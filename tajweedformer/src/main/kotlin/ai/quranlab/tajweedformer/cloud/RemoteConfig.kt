@@ -23,6 +23,23 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
 
     val recommendedRevision: String? get() = recommended?.get("revision") as? String
 
+    /** Where model files are served (qlab-api signs it): `https://cdn.quranlab.ai/models`, or null when absent or not https. */
+    val base: String? get() = (raw["base"] as? String)?.takeIf { safeBase.matches(it) }
+
+    private val safeBase = Regex("^https://[A-Za-z0-9.-]+(:\\d+)?(/[A-Za-z0-9._~/-]*)?$")
+
+    /**
+     * The recommended model's folder URL for [ai.quranlab.tajweedformer.ModelStore]: [base] (else [fallback]) +
+     * `/{model}/{revision}/{folder}/`. Null when the config recommends no model.
+     */
+    fun modelBaseUrl(fallback: String = ai.quranlab.tajweedformer.ModelStore.MODELS_URL): String? {
+        val r = recommended ?: return null
+        val model = r["model"] as? String ?: return null
+        val rev = r["revision"] as? String ?: return null
+        val folder = r["folder"] as? String ?: (r["model_id"] as? String)?.let { "sdk/$it" } ?: return null
+        return ai.quranlab.tajweedformer.ModelStore.folderUrl(base ?: fallback, model, rev, folder)
+    }
+
     /** The `tajweed` block, or null when the config has none. */
     val tajweedJson: String? get() = raw["tajweed"]?.takeIf { it is Map<*, *> }?.let { Json.write(it) }
 

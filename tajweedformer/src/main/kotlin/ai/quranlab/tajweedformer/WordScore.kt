@@ -28,7 +28,7 @@ sealed class WordOption {
 
 /**
  * A context's per-word calibration: calibration.json's `contexts.<ctx>.word` block (CAL; the shipping
- * file 37249b0c has one per context: `default_preset`, `presets.<name>.tau`, `floor`, `custom_range`,
+ * file 747b7b4c has one per context: `default_preset`, `presets.<name>.tau`, `floor`, `custom_range`,
  * `status`, `readout`, `evidence`), else a top-level `word` block, else the contract's fallback table
  * (P2.5: general 4.93, beginner 4.0, strict 6.5, floor 2.0; [fromCalibration] false then).
  */

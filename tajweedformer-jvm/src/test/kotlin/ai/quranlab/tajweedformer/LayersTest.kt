@@ -131,7 +131,7 @@ class LayersTest {
         }
     }
 
-    /** The shipping calibration.json (37249b0c): the levels come from its per-context
+    /** The shipping calibration.json (747b7b4c): the levels come from its per-context
      *  word blocks, not from the fallback table. */
     @Test
     fun wordThresholdsComeFromTheShippingCalibration() {

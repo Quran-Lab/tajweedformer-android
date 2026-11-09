@@ -28,7 +28,7 @@ class TajweedModel private constructor(
     /** The model's id ("v4.0"). */
     val modelId: String get() = manifest.modelId
 
-    /** Every shipped context ("c16_l64", "c24_l72", "c24_l256"), calibration.json's order. */
+    /** Every shipped context ("c16_l64", "c8_l64", "c24_l72", ...), calibration.json's order. */
     val contexts: List<String> get() = calibration.contexts.keys.toList()
 
     val defaultContext: String get() = calibration.defaultContext

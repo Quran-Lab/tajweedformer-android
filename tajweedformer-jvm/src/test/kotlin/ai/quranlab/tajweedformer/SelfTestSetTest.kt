@@ -191,7 +191,9 @@ class SelfTestSetTest {
             // the set can catch a missed flag: at least one flagged site and one flagged word (the planted clip)
             assertTrue("$ctx: no flagged site in the set", expected.clips.values.any { it.flaggedSites.isNotEmpty() })
             assertTrue("$ctx: no flagged word in the set", expected.clips.values.any { it.flaggedWords.isNotEmpty() })
-            assertEquals(setOf("vowel_sub", "cons_sub"), expected.clips.getValue(PLANTED).flaggedSites.map { it.second }.toSet())
+            // at c8_l64 the planted vowel is flagged as vowel_sub and vowel_del; the site reports the larger, vowel_del (reports/C8.md)
+            val plantedVowel = if (ctx == "c8_l64") "vowel_del" else "vowel_sub"
+            assertEquals(setOf(plantedVowel, "cons_sub"), expected.clips.getValue(PLANTED).flaggedSites.map { it.second }.toSet())
             assertEquals(setOf(1), expected.clips.getValue(PLANTED).flaggedWords)
             val engine = ExactTajweedEngine(model, ctx, true)
             try {

@@ -98,6 +98,19 @@ class CloudTest {
         assertTrue(c2.tajweedJson!!.contains("\"strict\""))
     }
 
+    @Test fun theModelFolderUrlComesFromTheSignedBaseElseTheCdnModelsPath() {
+        val rec = mapOf("model" to "Quran-Lab/tajweedformer-v4", "model_id" to "v4.0", "folder" to "sdk/v4.0", "revision" to "abc")
+        fun url(base: Any?) = RemoteConfig(mapOf("recommended" to rec) + (if (base != null) mapOf("base" to base) else emptyMap()), ByteArray(0)).modelBaseUrl()
+        assertEquals("https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url(null))
+        assertEquals("https://mirror.example/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://mirror.example/"))
+        assertEquals("a bare cdn base keeps the old /hf/ path", "https://cdn.quranlab.ai/hf/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://cdn.quranlab.ai"))
+        assertEquals("not https: ignored", "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("http://evil.example"))
+        assertEquals("the models path is not the bare host: no /hf", "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://cdn.quranlab.ai/models/"))
+        assertNull(RemoteConfig(emptyMap(), ByteArray(0)).modelBaseUrl())
+        assertEquals("https://eeur.cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/", ai.quranlab.tajweedformer.ModelStore.folderUrl("https://eeur.cdn.quranlab.ai/", "Quran-Lab/m", "r", "sdk/v4.0"))
+        assertTrue(ai.quranlab.tajweedformer.ModelStore.DEFAULT_BASE_URL.startsWith("https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/"))
+    }
+
     @Test fun aTamperedOrForeignConfigIsRejectedAndTheLastGoodOneKept() {
         val c = cloud()
         c.refreshConfig()

@@ -24,6 +24,10 @@ object ModelProfile {
 
     private val ALL_NPU_ROLES = NPU_ROLES + NPU_PART_ROLE
 
+    /** Contexts with no NPU build by design: an NPU backend is never chosen for them, whatever a manifest lists.
+     *  c8_l64 is 8 frames at 20 ms per step (160 ms chunks) with 64 left frames; it runs on the exact CPU engine. */
+    @JvmField val CPU_ONLY_CONTEXTS = setOf("c8_l64")
+
     /** The CPU profile of [context] for [platform]. */
     @JvmStatic
     @JvmOverloads
@@ -47,7 +51,7 @@ object ModelProfile {
     @JvmStatic
     @JvmOverloads
     fun npu(m: ModelManifest, soc: String?, context: String, platform: String = TajweedFormer.PLATFORM): List<ModelManifest.FileEntry> {
-        if (soc == null) return emptyList()
+        if (soc == null || context in CPU_ONLY_CONTEXTS) return emptyList()
         val files = m.files.filter {
             it.need == ModelManifest.Need.OPTIONAL && it.role in ALL_NPU_ROLES && it.forPlatform(platform) &&
                 it.soc == soc && it.context == context

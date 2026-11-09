@@ -24,15 +24,16 @@ import java.nio.ByteOrder
  * staged transport folder or `TJ_V4_DIR` = a
  * decoded folder already in place, `ZF_V4_AUDIO_DIR` = the clips' float32 .pcm, and
  * `ZF_V4_CONFORMANCE_DIR` = the engine's conformance folder (default: the engine submodule's).
- * Only c16_l64 has an audio expected file; the other contexts' expected files are feature-level,
- * and this SDK's V4 API takes audio, not features.
+ * c16_l64 and c8_l64 have audio expected files; the c24 contexts' expected files are feature-level,
+ * and this SDK's V4 API takes audio, not features. `TJ_V4_DIR` may name an unsigned decoded folder with
+ * `TJ_V4_UNSIGNED=1` (no signature is checked then); the calibration sha256 is checked on both routes.
  */
 class V4ConformanceTest {
     internal fun env(name: String): String? = System.getenv(name) ?: System.getProperty(name)
 
     companion object {
-        /** the 2.0.0 design (supersedes a5fff30b and 7bdccd94). */
-        const val SHIPPING_CALIBRATION_SHA256 = "37249b0cd444705401cd834cf83fa7a712e4e602527206ef7df49e82cc7c6342"
+        /** the 2.0.0 design (supersedes a5fff30b, 7bdccd94 and 37249b0c, the three-context file of the first V4.0 revision). */
+        const val SHIPPING_CALIBRATION_SHA256 = "747b7b4cff040efbd46b2ef709f9344c35771b109a4ca1bee1e52b65a5bd991c"
         private const val FNV0 = 1469598103934665603L
         private const val PRIME = 1099511628211L
 
@@ -60,7 +61,13 @@ class V4ConformanceTest {
     internal fun model(): TajweedModel? {
         if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) return null
         val key = listOf(TestKit.hex(ManifestTest.STAGED_TEST_KEY))
-        env("TJ_V4_DIR")?.let { return TajweedModel.open(File(it), ManifestVerifier(key)) }
+        env("TJ_V4_DIR")?.let {
+            val m = TajweedModel.open(File(it), ManifestVerifier(key, requireSignature = env("TJ_V4_UNSIGNED") == null))
+            // the 2.0.0 design: the shipping calibration.json
+            val sha = java.security.MessageDigest.getInstance("SHA-256").digest(File(it, "calibration.json").readBytes())
+            assertEquals(SHIPPING_CALIBRATION_SHA256, sha.joinToString("") { b -> "%02x".format(b) })
+            return m
+        }
         val staged = ManifestTest.stagedDir() ?: return null
         val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
         server.createContext("/") { ex ->
@@ -91,21 +98,29 @@ class V4ConformanceTest {
     }
 
     @Test
+    fun c16l64AudioIsBitExactThroughTheSdk() = audioIsBitExactThroughTheSdk("c16_l64", 320)
+
+    /** The 160 ms context: same recipe and reference (ONNX Runtime armv7) as c16_l64. Runs on the CPU engine
+     *  (`no_npu_build` on a device with an NPU build at c16_l64; `no_accelerator` on this host). */
+    @Test
+    fun c8l64AudioIsBitExactThroughTheSdk() = audioIsBitExactThroughTheSdk("c8_l64", 160)
+
     @Suppress("UNCHECKED_CAST")
-    fun c16l64AudioIsBitExactThroughTheSdk() = runBlocking {
+    private fun audioIsBitExactThroughTheSdk(context: String, chunkMs: Int) = runBlocking {
         val audio = env("ZF_V4_AUDIO_DIR")?.let(::File)
         val conf = (env("ZF_V4_CONFORMANCE_DIR") ?: env("ZF_CONFORMANCE_DIR"))?.let(::File)
-        val expectedFile = conf?.let { File(it, "v4_c16_l64_audio_expected.jsonl") }
+        val expectedFile = conf?.let { File(it, "v4_${context}_audio_expected.jsonl") }
         Assume.assumeTrue("ZF_V4_AUDIO_DIR and the V4 conformance file are needed",
             audio != null && audio.isDirectory && expectedFile?.isFile == true)
         val model = model()
         Assume.assumeTrue("no JNI library or no staged folder", model != null)
         model!!
-        val tj = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", threads = 4, selfTest = true, allHeads = true))
+        Assume.assumeTrue("the folder has no $context", context in model.availableContexts)
+        val tj = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = context, threads = 4, selfTest = true, allHeads = true))
         assertTrue("CPU self-test: ${tj.cpuSelfTest}", tj.cpuSelfTest!!.passed)
         assertEquals(Backend.CPU, tj.backend)
         assertEquals("no_accelerator", tj.backendChoice.reason)
-        assertEquals(320, tj.chunkMs)
+        assertEquals(chunkMs, tj.chunkMs)
         val expected = expectedFile!!.readLines().filter { it.isNotBlank() }.map { Json.parse(it) as Map<String, Any?> }
         assertEquals(35, expected.size)
         val bad = ArrayList<String>()
@@ -162,14 +177,14 @@ class V4ConformanceTest {
             assertTrue(r.words.isNotEmpty())
             if (wordApi) {
                 assertTrue(r.wordsFromEngine)
-                val want = WordCalibration.of(model.calibration, "c16_l64")
+                val want = WordCalibration.of(model.calibration, context)
                 assertEquals(want.threshold(want.defaultLevel), r.wordSettings!!.threshold, 1e-12)
                 assertTrue(r.words.all { it.flagged == (it.hasScore && it.score >= it.threshold) })
             }
         } finally {
             tj.close()
         }
-        println("V4 c16_l64 audio through TajweedRecognizer: ${expected.size - bad.size}/${expected.size} clips bit-identical " +
+        println("V4 $context audio through TajweedRecognizer: ${expected.size - bad.size}/${expected.size} clips bit-identical " +
             "($outputsChecked chunk outputs)" + if (bad.isEmpty()) "" else "; differ: ${bad.joinToString()}")
         assertTrue(bad.joinToString(), bad.isEmpty())
     }

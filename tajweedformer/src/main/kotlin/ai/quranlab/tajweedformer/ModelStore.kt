@@ -181,13 +181,30 @@ class ModelStore @JvmOverloads constructor(
     }
 
     companion object {
+        /** Where Quran Lab serves model files: `{base}/{owner}/{repo}/{revision}/{path}`, app key in `x-qlab-key`. */
+        const val MODELS_URL = "https://cdn.quranlab.ai/models"
+
         /**
-         * The Quran Lab CDN's mirror of `Quran-Lab/tajweedformer-v4` (`/hf/{org}/{repo}/{commit}/{path}`,
-         * app key in `x-qlab-key`). The commit segment is the ingested revision: `main` here is a
-         * placeholder until the model is published; pass the published one (the portal's setup API
-         * gives it) as `baseUrl`.
+         * `Quran-Lab/tajweedformer-v4` on [MODELS_URL]. The revision segment is the published revision:
+         * `main` here is a placeholder until the model is published; pass the published one as `baseUrl`
+         * (the portal's setup API gives it), or build it with [folderUrl] from the signed config
+         * ([ai.quranlab.tajweedformer.cloud.RemoteConfig.modelBaseUrl]).
          */
-        const val DEFAULT_BASE_URL = "https://cdn.quranlab.ai/hf/Quran-Lab/tajweedformer-v4/main/sdk/v4.0/"
+        const val DEFAULT_BASE_URL = "$MODELS_URL/Quran-Lab/tajweedformer-v4/main/sdk/v4.0/"
+
+        private val LEGACY_CDN = Regex("^https://((weur|eeur|enam|wnam|apac|oc)\\.)?cdn\\.quranlab\\.ai$")
+
+        /**
+         * A model folder's URL, `{base}/{repo}/{revision}/{folder}/`. A bare `https://cdn.quranlab.ai` (or regional)
+         * base keeps the old shape `{cdn}/hf/{repo}/...`, which stays served for every revision.
+         */
+        @JvmStatic
+        fun folderUrl(base: String?, repo: String, revision: String, folder: String): String {
+            var b = (base ?: MODELS_URL).trimEnd('/')
+            if (LEGACY_CDN.matches(b)) b += "/hf"
+            fun enc(p: String) = p.split('/').joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
+            return "$b/${enc(repo)}/${enc(revision)}/${enc(folder)}/"
+        }
         const val MAX_MANIFEST_BYTES = 1 shl 20
     }
 }

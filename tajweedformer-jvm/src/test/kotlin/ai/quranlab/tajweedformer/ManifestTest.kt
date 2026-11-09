@@ -25,6 +25,21 @@ class ManifestTest {
         }
     }
 
+    /** c8_l64 has no NPU build by design: a manifest cannot make it pick the NPU, and no file of it is downloaded. */
+    @Test
+    fun c8IsNeverAnNpuContext() {
+        val soc = "tensor_g5"
+        val d = "npu/$soc/c8_l64/tajweedformer_v4_${soc}_c8_l64"
+        val files = TestKit.v4Files(npuSocs = listOf(soc), contexts = listOf("c16_l64", "c8_l64")) + listOf(
+            TestKit.F("$d.tflite", ByteArray(5000) { 3 }, "npu-model", "c8_l64", "optional", listOf("android"), soc),
+            TestKit.F("$d.io.json", "{}".toByteArray(), "npu-io", "c8_l64", "optional", listOf("android"), soc),
+            TestKit.F("$d.masks.json", "{}".toByteArray(), "npu-masks", "c8_l64", "optional", listOf("android"), soc),
+        )
+        val m = TestKit.manifest(files, listOf("c16_l64", "c8_l64"))
+        assertTrue(ModelProfile.npu(m, soc, "c16_l64").isNotEmpty())
+        assertTrue(ModelProfile.npu(m, soc, "c8_l64").isEmpty())
+    }
+
     @Test
     fun signedTextFollowsTheLayout() {
         val files = listOf(
