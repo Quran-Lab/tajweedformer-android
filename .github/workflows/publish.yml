@@ -1,0 +1,84 @@
+name: Publish to Maven Central
+
+# Started by hand on a tag (Actions, Publish to Maven Central, Run workflow, Use workflow from: Tags).
+# Tests, then the signed bundle of ai.quranlab:tajweedformer, then the Central Portal upload as USER_MANAGED:
+# the Portal validates it and it waits there. Nothing is released until someone publishes the deployment on
+# central.sonatype.com (the run's summary has the deployment id).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Test, sign and upload to the Central Portal
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the version
+        run: |
+          v=$(sed -n 's/^tajweedformer.version=//p' gradle.properties)
+          [ -n "$v" ] && [ "$GITHUB_REF_NAME" = "$v" ] || { echo "tag $GITHUB_REF_NAME is not tajweedformer.version $v" >&2; exit 1; }
+      - name: Engine submodule
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-engine.sh engine
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Tools
+        run: sudo apt-get install -y ninja-build
+      - name: JVM tests (no engine)
+        run: ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
+      - name: JVM tests with the engine (V4; the model-dependent ones skip without the model)
+        run: |
+          ./gradlew --no-daemon :tajweedformer-jvm:cleanTest :tajweedformer-jvm:test -Pnative \
+            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.EngineSettingsTest' \
+            --tests 'ai.quranlab.tajweedformer.TajweedApiTest' --tests 'ai.quranlab.tajweedformer.TajweedModelTest' \
+            --tests 'ai.quranlab.tajweedformer.TajweedSettingsTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
+            --tests 'ai.quranlab.tajweedformer.LayersTest'
+      - name: Signed bundle (AAR with arm64-v8a and armeabi-v7a, sources, javadoc, POM, signatures, checksums)
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
+          ./gradlew --no-daemon :tajweedformer:centralBundle
+          unzip -l tajweedformer/build/distributions/central-bundle-*.zip
+      - name: Upload to the Central Portal (USER_MANAGED) and wait for validation
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          [ -n "$MAVEN_CENTRAL_USERNAME" ] && [ -n "$MAVEN_CENTRAL_PASSWORD" ] || { echo "no Central Portal secrets" >&2; exit 1; }
+          token=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
+          echo "::add-mask::$token"
+          api=https://central.sonatype.com/api/v1/publisher
+          bundle=$(ls tajweedformer/build/distributions/central-bundle-*.zip)
+          id=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" \
+            -F "bundle=@$bundle;type=application/octet-stream" \
+            "$api/upload?publishingType=USER_MANAGED&name=ai.quranlab:tajweedformer:$GITHUB_REF_NAME")
+          echo "deployment $id"
+          for _ in $(seq 1 60); do
+            sleep 20
+            status=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" "$api/status?id=$id")
+            state=$(printf '%s' "$status" | jq -r .deploymentState)
+            echo "state $state"
+            case $state in
+              VALIDATED)
+                {
+                  echo "Deployment \`$id\` passed validation and is waiting on the Central Portal."
+                  echo "Nothing is released yet: publish it at https://central.sonatype.com/publishing/deployments"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              FAILED)
+                printf '%s' "$status" | jq .errors
+                exit 1 ;;
+            esac
+          done
+          echo "validation did not finish in 20 minutes (deployment $id)" >&2
+          exit 1

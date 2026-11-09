@@ -1,11 +1,15 @@
+import java.util.zip.ZipFile
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     `maven-publish`
+    signing
 }
 
-// Maven coordinates ai.quranlab:tajweedformer (version in gradle.properties). Nothing here publishes
-// anywhere: publishToMavenLocal is the only repository until a release is made.
+// Maven coordinates ai.quranlab:tajweedformer (version in gradle.properties). Nothing here uploads anywhere:
+// the release writes a signed Maven layout to build/central-bundle and zips it (centralBundle), and the
+// publish workflow (.github/workflows/publish.yml) hands that zip to the Central Portal.
 group = "ai.quranlab"
 version = providers.gradleProperty("tajweedformer.version").get()
 
@@ -56,6 +60,7 @@ android {
     publishing {
         singleVariant("release") {
             withSourcesJar()
+            withJavadocJar()
         }
     }
 
@@ -75,6 +80,79 @@ publishing {
             artifactId = "tajweedformer"
             version = project.version.toString()
             afterEvaluate { from(components["release"]) }
+            pom {
+                name.set("TajweedFormer for Android")
+                description.set(
+                    "TajweedFormer V4 on Android: on-device tajweed feedback from the exact engine, word by word " +
+                        "while the learner recites, with the decoded layer, per-site verdicts and the Quran Lab platform client."
+                )
+                url.set("https://github.com/Quran-Lab/tajweedformer-android")
+                licenses {
+                    license {
+                        name.set("Quran-Lab No-Profit License 1.2 (NPL-1.2)")
+                        url.set("https://github.com/Quran-Lab/tajweedformer-android/blob/main/LICENSE")
+                        distribution.set("repo")
+                    }
+                }
+                developers {
+                    developer {
+                        id.set("quran-lab")
+                        name.set("Quran Lab")
+                        organization.set("Quran Lab")
+                        organizationUrl.set("https://quranlab.ai")
+                    }
+                }
+                scm {
+                    connection.set("scm:git:https://github.com/Quran-Lab/tajweedformer-android.git")
+                    developerConnection.set("scm:git:ssh://git@github.com/Quran-Lab/tajweedformer-android.git")
+                    url.set("https://github.com/Quran-Lab/tajweedformer-android")
+                }
+            }
+        }
+    }
+    repositories {
+        // a folder, not a server: the signed files in the Maven layout the Central Portal's bundle needs
+        maven {
+            name = "bundle"
+            url = uri(layout.buildDirectory.dir("central-bundle"))
+        }
+    }
+}
+
+// In-memory GPG signing of the release publication, only when SIGNING_KEY (an ASCII-armored private key with no
+// passphrase) is set: the publish workflow sets it, every other build leaves the artifacts unsigned.
+val signingKey: String? = providers.environmentVariable("SIGNING_KEY").orNull?.takeIf { it.isNotBlank() }
+signing {
+    if (signingKey != null) {
+        useInMemoryPgpKeys(signingKey, "")
+        sign(publishing.publications["release"])
+    }
+}
+
+val bundleDir = layout.buildDirectory.dir("central-bundle")
+tasks.matching { it.name == "publishReleasePublicationToBundleRepository" }.configureEach {
+    // only this release's files: nothing left over from an earlier build goes into the bundle
+    doFirst { delete(bundleDir) }
+}
+
+// The bundle for the Central Portal's upload API: the group's Maven layout with the .asc signatures and the
+// checksums the file repository wrote; maven-metadata is the repository's own bookkeeping, not part of a release.
+val centralBundle by tasks.registering(Zip::class) {
+    description = "Zips the signed release publication for the Central Portal (needs SIGNING_KEY)."
+    dependsOn("publishReleasePublicationToBundleRepository")
+    from(bundleDir)
+    exclude("**/maven-metadata*")
+    archiveFileName.set("central-bundle-${project.version}.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("distributions"))
+    doFirst {
+        check(signingKey != null) { "centralBundle needs SIGNING_KEY: Maven Central refuses unsigned files" }
+        // the native engine must be in the AAR for both Android ABIs
+        val aar = bundleDir.get().asFile.walkTopDown().single { it.name.endsWith("${project.version}.aar") }
+        val entries = ZipFile(aar).use { z -> z.entries().asSequence().map { it.name }.toSet() }
+        for (abi in listOf("arm64-v8a", "armeabi-v7a")) {
+            for (lib in listOf("libtajweedformer_jni.so", "libtajweedformer_opus.so")) {
+                check("jni/$abi/$lib" in entries) { "the AAR has no jni/$abi/$lib" }
+            }
         }
     }
 }

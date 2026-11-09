@@ -1,0 +1,8 @@
+# Test data and expected outputs are compared byte for byte (their hashes are checked), so a Windows
+# checkout must not convert their line endings.
+tajweedformer-jvm/src/test/resources/** -text
+tajweedformer/src/main/resources/** -text
+# Shell scripts run under bash on every platform.
+*.sh text eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf
