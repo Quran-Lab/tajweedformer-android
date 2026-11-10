@@ -30,19 +30,25 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 
 /**
- * The look of the SDK's sharing views (Views toolkit). Defaults follow the activity's theme
- * (`colorBackground`, `textColorPrimary`, `colorAccent`); apps restyle freely, never reword.
+ * The look of the SDK's sharing sheets (consent, guardian, thanks, settings and their dialogs; Views
+ * toolkit; the Compose module's `SharingStyle` is the same for Compose). Defaults follow the activity's
+ * theme (`colorBackground`, `textColorPrimary`, `colorAccent`). A theme changes how the words look,
+ * never the words, so it does not change the consent version. Set it once with
+ * `QuranLabAndroid.sharingTheme`, or pass it to the calls here.
  */
-data class SharingTheme(
+data class SharingTheme @JvmOverloads constructor(
     val background: Int? = null,
     val text: Int? = null,
     val secondaryText: Int? = null,
     /** Both buttons use it: the two choices have equal weight. */
     val accent: Int? = null,
     val cornerRadiusDp: Float = 20f,
+    /** The body font (and the titles', unless [titleTypeface] is set). */
     val typeface: Typeface? = null,
     val titleSizeSp: Float = 20f,
     val bodySizeSp: Float = 15f,
+    /** The titles' font; null: [typeface] in bold. */
+    val titleTypeface: Typeface? = null,
 ) {
     internal fun resolve(ctx: Context): Resolved {
         fun attr(id: Int, fallback: Int): Int {
@@ -54,20 +60,15 @@ data class SharingTheme(
         val bg = background ?: attr(android.R.attr.colorBackground, Color.WHITE)
         val fg = text ?: attr(android.R.attr.textColorPrimary, Color.BLACK)
         return Resolved(bg, fg, secondaryText ?: (fg and 0x00ffffff) or (0xb3 shl 24), accent ?: attr(android.R.attr.colorAccent, 0xff1b6e4f.toInt()),
-            cornerRadiusDp, typeface, titleSizeSp, bodySizeSp)
+            cornerRadiusDp, typeface, titleSizeSp, bodySizeSp, titleTypeface)
     }
 
-    internal data class Resolved(val bg: Int, val fg: Int, val fg2: Int, val accent: Int, val radius: Float, val face: Typeface?, val title: Float, val body: Float)
+    internal data class Resolved(val bg: Int, val fg: Int, val fg2: Int, val accent: Int, val radius: Float, val face: Typeface?, val title: Float, val body: Float,
+                                 val titleFace: Typeface? = null)
 }
 
-/**
- * Lines the deck (the shared copy decks) does not have yet, English only, for the SDK's own
- * recovery-code and failure messages. the portal team: add `recovery.*` and `delete.failed` to the deck.
- */
+/** The one button label the copy deck has no key for (closing a message). */
 internal object SdkText {
-    const val RECOVERY_ROW = "Recovery code"
-    const val RECOVERY_BODY = "If you lose this device, this code lets you delete what you shared at quranlab.ai/delete. Keep it private. It works once."
-    const val DELETE_FAILED = "The request could not be sent. Please check your connection and try again."
     const val CLOSE = "OK"
 }
 
@@ -76,7 +77,7 @@ object SharingDialogs {
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "quranlab-sharing-ui").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
 
-    /** Shows what the SDK asked for (a consent sheet, the thank-you, the impact line). */
+    /** Shows what the SDK asked for (a consent sheet, the thank-you, the impact line), with the app's own wording where it set one. */
     @JvmStatic
     @JvmOverloads
     fun show(activity: Activity, sharing: Sharing, request: Sharing.SheetRequest, theme: SharingTheme = SharingTheme()) {
@@ -108,7 +109,7 @@ object SharingDialogs {
             text = s
             setTextColor(if (secondary) t.fg2 else t.fg)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, if (title) t.title else t.body)
-            typeface = if (title) Typeface.create(t.face ?: Typeface.DEFAULT, Typeface.BOLD) else (t.face ?: Typeface.DEFAULT)
+            typeface = if (title) (t.titleFace ?: Typeface.create(t.face ?: Typeface.DEFAULT, Typeface.BOLD)) else (t.face ?: Typeface.DEFAULT)
             textAlignment = View.TEXT_ALIGNMENT_VIEW_START
             setPadding(0, 0, 0, dp(ctx, 12f).toInt())
         }
@@ -185,7 +186,8 @@ object SharingDialogs {
         d.show()
     }
 
-    private fun message(activity: Activity, copy: SharingCopy, line: String, theme: SharingTheme, secure: Boolean = false, title: String? = null) {
+    private fun message(activity: Activity, copy: SharingCopy, line: String, theme: SharingTheme, secure: Boolean = false, title: String? = null,
+                        retry: Pair<String, () -> Unit>? = null) {
         val t = theme.resolve(activity)
         val col = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
@@ -194,10 +196,16 @@ object SharingDialogs {
         }
         title?.let { col.addView(text(activity, t, it, title = true)) }
         col.addView(text(activity, t, line))
-        val ok = button(activity, t, SdkText.CLOSE)
-        col.addView(LinearLayout(activity).apply { addView(ok) })
+        val ok = button(activity, t, if (retry != null) copy["delete.cancel"] else SdkText.CLOSE)
+        val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; addView(ok) }
+        col.addView(row)
         val d = dialog(activity, copy, t, col, secure)
         ok.setOnClickListener { d.dismiss() }
+        retry?.let { (label, action) ->
+            val again = button(activity, t, label)
+            row.addView(again)
+            again.setOnClickListener { d.dismiss(); action() }
+        }
         d.show()
     }
 
@@ -234,20 +242,27 @@ object SharingDialogs {
         cancel.setOnClickListener { d.dismiss() }
         del.setOnClickListener {
             del.isEnabled = false
-            io.execute {
-                val r = sharing.deleteEverything()
-                main.post {
-                    d.dismiss()
-                    if (activity.isFinishing) return@post
-                    when (r) {
-                        Sharing.Deletion.ACCEPTED, Sharing.Deletion.NOTHING_SHARED -> message(activity, c, c.deletion("delete.done"), theme)
-                        else -> message(activity, c, SdkText.DELETE_FAILED, theme)
-                    }
-                    done?.invoke()
-                }
-            }
+            d.dismiss()
+            delete(activity, sharing, theme, done)
         }
         d.show()
+    }
+
+    /** The signed deletion request, then its outcome: done, or failed with "Try again". */
+    private fun delete(activity: Activity, sharing: Sharing, theme: SharingTheme, done: (() -> Unit)?) {
+        io.execute {
+            val r = sharing.deleteEverything()
+            main.post {
+                if (activity.isFinishing) return@post
+                val c = sharing.copy
+                when (r) {
+                    Sharing.Deletion.ACCEPTED, Sharing.Deletion.NOTHING_SHARED -> message(activity, c, c.deletion("delete.done"), theme)
+                    else -> message(activity, c, c["delete.failed.network"], theme, title = c["delete.failed.title"],
+                        retry = c["delete.retry"] to { delete(activity, sharing, theme, done) })
+                }
+                done?.invoke()
+            }
+        }
     }
 
     /** The recovery code, shown only to the learner, in a window screenshots and screen recording cannot capture. */
@@ -264,8 +279,10 @@ object SharingDialogs {
                     val p = dp(activity, 24f).toInt()
                     setPadding(p, p, p, p)
                 }
-                col.addView(text(activity, t, SdkText.RECOVERY_ROW, title = true))
-                col.addView(text(activity, t, SdkText.RECOVERY_BODY))
+                val c = sharing.copy
+                col.addView(text(activity, t, c["recovery.reveal"], title = true))
+                col.addView(text(activity, t, c["recovery.keep"]))
+                col.addView(text(activity, t, c["recovery.hint"], secondary = true))
                 col.addView(TextView(activity).apply {
                     text = code
                     setTextColor(t.fg)
@@ -288,8 +305,8 @@ object SharingDialogs {
 
 /**
  * The settings rows, ready to place in an app's settings screen: "Share my recitations" (a switch:
- * off stops uploads at once and deletes the unsent queue), "What is shared", "Delete what I
- * shared", and the recovery code (once something was shared).
+ * off stops uploads at once and deletes the unsent queue, whatever words the learner agreed to), "What is
+ * shared", "Delete what I shared", and the recovery code (once something was shared).
  */
 class SharingSettingsView @JvmOverloads constructor(
     private val activity: Activity,
@@ -305,12 +322,13 @@ class SharingSettingsView @JvmOverloads constructor(
         layoutDirection = if (c.rtl) View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
         toggle.text = c["settings.toggle"]
         toggle.setTextColor(t.fg)
+        t.face?.let { toggle.typeface = it }
         toggle.isChecked = sharing.isOn
         toggle.setOnCheckedChangeListener { _, on -> Executors.newSingleThreadExecutor().execute { sharing.setOn(on) } }
         addView(toggle, row())
         addView(rowText(t, c["settings.what"]) { SharingDialogs.whatIsShared(activity, sharing, theme) }, row())
         addView(rowText(t, c["settings.delete"]) { SharingDialogs.confirmDelete(activity, sharing, theme) { toggle.isChecked = sharing.isOn } }, row())
-        addView(rowText(t, SdkText.RECOVERY_ROW) { SharingDialogs.showRecoveryCode(activity, sharing, theme) }, row())
+        addView(rowText(t, c["recovery.reveal"]) { SharingDialogs.showRecoveryCode(activity, sharing, theme) }, row())
     }
 
     private fun row() = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -321,6 +339,7 @@ class SharingSettingsView @JvmOverloads constructor(
         text = s
         setTextColor(t.fg)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, t.body + 1)
+        t.face?.let { typeface = it }
         val p = SharingDialogs.dp(context, 10f).toInt()
         setPadding(0, p, 0, p)
         isClickable = true

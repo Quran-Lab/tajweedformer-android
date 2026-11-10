@@ -58,7 +58,7 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 
 ## At a glance
 
-- **What it is:** the Kotlin SDK 2.0.0 for the Quran Lab TajweedFormer engine (Maven
+- **What it is:** the Kotlin SDK 2.0.1 for the Quran Lab TajweedFormer engine (Maven
   `ai.quranlab:tajweedformer`, package `ai.quranlab.tajweedformer`): a JNI bridge over
   [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) (pinned as the `engine/`
   submodule) and an API that mirrors the Swift SDK. For the V4 model (`sdk/v4.0`): signed model
@@ -82,7 +82,7 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.0` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.1` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+ | SwiftPM, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node | npm `@quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake (`add_subdirectory`) |
@@ -105,7 +105,7 @@ cd tajweedformer-android
 ./gradlew :tajweedformer:assembleRelease     # tajweedformer/build/outputs/aar/tajweedformer-release.aar
 ```
 
-Depend on `ai.quranlab:tajweedformer:2.0.0` (the AAR, or the `:tajweedformer` project).
+Depend on `ai.quranlab:tajweedformer:2.0.1` (the AAR, or the `:tajweedformer` project).
 
 ### Ten lines
 
@@ -124,9 +124,10 @@ result.flaggedWords.forEach { w -> show(w.word, w.score, w.best?.expected, w.bes
 ```
 
 `tf.recognizer()` downloads the CPU profile on the first call (any network), verifies it, runs the
-CPU self-test, and uses the NPU only when this phone's build is on disk, loads, and passes its own
-self-test against the CPU (NPU files are fetched in the background on an unmetered network after
-the CPU self-test passed). `tj.backendChoice` says which backend runs and why.
+CPU self-test, and serves on the exact CPU engine. The NPU is promoted in the background after the first
+session (download on an unmetered network, load, warm-up, the golden test against the CPU engine) and used
+from the next session once it is ready and warm ("CPU first, then the accelerator" below).
+`tj.backendChoice` says which backend runs and why.
 
 ### The three layers (one concept set with the Swift, web and native SDKs)
 
@@ -153,7 +154,9 @@ the CPU self-test passed). `tj.backendChoice` says which backend runs and why.
 `TajweedFormer.events.add(observer)` with an `SdkObserver`: session start and end (audio seconds,
 compute seconds, RTF, chunks, backend), the audio exactly as pushed (`onAudio`, for opt-in recording
 sharing), backend choice and every fallback with a reason code, download progress and results,
-self-test results, handled errors. The SDK's cloud module (telemetry, sharing) is built on it.
+self-test results, handled errors. The SDK's cloud module (telemetry, sharing) is built on it; what it
+sends to Quran Lab is described in [docs/platform-client.md](docs/platform-client.md) (see
+[Recitation sharing](#recitation-sharing) and [Telemetry](#telemetry) below).
 
 ## How it works
 
@@ -266,28 +269,191 @@ dispatch library, both added by the app; the SDK itself does not depend on LiteR
 (the engine's own resampler and fbank, windows, state requantisation, the mask table, log-softmax or
 softmax per head) is in `ai.quranlab.tajweedformer.npu`.
 
-**CPU first, the NPU as a verified upgrade** (`ai.quranlab.tajweedformer.accel`). The exact
-CPU engine serves from the first session. `AcceleratorController` prepares the NPU in the background
-(WorkManager: idle, charging, unmetered; the LiteRT load on a low-priority thread with a timeout), then
-runs the shipped self-test set (`selftest/` in the model folder: the three Basmala must-decode clips and
-Husary_112001) and promotes it only if tokens, site flags and word flags equal the CPU engine's expected
-files, nothing is NaN or inf, per-chunk p90 <= 0.5 x chunk_ms and the median is below the CPU's. A new
-session then runs on the NPU; a session in progress never changes engine. The verdict is kept per model
-revision, OS build (`Build.FINGERPRINT`), device and SoC, so an OS update tests again. A crash sentinel
-(fsync'd before every load and first run) disables the NPU for that revision and OS build if the process
-died there. A per-chunk watchdog (slower than real time, NaN or inf, an all-blank take, an exception) sends
-the next takes to the CPU; serious thermal state, memory warnings and the portal's denylist prefer the
-CPU. `client.accelerator(model)` gives the state (`cpu`, `preparing`, `ready`, `disabled(reason)`) as a
-`StateFlow`, listeners, `awaitReady()` and `forced` for debugging; nothing is needed by default. **The
-NPU path has not run inside an app on an NPU phone yet** (its native runner, through
-`native/tools/litert_npu_harness.c`, ran on the Exynos 2500 and 2600 boards: every head byte-identical to the
-bench runner).
+How the NPU is promoted, and what happens when it fails mid-session: "CPU first, then the accelerator" below.
 
 **Threading.** Each recognizer owns one thread, and every engine call it makes runs there, in the
 order the calls were made. The public calls are safe from any thread or coroutine. A recognizer runs
 one session at a time (`SessionActive` otherwise).
 
-SDK 2.0.0 hosts TajweedFormer V4 only; v3.2 stays on the 1.x SDKs.
+SDK 2.0 hosts TajweedFormer V4 only; v3.2 stays on the 1.x SDKs.
+
+### CPU first, then the accelerator
+
+**What the first run downloads.** Only the CPU files of the default context (56.5 MB for c16_l64). The first
+session runs on the exact CPU engine, and nothing else is downloaded or compiled before it: the accelerator's
+pipeline starts when that first session ends (or 30 s after it started, whichever comes first). On a later launch
+it starts at launch, at low priority.
+
+**What happens in the background.** One persisted state machine per model revision, context, accelerator build
+(`npu:<soc>`), OS build (`Build.FINGERPRINT`) and device model (`accelerator.json` in the model folder, written
+after every stage; a restart resumes at the next stage):
+
+1. `download`: the SoC's NPU files and the self-test set, on an unmetered network, resumable, every file verified
+   against the signed manifest. A program shipped as a delta (`npu-delta`, QLPD1) is rebuilt from the CPU weights
+   already on the device and its SHA-256 checked before LiteRT sees it; the full program is the fallback.
+2. `compile`: the program loaded through LiteRT with the vendor dispatch (the shipped builds are compiled ahead of
+   time for each SoC, so no compiler runs on the device), within 5 minutes.
+3. `warmup`: a second of silence and the first self-test clip through the accelerator, no NaN or inf.
+4. `golden`: all five self-test clips (the three Basmala clips, Husary 112:1 and the planted Husary_112001_vsub2)
+   through the accelerator path (the streaming code a session uses) and through the exact CPU engine in the same
+   run. The CPU must equal the shipped expected file; the accelerator must decide as the CPU did: the same tokens on
+   the clean clips and the same flagged sites and words on every clip (an extra flag and a missed one both count),
+   within the build's signed `golden_tolerance` (exact without it), and the planted mistake always flagged.
+5. `measure`: the speedup (the CPU's median chunk time over the accelerator's) and the accelerator's median and p90,
+   which set its deadline. Telemetry only: a build that passes the golden test is promoted whatever its speed.
+6. `promote`: the accelerator stays loaded and warm; the next session uses it.
+
+Warm-up, golden and measure run only while no session is active (a session that starts stops them without a
+failure; they run again after it). Nothing runs in battery saver, below 20 % battery unless charging, or above
+light thermal throttling (it waits, no failure counted). On Android the pipeline is WorkManager unique work (battery
+not low, unmetered for the download), so it resumes after the app is killed or the phone restarts.
+
+**When the swap happens.** Only at a session start, to an accelerator that is already loaded and warm: the session
+starts without a pause and the app sees the same API, results and events, only the backend name and faster chunks.
+A key promoted in an earlier launch loads and warms at SDK init; a session that starts before it is warm runs on
+the CPU without waiting.
+
+**What fails safe.** Any failure before promotion (download, verification, compile error or timeout, load error,
+crash, hang, NaN, a golden mismatch, the CPU not matching its expected file, the signed config's deny rules) keeps
+the CPU and records the stage and reason. Retries for the same key after 1 h, 6 h and 24 h, then none; a golden or
+CPU mismatch, NaN or a crash is never retried for the key (a new model revision or OS build tries again). A crash
+sentinel is written before every compile, load, warm-up, golden run and a session's first accelerator call; a
+process that died there leaves it, and the next launch records a crash.
+
+During a session every accelerator call runs on its own thread against a deadline (min(300 ms, max(4 x p90,
+2 x median)) of this device's measured chunk times, at least 50 ms; a stream's first call gets four times that).
+A call that throws, returns NaN, inf or values outside what the build can produce, returns blank chunks over
+speech for 4 s, or misses its deadline is abandoned and the take switches to the CPU within that call: the last
+5.12 s of audio (a ring buffer) are replayed through a CPU stream to rebuild its state, the failed chunk is redone,
+and the take continues on the CPU. The chunks the app already got stay. The accelerator is set aside for that
+model revision and OS build (retried by the pipeline at least 24 h later) and later sessions start on the CPU. The
+app sees no error, only `backendChoice` changing to `failover_<cause>`.
+
+The CPU standby costs no resident memory: the engine maps its weights, but on every CPU with the dot-product
+instructions (every NPU phone) it rewrites the 63 MB of int8 linears into that layout in place at load, which makes
+them private memory. So while the accelerator serves, the CPU engine's weights are released (a scoring handle
+without weights stays) and a failover loads them again; the stall includes that load.
+
+Measured (this repository's `FailoverEngineTest`, the real exact engine on a Windows x86-64 desktop at 4 engine
+threads, the accelerator a fake that wraps the CPU engine and fails on demand; medians of 5 rounds): the stall
+(from the failure detected to the failed chunk's CPU result) is about 90 ms at the first chunk, 480 ms with 10
+chunks replayed and 810 to 850 ms with 16 chunks replayed plus the end-of-take flush, of which the reload of the
+weights is 10 to 40 ms (cold against warm). This host's chunk is 37 ms (the x86 build runs the engine's ARM NEON
+kernels through an emulation layer); a current NPU phone's big cores run a chunk in about a quarter of that
+(estimate), so the replay of a full window should take about 150 to 250 ms there (estimate, not measured on a
+phone). Divergence from a CPU-only run, failures at the first, a middle and the last chunk: on the five self-test
+clips (60 takes, four causes) no token, site or word differed; on the engine's 35 parity ayahs (2.7 to 15 s), a
+failure at the first, a middle and the last chunk of each (105 takes), by replay window:
+
+| Replay window | Replays from the take's start (exact) | Takes with a token difference | Site or word flag differences | Stall median / max, this host |
+| - | - | - | - | - |
+| 1.28 s | 39 of 105 | 3 (5 edits of 2481 tokens) | 0 | 250 / 384 ms |
+| 2.56 s | 62 of 105 | 0 | 0 | 396 / 548 ms |
+| **5.12 s (shipped)** | 92 of 105 | 0 | 0 | 396 / 843 ms |
+| 7.68 s | 102 of 105 | 0 | 0 | 399 / 1111 ms |
+
+A bounded replay cannot rebuild the encoder's caches bit for bit (16 layers of 1.28 s attention reach back further,
+and int8 rounding flips carry): measured on a 47 s session, the replayed chunks' log-probs differ from the
+uninterrupted run's by about 10 at the first replayed chunk, 0.5 after 12 chunks and stay near 0.1 after that. The
+decisions did not change in any take from 2.56 s up; 5.12 s keeps a margin for longer ayahs.
+
+`client.accelerator(model)` gives the state (`cpu`, `preparing(stage, waitingFor)`, `ready(speedup)`,
+`disabled(reason, retryAt)`) as a `StateFlow`, listeners, `awaitReady()` and `forced` for debugging; nothing is
+needed by default. **The NPU path has not run inside an app on an NPU phone yet** (its native runner, through
+`native/tools/litert_npu_harness.c`, ran on the Exynos 2500 and 2600 boards: every head byte-identical to the
+bench runner).
+
+**Telemetry.** The `promotions` entry of the telemetry delta (per accelerator, revision and context: attempts,
+promoted, the stage and reason of each failure, compile time and speedup histograms, failovers by cause with their
+stall, demotions) and an issue report for every incident (`promotion_failed`, `accelerator_failover`: stage,
+cause, the error's class and path-stripped message, chunk and deadline, the self-test clip and how far it diverged,
+device model, OS build, chip, delegate, thermal state; never audio, text or ids). See `docs/platform-client.md`.
+
+### The Quran Lab platform link
+
+`QuranLabAndroid.configure(this, CloudOptions(key = "qlk_v1_..."))` in `Application.onCreate` links the
+app to portal.quranlab.ai: the signed config (and the portal's tajweed block), telemetry, issue reports
+and recitation sharing. Everything runs in the background (WorkManager for the network work). What is
+sent, when, and what an app can change is the same in every SDK and is written down in
+[docs/platform-client.md](docs/platform-client.md).
+
+### Recitation sharing
+
+**Quran Lab decides** whether the SDK offers sharing, per app, in the signed config
+(`flags.contributions` and who may upload); `CloudOptions.contributions` is ignored since 2.0.1, and
+without a signed config in force nothing is offered. Offered is never consent: nothing is recorded for
+sharing and nothing is sent before the learner taps "Share" (on the SDK's sheet or the app's own), and
+a learner who never answers never shares. While the learner agreed, each recitation session the SDK
+listens to is uploaded whole, in the background, as Opus in one Ogg stream cut into segments of 10, 20,
+40, then 60 s, from a queue on disk that survives process death and reboots.
+
+The consent sheet, four ways:
+
+1. **Default.** The SDK shows its own sheet over the resumed activity after a finished session with
+   feedback (never at first launch), in the learner's language (copy deck `2026-11-09.1`, eight
+   languages, consent version `share-2026-11-09`), right to left for Arabic and Urdu, with a guardian
+   variant for `CloudOptions(audience = Audience.CHILDREN)`. The sheet is shown at most three times per
+   install, ever: "Not now" may lead to a later ask, at least 7 sessions apart, until the third showing; a
+   learner who said "Share", or turned sharing off in the settings, is never asked again. A yes persists
+   across copy decks, your wording and SDK upgrades (a 2.0.0 grant and ask count carry over), and every
+   shared session carries the consent version the learner agreed to.
+2. **Themed.** `QuranLabAndroid.sharingTheme = SharingTheme(accent = ..., background = ..., text = ...,
+   secondaryText = ..., cornerRadiusDp = 16f, typeface = ..., titleTypeface = ...)` styles the SDK's
+   consent, guardian, thank-you and settings views; in Compose, `SharingSheetHost(SharingStyle(...))`
+   and `SharingSettings(sharing, style)` (`container`, `content`, `secondaryContent`, `accent`,
+   `cornerRadius` or `shape`, `titleFont`, `bodyFont`). The words stay the SDK's, so the consent
+   version does not change.
+3. **Your own UI.** Set `QuranLabAndroid.sheets = { request -> ... }` (or `cloud.sharing.prompts`). A
+   `Sharing.SheetRequest.Consent` arrives where the SDK counts an ask, within the same three showings
+   and with the same telemetry as its own sheet: show the strings of `cloud.sharing.copy` (`copy["sheet.what"]`,
+   `copy["sheet.share"]`, ...) and report the learner's own tap with `sharing.accept()` or
+   `sharing.decline()` (a dismissed sheet is a decline). `sharing.askNow()` asks at the app's moment
+   and is counted the same.
+4. **Your own wording.** `cloud.sharing.setWording(mapOf("sheet.title" to "...", "impact.minutes.other"
+   to "..."))` replaces strings of the deck (a plural line by category); an unknown key or an empty
+   text throws `IllegalArgumentException` and nothing changes; `null` or an empty map restores the
+   deck's. The learner then agrees to your words: the consent version becomes `custom-<24 hex>`, derived
+   from the text (`sharing.consentText`, `sharing.consentTextSha256`: send them to Quran Lab), and every
+   session of that grant carries `consent_text_sha256`. A learner who agreed earlier keeps the version
+   (and hash) recorded then and is not asked again; learners who agree after a change get the new
+   version. Set it at every start,
+   before the first session (it is not stored). Your text must say honestly that the audio of
+   recitation sessions is sent to Quran Lab, what else is sent, why, and how to stop and delete;
+   Quran Lab can switch sharing off for an app whose wording is not.
+
+The settings rows (`SharingSettingsView`, Compose `SharingSettings`): the switch (off stops uploads at
+once and deletes the unsent queue), "What is shared", "Delete what I shared" (signed with a key that
+never leaves the device; "Try again" when the request did not get through) and the one-time recovery
+code for portal.quranlab.ai/delete. Stopping and deleting work whatever words the learner agreed to.
+The app can never delete or read the recovery code itself.
+
+**Bitrate on bad networks.** Opus mono at 48 kHz starts at 192 kbit/s. One ladder per process steps
+192, 96, 64, 32 kbit/s: one step down when an upload request fails for network reasons (no connection,
+a timeout, HTTP 408 or 5xx; not a refusal such as an expired URL or a volume limit), one step down when
+a segment closes while 120 s or more of closed audio waits, one step up after three segment uploads in a
+row while at most 30 s waits. The new rate applies from the next segment (`OPUS_SET_BITRATE` before its
+first packet): one Ogg stream, no new headers. Each segment's rate is kept in its record on the device
+and listed in `Contribution.segmentBitrates`; a new process starts again at 192 kbit/s.
+`CloudOptions(uploadsOnUnmeteredOnly = true)` keeps uploads to unmetered networks.
+
+### Telemetry
+
+On by default, anonymous by construction (sums and histograms, nothing finer than the UTC day, no
+audio, text or identifiers); off with `CloudOptions(analytics = Analytics.OFF)` or the signed config's
+`flags.analytics: false`. Since 2.0.1 the SDK sends **deltas**: what was counted since the previous
+send point of the same UTC day, sealed on disk with a fresh random `report_id` before it is sent (a
+retry sends the same bytes, which the server counts once), never spanning midnight, kept up to 7 days.
+Send points: at launch, every 15 minutes while the app is in use, and when it goes to the background
+(`QuranLabAndroid` follows the process's foreground and background; other hosts call
+`QuranLabCloud.launch()`, `foreground()`, `tick()` and `background()`). 202 deletes a report, 400 and 413
+drop it, 401 renews the token, 429, 5xx and network errors keep it with a backoff.
+
+New counters in each delta (left out when zero): `launches` (cold starts and returns to the
+foreground), `ayahs` and `surah_ayahs` (ayahs scored, per surah), `words` (words scored),
+`rule_checks` and `rule_flags` (per rule or class, the verdicts whose check ran and the flagged ones),
+and `share_asked`, `share_yes`, `share_no` (the sharing sheet, the SDK's or the app's own).
+`POST /v1/register` is called once per UTC day per install, at the first launch or return to the
+foreground of the day.
 
 ## Build from source
 
@@ -318,14 +484,19 @@ GCC and Ninja on `PATH`) named by `TAJWEEDFORMER_LIBRARY`, the staged model fold
 (`ZF_V4_AUDIO_DIR`, `ZF_V4_CONFORMANCE_DIR`), the JVM tests also run `V4ConformanceTest` (a
 `ModelStore` download of the folder through a local server, then the 35 clips through
 `TajweedRecognizer`, every output of every chunk against `v4_c16_l64_audio_expected.jsonl`),
-`BackendFallbackTest` (backend choice and fallback with the real front end and the staged NPU
-tables), `ScorerVectorsTest` (with `TJ_SCORER_TABLE`) and `EngineSettingsTest`. The rest needs no
+`BackendFallbackTest` (an in-session failover with the real front end and the staged NPU
+tables), `FailoverEngineTest` (with `TJ_FAILOVER_MODEL`, a decoded V4 folder with `selftest/`: the golden stage
+with the real self-test clips, failovers at the first, a middle and the last chunk of every clip through the real
+engine, the stall warm and cold, the standby's memory; with `TJ_FAILOVER_AUDIO` the divergence over the parity
+ayahs), `ProgramDeltaTest` (with `TJ_PROGDELTA_STAGED` and `TJ_PROGDELTA_CPU`, every staged NPU delta rebuilt), `ScorerVectorsTest` (with `TJ_SCORER_TABLE`) and `EngineSettingsTest`. The rest needs no
 engine: format 3 manifests and signatures, profiles, SoC ids, downloads against a local Range / ETag
 server, the NPU host loop, the decoded layer, word scores and the settings vectors.
 
 Recitation sharing's tests (`SharingTest`, `SharingCodecTest`, `SharingVectorsTest`) encode real Ogg Opus,
 so they need the host build of `libtajweedformer_opus` (libopus 1.6.1 from `native/opus`). Without it
-they are SKIPPED, not failed. To run them:
+they are SKIPPED, not failed. `SharingCodecTest.bitrateStepsBetweenSegmentsInOneValidStream` also
+checks the stream with `ffprobe` and `ffmpeg` (its native and libopus decoders) when they are on `PATH`.
+To run them:
 
 ```sh
 scripts/opus/build_opus_host.sh            # Linux, macOS; Windows: Git Bash with MinGW GCC, CMake, Ninja on PATH
@@ -347,15 +518,23 @@ native/                     tj_jni.c over zf_tajweed.h (V4) and the engine's fro
 tajweedformer/              the Android library (AAR), ai.quranlab:tajweedformer
   src/main/kotlin           the API, plain JVM Kotlin: the same sources on Android and the JVM
     .../npu                 the NPU backend's host side and runner
-  src/main/resources        the self-test clip
+  src/main/resources        the self-test clip, the sharing copy deck
   src/android/kotlin        Android only: client, SoC, network, microphone, debug flag
   src/androidTest           DeviceEndToEndTest
+tajweedformer-compose/      the sharing sheets and settings in Jetpack Compose (optional)
 tajweedformer-jvm/          those sources on the desktop JVM, with the tests
+docs/platform-client.md     what the SDK sends to Quran Lab, when, and what an app can change
 scripts/                    host builds, the scorer table, the device test's server
 engine/                     tajweedformer-engine, pinned
 ```
 
 ## Status and roadmap
+
+Done (2.0.1, unreleased): recitation sharing decided by Quran Lab's signed config, with the SDK's
+sheet (themed or not), the app's own UI or the app's own wording; the adaptive Opus bitrate; copy deck
+2026-11-09.1; telemetry deltas with the new counters; registration once a day; CPU first, then a verified,
+persisted promotion to the NPU (program deltas, the golden test both ways with a signed tolerance, no speed
+gate) with in-session failover to the CPU, the `promotions` telemetry and incident reports.
 
 Done (2.0.0, unreleased): V4 only; manifest format 3 with download profiles, resumable verified
 downloads and the unmetered-only NPU policy; the exact CPU engine and the NPU backend with

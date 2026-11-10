@@ -171,141 +171,54 @@ object SelfTest {
 }
 
 /**
- * The NPU backend: the exact engine's front end (resampler, fbank, flush) on the CPU, the network on
- * the NPU ([NpuStreamer] over an [NpuRunner]), the scorer and the expected table from [cpu]. A run
- * that throws mid-take moves the take to the CPU: the audio of the take so far is replayed through
- * the CPU engine, the take's heads become the CPU's, and the engine stays on the CPU from then on
- * ([failure] is set, [onFallback] called).
+ * The NPU backend's session streams: the exact engine's front end (resampler, fbank, flush) on the CPU, the network
+ * on the NPU ([NpuStreamer] over an [NpuRunner]). No fallback inside: a session runs it under
+ * [ai.quranlab.tajweedformer.accel.FailoverEngine], which watches every chunk and switches the take to the CPU. Scoring
+ * goes to [scorer] (the CPU engine's scorer) when given.
  */
 internal class NpuTajweedEngine(
-    private val cpu: TajweedEngine,
     private val contract: NpuContract,
     private val masks: NpuMasks,
     private val runner: NpuRunner,
     private val sampleRate: Int,
-    private val onFallback: (String) -> Unit,
+    private val scorer: TajweedEngine? = null,
 ) : TajweedEngine {
     override val chunkMs: Int get() = contract.chunkMs
-    override val backend: Backend get() = if (failure == null) Backend.NPU else Backend.CPU
+    override val backend: Backend get() = Backend.NPU
 
-    @Volatile var failure: String? = null
-        private set
+    override fun createStream(): TajweedEngineStream = NpuStream()
 
-    /** Off during the self-test: there an NPU error must fail the test, not move to the CPU. */
-    @Volatile var fallbackEnabled = false
+    /** The NPU computes every head the build has. */
+    override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream = NpuStream()
 
-    override fun createStream(): TajweedEngineStream =
-        if (failure != null) cpu.createStream() else NpuStream()
-
-    override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream =
-        if (failure != null) cpu.createStream(heads) else NpuStream(heads)
-
-    /** The NPU computes every head; a fallback CPU stream computes [heads]. */
-    private inner class NpuStream(private val heads: Set<TajweedHead> = TajweedHead.SCORER_HEADS) : TajweedEngineStream {
+    private inner class NpuStream : TajweedEngineStream {
         private val fe = EngineFrontEnd(sampleRate)
         private val streamer = NpuStreamer(contract, masks, runner)
-        private val audio = FloatList()
-        private var delivered = 0
-        private var cpuStream: TajweedEngineStream? = null
-        private var cpuHeads: ArrayList<TajweedHeads>? = null
 
-        override val backend: Backend get() = if (cpuStream == null) Backend.NPU else Backend.CPU
+        override val backend: Backend get() = Backend.NPU
 
-        private fun fallback(e: Exception, pending: FloatArray?, offset: Int, length: Int, finishing: Boolean): List<TajweedHeads> {
-            if (!fallbackEnabled) throw e
-            val why = "${e.javaClass.simpleName}: ${e.message}"
-            failure = why
-            onFallback(why)
-            val s = cpu.createStream(heads)
-            cpuStream = s
-            val all = ArrayList<TajweedHeads>()
-            val a = audio.toArray()
-            all += s.pushAudio(a, 0, a.size)
-            if (pending != null) all += s.pushAudio(pending, offset, length)
-            if (finishing) all += s.finish()
-            cpuHeads = all
-            val fresh = if (all.size > delivered) all.subList(delivered, all.size).toList() else emptyList()
-            delivered = all.size
-            return fresh
-        }
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> =
+            streamer.push(fe.push(samples, offset, length))
 
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
-            cpuStream?.let { s ->
-                val out = s.pushAudio(samples, offset, length)
-                cpuHeads!!.addAll(out)
-                delivered += out.size
-                return out
-            }
-            return try {
-                val frames = fe.push(samples, offset, length)
-                val out = streamer.push(frames)
-                audio.add(samples, offset, length)
-                delivered += out.size
-                out
-            } catch (e: Exception) {
-                fallback(e, samples, offset, length, false)
-            }
-        }
-
-        override fun finish(): List<TajweedHeads> {
-            cpuStream?.let { s ->
-                val out = s.finish()
-                cpuHeads!!.addAll(out)
-                delivered += out.size
-                return out
-            }
-            return try {
-                val out = streamer.push(fe.finish())
-                delivered += out.size
-                out
-            } catch (e: Exception) {
-                fallback(e, null, 0, 0, true)
-            }
-        }
-
-        override fun takeHeads(): List<TajweedHeads>? = cpuHeads
+        override fun finish(): List<TajweedHeads> = streamer.push(fe.finish())
 
         override fun reset() {
-            cpuStream?.close()
-            cpuStream = null
-            cpuHeads = null
             fe.reset()
             streamer.reset()
-            audio.clear()
-            delivered = 0
         }
 
-        override fun close() {
-            cpuStream?.close()
-            fe.close()
-        }
+        override fun close() = fe.close()
     }
+
+    private fun s(): TajweedEngine = scorer ?: throw UnsupportedOperationException("this NPU engine has no scorer")
 
     override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int): TajweedResult =
-        cpu.score(heads, config, settings, surah, ayah)
+        s().score(heads, config, settings, surah, ayah)
 
-    override fun expectedTokens(surah: Int, ayah: Int): IntArray = cpu.expectedTokens(surah, ayah)
+    override fun expectedTokens(surah: Int, ayah: Int): IntArray = s().expectedTokens(surah, ayah)
 
-    override fun expectedWords(surah: Int, ayah: Int): IntArray = cpu.expectedWords(surah, ayah)
+    override fun expectedWords(surah: Int, ayah: Int): IntArray = s().expectedWords(surah, ayah)
 
-    override fun close() {
-        try { runner.close() } catch (_: Exception) {}
-        cpu.close()
-    }
-}
-
-/** A growable float array (the take's audio, kept for a fallback replay). */
-internal class FloatList {
-    private var a = FloatArray(16_000)
-    var size = 0
-        private set
-
-    fun add(v: FloatArray, offset: Int, length: Int) {
-        if (size + length > a.size) a = a.copyOf(maxOf(size + length, a.size * 2))
-        System.arraycopy(v, offset, a, size, length)
-        size += length
-    }
-
-    fun toArray(): FloatArray = a.copyOf(size)
-    fun clear() { size = 0 }
+    /** The runner is the prepared accelerator's; the scorer the caller's. */
+    override fun close() {}
 }

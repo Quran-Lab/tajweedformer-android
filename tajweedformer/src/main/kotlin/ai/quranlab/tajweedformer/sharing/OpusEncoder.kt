@@ -3,7 +3,8 @@ package ai.quranlab.tajweedformer.sharing
 /**
  * The Opus settings sessions are shared with, the same in every TajweedFormer SDK (the Swift SDK's
  * `OpusSettings`): libopus 1.6.1, `OPUS_APPLICATION_AUDIO`, 192 kbit/s unconstrained VBR,
- * complexity 10, fullband, automatic signal type, 20 ms frames, one-second Ogg pages.
+ * complexity 10, fullband, automatic signal type, 20 ms frames, one-second Ogg pages. Since 2.0.1 a
+ * shared session's bitrate steps down on a bad network ([BitrateLadder]); [bitrate] is where it starts.
  */
 data class OpusSettings(
     val application: Application = Application.AUDIO,
@@ -34,6 +35,15 @@ data class OpusSettings(
     }
 }
 
+/** Where an encoder hands its packets, one at a time ([OpusEncoding.encodeTo]). */
+interface PacketSink {
+    /** Called before each packet is encoded: the Ogg writer opens a segment here and sets its bitrate. */
+    fun beforePacket() {}
+
+    /** One packet, as soon as it is encoded. */
+    fun packet(p: ByteArray)
+}
+
 /** An Opus encoder: PCM in, Opus packets out. The Ogg writer depends only on this. */
 interface OpusEncoding : AutoCloseable {
     /** The encoder's lookahead in 48 kHz samples (OpusHead pre-skip). */
@@ -47,6 +57,19 @@ interface OpusEncoding : AutoCloseable {
 
     /** The pre-skip plus the input in 48 kHz samples: the last Ogg page's granule position. */
     val finalGranulePosition: Long
+
+    /** Sets the bit rate (bit/s) of the packets encoded from now on; false when this encoder has none to set. */
+    fun setBitrate(bitrate: Int): Boolean = false
+
+    /** As [encode], packet by packet: [PacketSink.beforePacket] before each is encoded, then the packet. */
+    fun encodeTo(pcm: FloatArray, offset: Int, length: Int, sink: PacketSink) {
+        for (p in encode(pcm, offset, length)) { sink.beforePacket(); sink.packet(p) }
+    }
+
+    /** As [flush], packet by packet. */
+    fun flushTo(sink: PacketSink) {
+        for (p in flush()) { sink.beforePacket(); sink.packet(p) }
+    }
 
     override fun close() {}
 }
@@ -124,8 +147,22 @@ class LibOpusEncoder(
     }
 
     override fun encode(pcm: FloatArray, offset: Int, length: Int): List<ByteArray> {
-        if (finished) throw SharingException("opus", "the Opus encoder was flushed")
         val out = ArrayList<ByteArray>()
+        encodeTo(pcm, offset, length, object : PacketSink { override fun packet(p: ByteArray) { out.add(p) } })
+        return out
+    }
+
+    override fun flush(): List<ByteArray> {
+        val out = ArrayList<ByteArray>()
+        flushTo(object : PacketSink { override fun packet(p: ByteArray) { out.add(p) } })
+        return out
+    }
+
+    /** `OPUS_SET_BITRATE`: every packet encoded after it has this target. */
+    override fun setBitrate(bitrate: Int): Boolean = handle != 0L && OpusNative.encoderSet(handle, OpusNative.SET_BITRATE, bitrate) == OpusNative.OPUS_OK
+
+    override fun encodeTo(pcm: FloatArray, offset: Int, length: Int, sink: PacketSink) {
+        if (finished) throw SharingException("opus", "the Opus encoder was flushed")
         val perFrame = frame.size
         var i = 0
         while (i < length) {
@@ -138,25 +175,23 @@ class LibOpusEncoder(
             nonFiniteSamples += bad
             filled += n
             i += n
-            if (filled == perFrame) out.add(encodeFrame())
+            if (filled == perFrame) { sink.beforePacket(); sink.packet(encodeFrame()) }
         }
         samplesIn += (length / channels).toLong()
-        return out
     }
 
-    override fun flush(): List<ByteArray> {
+    override fun flushTo(sink: PacketSink) {
         if (finished) throw SharingException("opus", "the Opus encoder was flushed")
         finished = true
-        val out = ArrayList<ByteArray>()
         // the samples still owed: what is buffered plus the lookahead held inside the codec
         var owed = filled / channels + preSkip * sampleRate / 48_000
         while (owed > 0) {
             for (k in filled until frame.size) frame[k] = 0f
             filled = frame.size
-            out.add(encodeFrame())
+            sink.beforePacket()
+            sink.packet(encodeFrame())
             owed -= frameSize
         }
-        return out
     }
 
     private fun encodeFrame(): ByteArray {

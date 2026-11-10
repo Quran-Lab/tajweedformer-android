@@ -329,7 +329,7 @@ class NpuChainTest {
             override val osBuild = "b"
             override val deviceModel = "Galaxy Z Flip7"
             override val soc = "exynos2500"
-            override fun schedule(constrained: Boolean, work: () -> Unit) = work()
+            override fun schedule(delayMs: Long, unmetered: Boolean, work: () -> Unit) = work()
         }
         val acc = AcceleratorController(env, AcceleratorStore(dir()), prep, key("c24_l72"))
         acc.start()

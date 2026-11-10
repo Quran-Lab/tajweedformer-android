@@ -1,13 +1,17 @@
 package ai.quranlab.tajweedformer.cloud
 
+import ai.quranlab.tajweedformer.CheckStatus
+import ai.quranlab.tajweedformer.MaddClass
+import ai.quranlab.tajweedformer.TajweedResult
+
 /**
  * What the recognition SDK tells the cloud side (telemetry, issues, recitation sharing). The core
  * (`ai.quranlab.tajweedformer`: downloader, backends, recognizer) calls these from its own threads;
  * every method is cheap (a lock and a few additions; audio is copied and encoded on the caller's
  * thread only while sharing is on) and never throws. Every method has a no-op default.
  *
- * Nothing passed here leaves the device except as the anonymous daily sums of section 6, and the
- * audio, only while the learner agreed to share (section 9).
+ * Nothing passed here leaves the device except as the anonymous sums of the telemetry, and the
+ * audio, only while the learner agreed to share.
  */
 interface TajweedObserver {
     /** A model was loaded (each load; [cold] for the first of this process). */
@@ -48,6 +52,14 @@ interface TajweedObserver {
 
     /** An error worth an issue report (no free text: a kind, a code, SDK frames). */
     fun onIssue(kind: String, code: String, error: Throwable? = null) {}
+
+    /** A promotion attempt of the accelerator ended (promoted or failed at a stage): `promotions` telemetry, and an
+     *  incident report (`promotion_failed`) when it failed. */
+    fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {}
+
+    /** A session switched from the accelerator to the CPU: `promotions` telemetry, and an incident report
+     *  (`accelerator_failover`). */
+    fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) {}
 
     data class ModelLoad(val revision: String, val context: String, val backend: String, val ms: Double, val cold: Boolean)
 
@@ -90,7 +102,43 @@ interface TajweedObserver {
         val maddFlagged: Int = 0,
         val wordsScored: Int = 0,
         val wordsFlagged: Int = 0,
-    )
+        /**
+         * Per rule or class id (`vowel_sub` ... `insertion`, `madd`, `qalqalah`, `gemination`, `word`): the
+         * verdicts whose check ran (status not off, enabled in the settings in force), and of those the flagged.
+         */
+        val ruleChecks: Map<String, Int> = emptyMap(),
+        val ruleFlags: Map<String, Int> = emptyMap(),
+    ) {
+        companion object {
+            /** The counts of one scored ayah. */
+            @JvmStatic
+            fun of(r: TajweedResult): Scored {
+                val checks = LinkedHashMap<String, Int>()
+                val flags = LinkedHashMap<String, Int>()
+                fun add(key: String, flagged: Boolean) {
+                    checks[key] = (checks[key] ?: 0) + 1
+                    if (flagged) flags[key] = (flags[key] ?: 0) + 1
+                }
+                val st = r.settings
+                for (v in r.sites) if (v.status != CheckStatus.OFF && st.sites[v.siteClass]?.enabled == true) add(v.siteClass.key, v.flagged)
+                for (v in r.madd) {
+                    val on = st.madd.enabled && (v.maddClass != MaddClass.LAZIM || st.lazim.enabled)
+                    if (v.status != CheckStatus.OFF && on) add("madd", v.flagged)
+                }
+                for (v in r.qalqalah) if (v.status != CheckStatus.OFF && st.qalqalah.enabled) add("qalqalah", v.flagged)
+                for (v in r.gemination) if (v.status != CheckStatus.OFF && st.gemination.enabled) add("gemination", v.flagged)
+                for (w in r.words) add("word", w.flagged)
+                return Scored(
+                    surah = r.surah, ayah = r.ayah,
+                    classes = r.sites.groupBy { it.siteClass.key }.mapValues { (_, v) -> v.size to v.count { it.flagged } },
+                    maddC2 = r.madd.count { it.count == 2 }, maddC4 = r.madd.count { it.count == 4 },
+                    maddC6 = r.madd.count { it.count == 6 }, maddFlagged = r.madd.count { it.flagged },
+                    wordsScored = r.words.size, wordsFlagged = r.words.count { it.flagged },
+                    ruleChecks = checks, ruleFlags = flags,
+                )
+            }
+        }
+    }
 
     data class SessionEnd(
         /** Seconds of audio in the session. */

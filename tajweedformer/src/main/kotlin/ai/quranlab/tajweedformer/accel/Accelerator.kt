@@ -2,146 +2,321 @@ package ai.quranlab.tajweedformer.accel
 
 import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.SelfTestSet
+import ai.quranlab.tajweedformer.TajweedBackend
 import ai.quranlab.tajweedformer.TajweedEngine
+import ai.quranlab.tajweedformer.TajweedEngineStream
+import ai.quranlab.tajweedformer.TajweedHead
 import java.io.File
 import java.io.FileOutputStream
 
 /**
- * The accelerator's state (the 2.0.0 design point 7). The exact CPU engine serves in every state; only
- * [Ready] lets a new session run on the accelerator.
+ * The accelerator's state. The exact CPU engine serves in every state; only [Ready] lets a NEW session run on
+ * the accelerator.
  */
 sealed class AcceleratorState {
-    /** No accelerator for this device, model or app (the CPU engine serves). [reason] says why. */
+    /** No accelerator for this device, model, context or app (the CPU engine serves). [reason] says why. */
     data class Cpu(val reason: String) : AcceleratorState()
 
-    /** Being prepared in the background (download, load, self-test). */
-    object Preparing : AcceleratorState() {
-        override fun toString() = "Preparing"
-    }
+    /**
+     * The promotion pipeline is on its way: [stage] is the stage that runs or runs next (`download`, `compile`,
+     * `warmup`, `golden`, `measure`); [waitingFor] is set while it waits without counting a failure
+     * (`first_session`, `session`, `unmetered_network`, `battery`, `power_save`, `thermal`, `retry`).
+     */
+    data class Preparing(val stage: String = Stages.DOWNLOAD, val waitingFor: String? = null) : AcceleratorState()
 
-    /** Passed its self-test; the next session runs on it. */
-    data class Ready(val soc: String?, val timeToReadyMs: Long) : AcceleratorState()
+    /** Promoted: passed its golden test for this key, loaded and warm; the next session runs on it. [speedup] is the
+     *  CPU median chunk time over the accelerator's (telemetry only: a slower build is promoted too). */
+    data class Ready(val soc: String?, val timeToReadyMs: Long, val speedup: Double = Double.NaN) : AcceleratorState()
 
-    /** Turned off: a failed self-test, a crash during load, a timeout, the watchdog, the denylist. [reason]
-     *  is a stable code (see [Reasons]); [persistent] when it holds until the model revision or OS build changes. */
-    data class Disabled(val reason: String, val detail: String = "", val persistent: Boolean = false) : AcceleratorState()
+    /**
+     * Not used now: a failed stage, a failover, the denylist. [reason] is a stable code ([Reasons]); [persistent]
+     * when nothing will try again for this key (a new model revision or OS build is a new key); otherwise the
+     * pipeline tries again at [retryAtMs] (a later launch).
+     */
+    data class Disabled(val reason: String, val detail: String = "", val persistent: Boolean = false, val retryAtMs: Long = 0) : AcceleratorState()
 
     /** A short name for logs and telemetry: `cpu`, `preparing`, `ready`, `disabled`. */
     val key: String get() = when (this) {
         is Cpu -> "cpu"
-        Preparing -> "preparing"
+        is Preparing -> "preparing"
         is Ready -> "ready"
         is Disabled -> "disabled"
     }
 }
 
-/** Stable reason codes of [AcceleratorState] and of the CPU choices it causes. */
+/** The promotion pipeline's stages, in order (the record names the last one completed). */
+object Stages {
+    const val DOWNLOAD = "download"
+    const val COMPILE = "compile"
+    const val WARMUP = "warmup"
+    const val GOLDEN = "golden"
+    const val MEASURE = "measure"
+    const val PROMOTE = "promote"
+    /** Not a pipeline stage: a running session (a failover, or a crash at a session's first inference). */
+    const val SESSION = "session"
+
+    @JvmField val ORDER = listOf(DOWNLOAD, COMPILE, WARMUP, GOLDEN, MEASURE, PROMOTE)
+
+    /** The stage after [done] ("" = none done yet). */
+    @JvmStatic
+    fun after(done: String): String = if (done.isEmpty()) DOWNLOAD else ORDER.getOrElse(ORDER.indexOf(done) + 1) { PROMOTE }
+}
+
+/** Stable reason codes: the CPU choices, and the pipeline's failure reasons (the `promotions` telemetry's `reasons`). */
 object Reasons {
     const val NO_BUILD = "no_npu_build"
     const val SOC_UNKNOWN = "soc_unknown"
     const val RUNTIME_MISSING = "runtime_missing"
-    const val NOT_DOWNLOADED = "npu_not_downloaded"
-    const val LOAD_FAILED = "npu_load_failed"
-    const val LOAD_TIMEOUT = "npu_load_timeout"
-    const val CRASHED = "npu_crashed_during_load"
-    const val SELF_TEST = "npu_self_test_failed"
-    const val DENYLIST = "denylist"
+    const val NO_SELFTEST_SET = "no_selftest_set"
     const val FORCED_CPU = "forced_cpu"
     const val THERMAL = "thermal"
     const val MEMORY = "memory"
-    const val WATCHDOG = "watchdog"
-    /** Two watchdog trips on the same key across processes: off until the revision or OS build changes. */
-    const val WATCHDOG_REPEATED = "npu_watchdog_repeated"
-    const val RUNTIME_ERROR = "npu_runtime_error"
+
+    // pipeline failures (telemetry `reasons`)
+    const val NETWORK = "network"
+    const val STORAGE = "storage"
+    const val VERIFY = "verify"
+    const val COMPILE_ERROR = "compile_error"
+    const val COMPILE_TIMEOUT = "compile_timeout"
+    const val LOAD_ERROR = "load_error"
+    const val CRASH = "crash"
+    const val HANG = "hang"
+    const val NON_FINITE = "non_finite"
+    const val GOLDEN_MISMATCH = "golden_mismatch"
+    const val CPU_MISMATCH = "cpu_mismatch"
+    const val FAILOVER = "failover"
+    const val DENYLIST = "denylist"
+    const val OTHER = "other"
+
+    @JvmField val PIPELINE = listOf(NETWORK, STORAGE, VERIFY, COMPILE_ERROR, COMPILE_TIMEOUT, LOAD_ERROR, CRASH, HANG, NON_FINITE,
+        GOLDEN_MISMATCH, CPU_MISMATCH, FAILOVER, DENYLIST, OTHER)
+
+    /** Never retried for the same key: the same build on the same OS fails the same way. A new model revision or
+     *  OS build (a new key) tries again. */
+    @JvmField val DETERMINISTIC = setOf(GOLDEN_MISMATCH, CPU_MISMATCH, NON_FINITE, CRASH)
 }
 
 /**
- * What a prepared state is valid for: the model revision, the OS build (Android `Build.FINGERPRINT`), the
- * device model, the SoC and the context. An OS update gives a new key, so the accelerator is prepared and
- * self-tested again.
+ * What a promotion record is valid for: the model revision, the context, the accelerator build (`npu:<soc>`), the
+ * OS build (Android `Build.FINGERPRINT`) and the device model. A new revision or OS build is a new key: a fresh
+ * pipeline with a fresh retry budget.
  */
 data class AcceleratorKey(val revision: String, val osBuild: String, val deviceModel: String, val soc: String?, val context: String) {
-    val id: String get() = listOf(revision, osBuild, deviceModel, soc ?: "-", context).joinToString("|")
+    /** The accelerator build: `npu:<soc>`. */
+    val build: String get() = "npu:${soc ?: "-"}"
+
+    /** The record's key in `accelerator.json`. */
+    val id: String get() = listOf(revision, context, build, osBuild, deviceModel).joinToString("|")
+}
+
+/** The device conditions the pipeline runs in (section "conditions": not battery saver, battery 20 % or more or
+ *  charging, thermal nominal or light). */
+data class Conditions(
+    val batteryPct: Int = 100,
+    val charging: Boolean = true,
+    val powerSave: Boolean = false,
+    /** Android `PowerManager` thermal status name: `none`, `light`, `moderate`, `severe`, `critical`, `emergency`, `shutdown`. */
+    val thermal: String = "none",
+) {
+    /** Null when the pipeline may run now, else what it waits for. */
+    fun waitingFor(): String? = when {
+        powerSave -> "power_save"
+        !charging && batteryPct < 20 -> "battery"
+        thermal !in setOf("none", "light") -> "thermal"
+        else -> null
+    }
 }
 
 /** The platform around the controller (Android: [ai.quranlab.tajweedformer.android.AndroidAccelerator]; tests: fakes). */
 interface AcceleratorEnvironment {
-    /** The OS build (Android: Build.FINGERPRINT). */
+    /** The OS build of the key (Android: Build.FINGERPRINT). */
     val osBuild: String
     val deviceModel: String
     val soc: String?
 
-    /** Serious thermal state (Android: PowerManager thermal status >= SEVERE): prefer the CPU. */
+    /** For incident reports: the model code (`SM-S921B`, `Pixel 9`), never a name or serial. */
+    val deviceModelCode: String get() = deviceModel
+
+    /** For incident reports: Android `<release>/<Build.ID>/<Build.VERSION.INCREMENTAL>`. */
+    val osBuildReport: String get() = osBuild
+
+    /** For incident reports: the delegate or dispatch library and its version, when known. */
+    val delegate: String? get() = null
+
+    /** Serious thermal state at a session start (Android: thermal status >= SEVERE): that session runs on the CPU. */
     fun thermalSevere(): Boolean = false
 
-    /** A memory warning is in force (Android: onTrimMemory RUNNING_LOW or worse, or low memory): prefer the CPU. */
+    /** A memory warning at a session start (Android: onTrimMemory RUNNING_LOW or worse): that session runs on the CPU. */
     fun lowMemory(): Boolean = false
 
     /** The signed config's denylist: `exact` / `cpu` forces the CPU for this revision. */
     fun forcedBackend(revision: String): String? = null
 
+    /** The signed config's `accel_deny`: the reason when a rule keeps [accelerator] (`npu:<soc>`) off for [revision]. */
+    fun accelDenied(revision: String, accelerator: String): String? = null
+
+    /** The pipeline's conditions now (battery, battery saver, thermal). */
+    fun conditions(): Conditions = Conditions()
+
+    /** Whether the network is unmetered now (the download stage waits otherwise). */
+    fun unmetered(): Boolean = true
+
     /**
-     * Runs [work] in the background at low priority; [constrained] asks for the device to be idle and
-     * charging (Android: WorkManager with those constraints; the download inside also needs an unmetered
-     * network). The JVM runs it at once on a background thread.
+     * Runs [work] once in the background at low priority, after [delayMs] (and, with [unmetered], when the network
+     * is unmetered: Android hands both to WorkManager). The JVM runs it on a background thread.
      */
-    fun schedule(constrained: Boolean, work: () -> Unit)
+    fun schedule(delayMs: Long, unmetered: Boolean, work: () -> Unit)
 
     fun nowMs(): Long = System.currentTimeMillis()
 }
 
-/** An accelerator engine that passed its load, ready for sessions; [close] releases the runtime. */
+/** A stage failed with a pipeline reason ([Reasons]); [cause] keeps the error for the incident report. */
+class StageFailure(val reason: String, message: String, cause: Throwable? = null, val clip: String? = null,
+                   val divergence: Divergence? = null) : Exception(message, cause)
+
+/** How far a golden clip diverged (incident `detail.divergence`). */
+data class Divergence(val tokensExpected: Int, val tokensDiffer: Int, val sitesDiffer: Int, val wordsDiffer: Int)
+
+/** The golden stage's observations: every clip through the accelerator path and through the CPU engine, in one run. */
+class GoldenRun(val accelerator: Map<String, SelfTestSet.ClipObserved>, val cpu: Map<String, SelfTestSet.ClipObserved>)
+
+/** The golden stage stopped because a session started (not a failure: it runs again later). */
+class StageAborted : Exception("a session started")
+
+/** An accelerator loaded for this key ([AcceleratorPreparer.compile]): warm-up, golden test, session streams. */
 interface PreparedAccelerator : AutoCloseable {
-    /** A session engine on the accelerator over [cpu] (its scorer, and the CPU it falls back to mid-take). */
-    fun engine(cpu: TajweedEngine, sampleRate: Int, onFallback: (String) -> Unit): TajweedEngine
-
-    /** Runs the self-test set through the accelerator: what it decided on each clip, and its chunk times. */
-    fun selfTest(): Map<String, SelfTestSet.ClipObserved>
-
-    /** The context's expected decisions (shipped in the model folder). */
-    val expected: SelfTestSet.Expected
+    /** Audio per chunk, ms. */
     val chunkMs: Int
+
+    /** The thresholds its heads are scored with ([TajweedBackend.FP32] for an NPU's). */
+    val headsBackend: TajweedBackend get() = TajweedBackend.FP32
+
+    /** The context's expected decisions (shipped in the model folder, `selftest/expected_<ctx>.json`). */
+    val expected: SelfTestSet.Expected
 
     /** Ids of the planted clips (their tokens are not compared). */
     val planted: Set<String> get() = emptySet()
+
+    /** The values its heads can take; a chunk outside is a failed chunk (`out_of_range`). */
+    val range: HeadRange get() = HeadRange()
+
+    /** The build's golden-test allowance (the signed manifest's `golden_tolerance`; exact when absent). */
+    val tolerance: ai.quranlab.tajweedformer.ModelManifest.GoldenTolerance get() = ai.quranlab.tajweedformer.ModelManifest.GoldenTolerance.EXACT
+
+    /** The planted site(s) of each planted clip, which the accelerator must flag whatever the tolerance. */
+    val plantedSites: Map<String, Set<Pair<Int, String>>> get() = emptyMap()
+
+    /** Runs a second of silence and the first self-test clip through the accelerator path: lazy initialisation done.
+     *  Throws [StageFailure] (`non_finite`, `load_error`). */
+    fun warmup()
+
+    /**
+     * Decodes every self-test clip end to end through the accelerator path (the streaming code a session uses) and
+     * through the CPU engine, in this run, chunk by chunk with each chunk's compute time. Checks [abort] between
+     * pieces and throws [StageAborted] when it says so (the engine allows one live stream per process: a starting
+     * session gets it within one piece).
+     */
+    fun golden(abort: () -> Boolean): GoldenRun
+
+    /** A raw accelerator stream for one take (no fallback inside: [FailoverEngine] watches it). */
+    fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream
 }
 
-/** Brings an accelerator to the point of its self-test: availability, download, load. */
+/** Brings an accelerator to [PreparedAccelerator]: availability, download, compile. */
 interface AcceleratorPreparer {
-    /** Null when there is nothing to prepare on this device: the reason (`no_npu_build`, `soc_unknown`, `runtime_missing`). */
+    /** Null when there is something to prepare; else why not (`no_npu_build`, `soc_unknown`, `runtime_missing`, ...).
+     *  Not a failure: nothing is recorded. */
     fun unavailable(key: AcceleratorKey): String?
 
-    /** Downloads what is missing (may throw; on Android only on an unmetered network). */
+    /** Downloads what is missing (resumable, each file verified). Throws [StageFailure] (`network`, `storage`, `verify`). */
     fun download(key: AcceleratorKey)
 
-    /** Loads the accelerator (the slow, crash-prone step: LiteRT dispatch load). */
-    fun load(key: AcceleratorKey): PreparedAccelerator
+    /** What the build's programs are (a hash of their SHA-256); a promoted key whose programs changed is tested again. */
+    fun programId(key: AcceleratorKey): String = ""
+
+    /** Whether the build's files are all in place (a promoted key whose files are gone goes through the pipeline again). */
+    fun inPlace(key: AcceleratorKey): Boolean = true
+
+    /** Builds the accelerator program for this device and loads it (Android: LiteRT with the vendor dispatch; the
+     *  shipped builds are compiled ahead of time). Throws [StageFailure] (`compile_error`) or anything (mapped to it). */
+    fun compile(key: AcceleratorKey): PreparedAccelerator
 }
 
 /**
- * The accelerator's persistent records in the model folder: the crash sentinel and one verdict per
- * [AcceleratorKey]. The sentinel is written and fsync'd before every load and first run and removed after
- * a clean run; if it is there at startup, the last load or first run killed the process.
+ * The persisted promotion record of one key: the last stage completed, the attempt and failure counts, the backoff,
+ * and what the measure stage found. Written atomically after each stage.
+ */
+data class PromotionRecord(
+    /** The last stage completed in the current attempt ("" = none), or [Stages.PROMOTE] once promoted. */
+    val stage: String = "",
+    /** `pending` (an attempt to run or resume), `promoted`, `failed` (retryable at [nextAttemptAtMs]), `final` (never again). */
+    val status: String = PENDING,
+    /** Attempts started for this key (1 for the first). */
+    val attempt: Int = 0,
+    /** Failures counted against the retry budget (deterministic ones end it). */
+    val failures: Int = 0,
+    val reason: String = "",
+    val failedStage: String = "",
+    val detail: String = "",
+    val nextAttemptAtMs: Long = 0,
+    /** The launch the current attempt last ran in (one attempt per launch). */
+    val launch: String = "",
+    val compileMs: Long = -1,
+    val cpuMedianMs: Double = Double.NaN,
+    val accMedianMs: Double = Double.NaN,
+    val accP90Ms: Double = Double.NaN,
+    val promotedAtMs: Long = 0,
+    val updatedAtMs: Long = 0,
+    /** A denylist or `accel_deny` match was counted for this key (`reasons.denylist`, once). */
+    val denyCounted: Boolean = false,
+    /** What the promotion was verified on: the SHA-256 of the accelerator program files; another one reruns the golden test. */
+    val programSha: String = "",
+) {
+    val speedup: Double get() = if (accMedianMs > 0 && cpuMedianMs > 0) cpuMedianMs / accMedianMs else Double.NaN
+
+    fun toJson(): Map<String, Any?> = linkedMapOf(
+        "stage" to stage, "status" to status, "attempt" to attempt, "failures" to failures, "reason" to reason,
+        "failed_stage" to failedStage, "detail" to detail, "next_attempt_at_ms" to nextAttemptAtMs, "launch" to launch,
+        "compile_ms" to compileMs, "cpu_median_ms" to num(cpuMedianMs), "acc_median_ms" to num(accMedianMs),
+        "acc_p90_ms" to num(accP90Ms), "promoted_at_ms" to promotedAtMs, "updated_at_ms" to updatedAtMs,
+        "deny_counted" to denyCounted, "program_sha256" to programSha,
+    )
+
+    companion object {
+        const val PENDING = "pending"
+        const val PROMOTED = "promoted"
+        const val FAILED = "failed"
+        const val FINAL = "final"
+
+        private fun num(d: Double): Double? = if (d.isFinite()) d else null
+
+        fun fromJson(o: Map<*, *>): PromotionRecord {
+            fun s(k: String) = o[k] as? String ?: ""
+            fun l(k: String, d: Long = 0) = (o[k] as? Double)?.toLong() ?: d
+            fun d(k: String) = o[k] as? Double ?: Double.NaN
+            return PromotionRecord(s("stage"), (o["status"] as? String) ?: PENDING, l("attempt").toInt(), l("failures").toInt(), s("reason"),
+                s("failed_stage"), s("detail"), l("next_attempt_at_ms"), s("launch"), l("compile_ms", -1), d("cpu_median_ms"),
+                d("acc_median_ms"), d("acc_p90_ms"), l("promoted_at_ms"), l("updated_at_ms"), o["deny_counted"] == true, s("program_sha256"))
+        }
+    }
+}
+
+/**
+ * The accelerator's persistent state in the model folder: one [PromotionRecord] per [AcceleratorKey]
+ * (`accelerator.json`, written atomically: a temporary file renamed over it), the install's first-session flag, and
+ * the crash sentinel (`accelerator.sentinel`, written and synced before every compile, load, first inference and
+ * golden run, removed after; found at launch, the process died there).
  */
 class AcceleratorStore(private val dir: File) {
     private val sentinel = File(dir, "accelerator.sentinel")
     private val records = File(dir, "accelerator.json")
     private val lock = Any()
 
-    /** One watchdog trip: its reason (`latency`, `non_finite`, `all_blank`, `exception`) and time. */
-    data class Trip(val reason: String, val atMs: Long)
-
-    data class Record(
-        val status: String, val reason: String, val detail: String, val atMs: Long, val timeToReadyMs: Long,
-        /** Every watchdog trip on this key, across processes. */
-        val trips: List<Trip> = emptyList(),
-    )
-
-    /** Written and synced to disk before the risky step, naming the key and the step. */
-    fun armSentinel(key: AcceleratorKey, step: String) = synchronized(lock) {
+    /** Written and synced to disk before the risky step, naming the key and the stage. */
+    fun armSentinel(key: AcceleratorKey, stage: String) = synchronized(lock) {
         dir.mkdirs()
         FileOutputStream(sentinel).use { out ->
-            out.write(Json.write(mapOf("key" to key.id, "step" to step)).toByteArray())
+            out.write(Json.write(mapOf("key" to key.id, "stage" to stage)).toByteArray())
             out.flush()
             out.fd.sync()
         }
@@ -149,55 +324,71 @@ class AcceleratorStore(private val dir: File) {
 
     fun clearSentinel() = synchronized(lock) { sentinel.delete(); Unit }
 
-    /** The key id and step of a sentinel left by a process that died, or null. */
+    /** The key id and stage of a sentinel left by a process that died, or null. */
     fun leftSentinel(): Pair<String, String>? = synchronized(lock) {
         if (!sentinel.isFile) return null
         return try {
             val m = Json.parse(sentinel.readText()) as Map<*, *>
-            (m["key"] as String) to (m["step"] as? String ?: "")
+            (m["key"] as String) to (m["stage"] as? String ?: "")
         } catch (_: Exception) {
-            "" to "unreadable"
+            "" to ""
         }
     }
 
-    fun record(key: AcceleratorKey): Record? = synchronized(lock) { load()[key.id] }
+    fun record(key: AcceleratorKey): PromotionRecord? = synchronized(lock) { load().second[key.id] }
 
-    /** Stores [r] for [keyId]; the trips already recorded for the key are kept (and [r]'s added). */
-    fun put(keyId: String, r: Record) = synchronized(lock) {
-        val all = HashMap(load())
-        val old = all[keyId]?.trips.orEmpty()
-        all[keyId] = r.copy(trips = (old + r.trips).distinct())
+    fun record(keyId: String): PromotionRecord? = synchronized(lock) { load().second[keyId] }
+
+    fun put(key: AcceleratorKey, r: PromotionRecord) = put(key.id, r)
+
+    fun put(keyId: String, r: PromotionRecord) = synchronized(lock) {
+        val (install, all) = load()
+        val m = HashMap(all)
+        m[keyId] = r
+        save(install, m)
+    }
+
+    /** A session has started on this install before (the pipeline then may start at launch). */
+    var sessionStarted: Boolean
+        get() = synchronized(lock) { load().first["session_started"] == true }
+        set(v) = synchronized(lock) {
+            val (install, all) = load()
+            if ((install["session_started"] == true) == v) return
+            save(install + ("session_started" to v), all)
+        }
+
+    fun forget() = synchronized(lock) { records.delete(); sentinel.delete(); Unit }
+
+    private fun save(install: Map<String, Any?>, all: Map<String, PromotionRecord>) {
         dir.mkdirs()
         val tmp = File(records.path + ".tmp")
-        tmp.writeText(Json.write(all.mapValues { (_, v) ->
-            mapOf("status" to v.status, "reason" to v.reason, "detail" to v.detail, "at_ms" to v.atMs, "time_to_ready_ms" to v.timeToReadyMs,
-                "trips" to v.trips.map { t -> mapOf("reason" to t.reason, "at_ms" to t.atMs) })
-        }.toSortedMap()))
+        FileOutputStream(tmp).use { out ->
+            out.write(Json.write(linkedMapOf("format" to FORMAT, "install" to install,
+                "keys" to all.mapValues { it.value.toJson() }.toSortedMap())).toByteArray())
+            out.flush()
+            out.fd.sync()
+        }
         if (!tmp.renameTo(records)) {
             records.delete()
             tmp.renameTo(records)
         }
     }
 
-    fun forget() = synchronized(lock) { records.delete(); sentinel.delete(); Unit }
-
-    private fun load(): Map<String, Record> {
-        if (!records.isFile) return emptyMap()
+    private fun load(): Pair<Map<String, Any?>, Map<String, PromotionRecord>> {
+        if (!records.isFile) return emptyMap<String, Any?>() to emptyMap()
         return try {
-            (Json.parse(records.readText()) as Map<*, *>).entries.associate { (k, v) ->
-                val o = v as Map<*, *>
-                k as String to Record(o["status"] as String, o["reason"] as? String ?: "", o["detail"] as? String ?: "",
-                    (o["at_ms"] as Double).toLong(), (o["time_to_ready_ms"] as? Double)?.toLong() ?: 0,
-                    (o["trips"] as? List<*>).orEmpty().map { t -> val m = t as Map<*, *>; Trip(m["reason"] as String, (m["at_ms"] as Double).toLong()) })
-            }
+            val m = Json.parse(records.readText()) as Map<*, *>
+            // a 2.0.0 file (a map of verdicts, no format) is not carried over: every key prepares again
+            if (m["format"] != FORMAT) return emptyMap<String, Any?>() to emptyMap()
+            @Suppress("UNCHECKED_CAST")
+            val install = (m["install"] as? Map<String, Any?>).orEmpty()
+            install to (m["keys"] as? Map<*, *>).orEmpty().entries.associate { (k, v) -> k as String to PromotionRecord.fromJson(v as Map<*, *>) }
         } catch (_: Exception) {
-            emptyMap()
+            emptyMap<String, Any?>() to emptyMap()
         }
     }
 
     companion object {
-        const val READY = "ready"
-        const val FAILED = "failed"
-        const val CRASHED = "crashed"
+        const val FORMAT = "quranlab.accelerator/2"
     }
 }

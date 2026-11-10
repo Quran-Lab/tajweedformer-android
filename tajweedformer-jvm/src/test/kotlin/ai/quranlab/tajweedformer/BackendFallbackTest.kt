@@ -19,10 +19,10 @@ import java.util.Collections
 import java.util.zip.GZIPInputStream
 
 /**
- * The NPU's mid-take fallback with the REAL host loop (the exact engine's front end through JNI, the staged
- * tensor_g5 io.json and masks.json, [NpuTajweedEngine]) over a fake runner that throws at its third chunk:
- * the take is replayed on the CPU, scored as CPU, and the next takes run on the CPU (the watchdog's
- * `exception`). Needs the JNI library (build/host) and the staged folder.
+ * The NPU's in-session failover with the REAL host loop (the exact engine's front end through JNI, the staged
+ * tensor_g5 io.json and masks.json, [NpuTajweedEngine] under the failover engine) over a fake runner that throws at
+ * its third chunk: the take continues on the CPU from the failed chunk, is scored as CPU, the key is demoted and the
+ * next takes run on the CPU. Needs the JNI library (build/host) and the staged folder.
  */
 class BackendFallbackTest {
     private val dirs = ArrayList<File>()
@@ -165,29 +165,32 @@ class BackendFallbackTest {
 
     private fun fallbackTake(contract: NpuContract, masks: NpuMasks, soc: String, runner: () -> NpuRunner) = runBlocking {
         val cpu = CpuFake()
+        val clips = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipExpected(1, listOf(1), emptySet(), emptySet(), emptyList()) }
+        val same = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipObserved(1, listOf(1), emptySet(), emptySet(), true, listOf(5.0)) }
+        val r = runner()
         val prepared = object : ai.quranlab.tajweedformer.accel.PreparedAccelerator {
-            override val expected = SelfTestSet.Expected("c16_l64", "x", "balanced", "general",
-                mapOf("a" to SelfTestSet.ClipExpected(1, listOf(1), emptySet(), emptySet(), emptyList())))
+            override val expected = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", clips)
             override val chunkMs = 320
-            override fun engine(cpu: TajweedEngine, sampleRate: Int, onFallback: (String) -> Unit): TajweedEngine =
-                NpuTajweedEngine(cpu, contract, masks, runner(), sampleRate, onFallback).also { it.fallbackEnabled = true }
-            override fun selfTest() = mapOf("a" to SelfTestSet.ClipObserved(1, listOf(1), emptySet(), emptySet(), true, listOf(5.0)))
+            override fun warmup() {}
+            override fun golden(abort: () -> Boolean) = ai.quranlab.tajweedformer.accel.GoldenRun(same, same)
+            override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream =
+                NpuTajweedEngine(contract, masks, r, sampleRate).createStream(heads)
             override fun close() {}
         }
         val env = object : ai.quranlab.tajweedformer.accel.AcceleratorEnvironment {
             override val osBuild = "b"
             override val deviceModel = "m"
             override val soc = soc
-            override fun schedule(constrained: Boolean, work: () -> Unit) = work()
+            override fun schedule(delayMs: Long, unmetered: Boolean, work: () -> Unit) = work()
         }
         val prep = object : ai.quranlab.tajweedformer.accel.AcceleratorPreparer {
             override fun unavailable(key: ai.quranlab.tajweedformer.accel.AcceleratorKey): String? = null
             override fun download(key: ai.quranlab.tajweedformer.accel.AcceleratorKey) {}
-            override fun load(key: ai.quranlab.tajweedformer.accel.AcceleratorKey) = prepared
+            override fun compile(key: ai.quranlab.tajweedformer.accel.AcceleratorKey) = prepared
         }
-        val acc = ai.quranlab.tajweedformer.accel.AcceleratorController(env, ai.quranlab.tajweedformer.accel.AcceleratorStore(dir()), prep,
+        val store = ai.quranlab.tajweedformer.accel.AcceleratorStore(dir()).also { it.sessionStarted = true }
+        val acc = ai.quranlab.tajweedformer.accel.AcceleratorController(env, store, prep,
             ai.quranlab.tajweedformer.accel.AcceleratorKey("r", "b", "m", soc, "c16_l64"))
-        acc.recordCpuChunk(40.0)
         acc.start()
         assertTrue(acc.state.value is ai.quranlab.tajweedformer.accel.AcceleratorState.Ready)
         val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(accelerator = acc, soc = soc, engine = { _, _, _ -> cpu }))
@@ -200,16 +203,18 @@ class BackendFallbackTest {
             s.append(clip, at, k)
             at += k
         }
-        val r = s.finishAndScore(1, 1)
+        val res = s.finishAndScore(1, 1)
         val got = chunks.await()
-        // the first two chunks came from the NPU, the rest from the CPU replay; scored as CPU (int8)
+        // the first two chunks came from the NPU, the failed third and the rest from the CPU (the take so far fits in the
+        // replay window, so the CPU replayed it from its first sample); scored as CPU (int8): most chunks are the CPU's
         assertEquals(listOf(Backend.NPU, Backend.NPU), got.take(2).map { it.backend })
         assertTrue(got.drop(2).all { it.backend == Backend.CPU })
         assertEquals(8, got.size)
+        assertEquals((0 until 8).toList(), got.map { it.index })
         assertEquals(TajweedBackend.INT8, cpu.scoredBackend)
-        assertEquals(Backend.CPU, r.backend)
-        assertEquals("npu_runtime_error", rec.backendChoice.reason)
-        assertEquals("watchdog_exception", (acc.state.value as ai.quranlab.tajweedformer.accel.AcceleratorState.Disabled).reason)
+        assertEquals(Backend.CPU, res.backend)
+        assertEquals("failover_exception", rec.backendChoice.reason)
+        assertEquals(ai.quranlab.tajweedformer.accel.Reasons.FAILOVER, (acc.state.value as ai.quranlab.tajweedformer.accel.AcceleratorState.Disabled).reason)
         // the next take runs on the CPU from the start
         val s2 = rec.startSession()
         s2.append(FloatArray(6000))

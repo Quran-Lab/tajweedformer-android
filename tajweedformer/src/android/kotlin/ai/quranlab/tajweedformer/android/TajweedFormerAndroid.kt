@@ -25,9 +25,10 @@ import java.io.File
  * library in its native libraries; without them the recognizer runs on the CPU (reason
  * `runtime_missing` in [ai.quranlab.tajweedformer.SdkObserver.onBackendSelected]).
  *
- * CPU first: the first session runs on the exact CPU engine; the NPU is prepared in
- * the background (WorkManager: idle, charging, unmetered) and used by later sessions once it passed its
- * self-test. `client.accelerator(model)?.state` shows where it is.
+ * CPU first: the first session runs on the exact CPU engine; the NPU is promoted in the background (download on an
+ * unmetered network, load, warm-up, the golden test against the CPU engine; WorkManager unique work that survives the
+ * app being killed and the phone restarting) and used from the next session once it is ready and warm.
+ * `client.accelerator(model)?.state` shows where it is.
  *
  * When the app has called `QuranLabAndroid.configure` (the portal link), the client reports to it
  * ([CloudBridge]), takes the portal's `tajweed` block at every session start and follows the
@@ -35,6 +36,21 @@ import java.io.File
  */
 object TajweedFormerAndroid {
     @Volatile private var env: AndroidAccelerator? = null
+    private const val PREFS = "ai.quranlab.tajweedformer.accelerator"
+
+    /**
+     * Resumes every accelerator promotion recorded on this device (the worker calls this in a process WorkManager started
+     * after the app was killed or the phone restarted): the model folder and URL the app last used, the stored manifest,
+     * each context with a record. Blocking; returns the keys run.
+     */
+    @JvmStatic
+    fun resumePromotions(context: Context): Int {
+        val app = context.applicationContext
+        val p = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val dir = p.getString("dir", null)?.let(::File) ?: return 0
+        val base = p.getString("base", null) ?: ModelStore.DEFAULT_BASE_URL
+        return client(app, baseUrl = base, dir = dir).resumePromotions()
+    }
 
     @Synchronized
     private fun environment(app: Context, debug: Boolean): AndroidAccelerator {
@@ -64,6 +80,11 @@ object TajweedFormerAndroid {
         // without explicit headers: the portal link's app key, when configured
         val h = headers ?: HeaderProvider { QuranLabAndroid.cloud?.key?.value?.let { mapOf("x-qlab-key" to it) } ?: emptyMap() }
         val store = ModelStore(dir, baseUrl, transport, h, verifier)
+        // what a process WorkManager starts needs to resume the promotion (resumePromotions)
+        if (npu) try {
+            app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("dir", dir.path).putString("base", baseUrl).apply()
+        } catch (_: Exception) {
+        }
         val debug = TajweedAndroid.isDebuggable(app)
         val network = AndroidNetwork(app)
         return TajweedFormerClient(
@@ -78,6 +99,10 @@ object TajweedFormerAndroid {
                 accelerator = if (npu) environment(app, debug) else null,
                 forcedBackend = { rev -> QuranLabAndroid.cloud?.forcedBackend(rev) },
             ),
-        )
+        ).also { c ->
+            // a key promoted in an earlier launch loads and warms now, in the background
+            if (npu) Thread({ try { c.startPromoted() } catch (_: Exception) {} }, "tajweedformer-npu-warm")
+                .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
+        }
     }
 }

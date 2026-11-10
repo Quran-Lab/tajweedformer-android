@@ -116,10 +116,50 @@ class ModelStore @JvmOverloads constructor(
     /** The NPU files of [soc] and [context] in the manifest (empty: no NPU build for them). */
     fun npuFiles(soc: String?, context: String): List<ModelManifest.FileEntry> = ModelProfile.npu(manifest(), soc, context)
 
-    /** Whether every NPU file of [soc] and [context] is in place and verified. */
+    /** Whether every NPU file of [soc] and [context] is in place and verified (each program downloaded, or rebuilt from its
+     *  delta and checked). */
     fun isNpuReady(soc: String?, context: String): Boolean {
         val f = npuFiles(soc, context)
-        return f.isNotEmpty() && f.all { downloader.isInPlace(it) }
+        return f.isNotEmpty() && npuInPlace(f)
+    }
+
+    private fun programInPlace(p: ModelProfile.Program): Boolean =
+        (p.full != null && downloader.isInPlace(p.full)) || downloader.isBuiltInPlace(File(root, p.path))
+
+    private fun npuInPlace(files: List<ModelManifest.FileEntry>): Boolean =
+        files.filter { it.role == "npu-io" || it.role == "npu-masks" }.all { downloader.isInPlace(it) } &&
+            ModelProfile.npuPrograms(files).all { programInPlace(it) }
+
+    /**
+     * Brings one program into place: rebuilt from its delta when the manifest lists one (checked against the delta's
+     * target and the program's own entry when listed), else downloaded; a delta that does not rebuild to its target falls
+     * back to the full program when the manifest lists it.
+     */
+    private fun fetchProgram(p: ModelProfile.Program, context: String, cancel: Cancellation?, revision: String) {
+        if (programInPlace(p)) return
+        val d = p.delta
+        if (d != null) {
+            val out = File(root, p.path)
+            try {
+                downloader.fetch(d, cancel, null, revision)
+                val r = ai.quranlab.tajweedformer.accel.ProgramDelta.rebuild(downloader.local(d),
+                    ai.quranlab.tajweedformer.accel.ProgramDelta.CpuFiles.of(root, context), out, p.full?.localSha256, p.full?.localSize)
+                downloader.recordBuilt(out, r.size, r.sha256)
+                // the program is what is kept: the delta's decoded file goes
+                downloader.local(d).delete()
+                return
+            } catch (e: ai.quranlab.tajweedformer.accel.ProgramDelta.Refused) {
+                downloader.local(d).delete()
+                out.delete()
+                if (p.full == null) throw RecognizerException.DownloadFailed(d.path, "the rebuilt program's sha256 does not match: ${e.message}")
+                SdkEvents.emit { it.onError("npu_delta", e) }
+            } catch (e: java.io.IOException) {
+                downloader.local(d).delete()
+                out.delete()
+                if (p.full == null) throw RecognizerException.DownloadFailed(d.path, "the delta did not rebuild: ${e.message}", e)
+            }
+        }
+        downloader.fetch(p.full ?: throw RecognizerException.DownloadFailed(p.path, "no program"), cancel, null, revision)
     }
 
     /**
@@ -141,19 +181,30 @@ class ModelStore @JvmOverloads constructor(
         if (soc == null) return NpuDownload(null, "soc_unknown")
         val files = npuFiles(soc, context)
         if (files.isEmpty()) return NpuDownload(null, "no_npu_build")
-        if (files.all { downloader.isInPlace(it) }) return NpuDownload(npuLocal(files), "ready")
+        if (npuInPlace(files)) return NpuDownload(npuLocal(files), "ready")
         if (!cpuSelfTestPassed) return NpuDownload(null, "cpu_self_test_pending")
         if (!network.isUnmetered()) return NpuDownload(null, "metered_network")
-        fetchAll(files, cancel, onProgress, manifest().revision)
+        val revision = manifest().revision
+        // the I/O contract and the masks first (small), then each program: by delta when there is one
+        fetchAll(files.filter { it.role == "npu-io" || it.role == "npu-masks" }, cancel, onProgress, revision)
+        for (p in ModelProfile.npuPrograms(files)) fetchProgram(p, context, cancel, revision)
         return NpuDownload(npuLocal(files), "downloaded")
     }
 
     private fun npuLocal(files: List<ModelManifest.FileEntry>): NpuFiles {
         fun f(role: String) = downloader.local(files.first { it.role == role })
-        val parts = files.filter { it.role == ModelProfile.NPU_PART_ROLE }
-            .sortedWith { a, b -> ModelManifest.compareUtf8(a.localPath, b.localPath) }.map { downloader.local(it) }
-        return if (parts.isEmpty()) NpuFiles(f("npu-model"), f("npu-io"), f("npu-masks"))
+        val programs = ModelProfile.npuPrograms(files)
+        val parts = programs.filter { it.part }.map { File(root, it.path) }
+        return if (parts.isEmpty()) NpuFiles(File(root, programs.single().path), f("npu-io"), f("npu-masks"))
         else NpuFiles(parts.first(), f("npu-io"), f("npu-masks"), parts)
+    }
+
+    /** What the NPU build of [soc] and [context] is made of: its programs' SHA-256 (listed, or the delta's target), so a
+     *  changed program reruns the promotion's golden test. Empty without a build. */
+    fun npuProgramId(soc: String?, context: String): String {
+        val files = npuFiles(soc, context)
+        if (files.isEmpty()) return ""
+        return ModelProfile.npuPrograms(files).joinToString(",") { p -> p.full?.localSha256 ?: ("delta:" + (p.delta?.localSha256 ?: "")) }
     }
 
     private fun fetchAll(files: List<ModelManifest.FileEntry>, cancel: Cancellation?, onProgress: ((ProfileProgress) -> Unit)?, revision: String) {
@@ -170,8 +221,11 @@ class ModelStore @JvmOverloads constructor(
     /** Deletes kept files the current manifest does not list (an older revision's), and stale parts. */
     fun prune(): Int {
         val m = manifest()
+        // a program rebuilt from a delta, and the size and SHA-256 kept next to it, stay with the delta's entry
+        val built = m.files.filter { it.role == ModelProfile.NPU_DELTA_ROLE }.map { ModelProfile.deltaProgram(it) } +
+            m.files.filter { it.role == "npu-model" || it.role == ModelProfile.NPU_PART_ROLE }.map { it.localPath }
         val keep = m.files.map { it.localPath }.toSet() + m.files.flatMap { listOf(it.path + ".part", it.path + ".part.v") } +
-            setOf(ModelManifest.FILE_NAME, VerifiedStamps.FILE_NAME)
+            built + built.map { "$it.target" } + setOf(ModelManifest.FILE_NAME, VerifiedStamps.FILE_NAME, "accelerator.json", "accelerator.sentinel")
         var n = 0
         root.walkBottomUp().filter { it.isFile }.forEach { f ->
             val rel = f.relativeTo(root).invariantSeparatorsPath

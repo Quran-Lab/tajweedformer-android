@@ -86,6 +86,47 @@ class TajweedFormerClient(
     }
 
     /**
+     * At SDK init: every context whose key was promoted in an earlier launch starts loading and warming its accelerator now,
+     * in the background (no golden test), so the first session after launch normally starts on it; a session that starts
+     * before it is warm runs on the CPU and never waits. Blocking only for reading the records; returns the keys started.
+     */
+    fun startPromoted(): Int {
+        val env = platform.accelerator ?: return 0
+        if (!platform.npuDownloads) return 0
+        val m = try { store.manifest() } catch (_: Exception) { return 0 }
+        val records = AcceleratorStore(store.root)
+        var n = 0
+        for (ctx in m.contexts) {
+            val r = records.record(AcceleratorKey(m.revision, env.osBuild, env.deviceModel, env.soc, ctx)) ?: continue
+            if (r.status != ai.quranlab.tajweedformer.accel.PromotionRecord.PROMOTED) continue
+            val model = store.openIfReady(ctx) ?: continue
+            if (accelerator(model, ctx) != null) n++
+        }
+        return n
+    }
+
+    /**
+     * Resumes, blocking, every accelerator promotion this device has a record of (the Android worker calls this in a fresh
+     * process): for each context of the stored manifest whose CPU files are in place and whose key has a record, the
+     * controller is started and its pipeline run to its next wait. Returns the keys run.
+     */
+    fun resumePromotions(): Int {
+        val env = platform.accelerator ?: return 0
+        if (!platform.npuDownloads) return 0
+        val m = try { store.manifest() } catch (_: Exception) { return 0 }
+        val records = AcceleratorStore(store.root)
+        var n = 0
+        for (ctx in m.contexts) {
+            val model = store.openIfReady(ctx) ?: continue
+            if (records.record(AcceleratorKey(m.revision, env.osBuild, env.deviceModel, env.soc, ctx)) == null) continue
+            val c = accelerator(model, ctx) ?: continue
+            c.runPipeline()
+            n++
+        }
+        return n
+    }
+
+    /**
      * A recognizer: the exact CPU engine now (after its self-test), the NPU for later sessions once it is
      * ready ([AcceleratorController.state]). [options]' `accelerator`, `soc`, `debugBuild` and `selfTest`
      * are filled in here (an explicit `debugBuild = true` is kept); the portal's denylist forces the CPU.

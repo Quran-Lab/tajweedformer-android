@@ -289,6 +289,105 @@ class SharingCodecTest {
         } finally { one.delete(); dir.deleteRecursively() }
     }
 
+    /**
+     * SDK 2.0.1: the bitrate changes between segments and the stream stays one valid Ogg Opus file. Real
+     * libopus on the self-test clip repeated to 155 s (5 segments) at 16 kHz, the ladder driven so that the
+     * segments are coded at 192, 96, 32, 64 and 192 kbit/s: one serial, pages in sequence from 0, BOS only on
+     * page 0, OpusHead only on page 0 and OpusTags only on page 1, every CRC, granules 960 x packets, EOS only
+     * on the last page whose granule is the encoder's final position, the decode exactly the input's length,
+     * each segment's bitrate as recorded, and its bytes per second following the rung. Where ffmpeg is on
+     * PATH: ffprobe's duration within 20 ms, ffmpeg's native and libopus decoders exactly the input's length.
+     */
+    @Test fun bitrateStepsBetweenSegmentsInOneValidStream() {
+        val raw = SharingCodecTest::class.java.getResourceAsStream("/ai/quranlab/tajweedformer/selftest_16k.f32")!!.use { it.readBytes() }
+        val fb = java.nio.ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val clip = FloatArray(fb.remaining()).also { fb.get(it) }
+        val rate = 16_000
+        val seconds = 155
+        val input = FloatArray(rate * seconds) { clip[it % clip.size] }
+        val ladder = BitrateLadder()
+        val asked = ArrayList<Int>()
+        val dir = tempDir()
+        try {
+            val closed = ArrayList<OggSegment>()
+            val w = OggOpusWriter({ File(dir, ShareFiles.name(it) + ".opus") }, SegmentPlan.SECONDS, rate, serial = 0x5eed,
+                bitrateFor = { n ->
+                    // what the outbox would have reported before segment n opens
+                    when (n) {
+                        2 -> ladder.uploadFailed()
+                        3 -> repeat(2) { ladder.uploadFailed() }
+                        4 -> repeat(3) { ladder.uploadOk(0.0) }
+                        5 -> repeat(6) { ladder.uploadOk(0.0) }
+                    }
+                    asked.add(n)
+                    ladder.bitrate
+                }) { closed.add(it) }
+            feed(w, input, 160, 40)
+            w.finish()
+            val want = listOf(192_000, 96_000, 32_000, 64_000, 192_000)
+            assertEquals("asked once per segment, when it opens", (1..5).toList(), asked)
+            assertEquals(want, closed.map { it.bitrate })
+            assertEquals(want, w.segmentBitrates)
+            assertEquals(listOf(false, false, false, false, true), closed.map { it.last })
+
+            val parts = closed.map { it.file.readBytes() }
+            val whole = parts.reduce { a, b -> a + b }
+            val ps = pages(whole) // every CRC is checked here
+            assertEquals("page sequence from 0", ps.indices.toList(), ps.map { it.sequence })
+            assertEquals("one serial", setOf(0x5eed), ps.map { it.serial }.toSet())
+            assertEquals("BOS only on page 0", listOf(0), ps.indices.filter { ps[it].flags and 0x02 != 0 })
+            assertEquals("EOS only on the last page", listOf(ps.size - 1), ps.indices.filter { ps[it].flags and 0x04 != 0 })
+            fun starts(p: OggTestKit.Page, tag: String) = p.packets.any { it.size >= 8 && String(it, 0, 8, Charsets.US_ASCII) == tag }
+            assertEquals("OpusHead only on page 0", listOf(0), ps.indices.filter { starts(ps[it], "OpusHead") })
+            assertEquals("OpusTags only on page 1", listOf(1), ps.indices.filter { starts(ps[it], "OpusTags") })
+            var packets = 0L
+            for (p in ps.drop(2)) {
+                packets += p.packets.size
+                if (p.flags and 0x04 == 0) assertEquals("granule = 960 x packets", packets * 960, p.granule)
+            }
+            val input48 = seconds.toLong() * 48_000
+            assertEquals("the last granule is the encoder's final position", w.preSkip + input48, ps.last().granule)
+            val decoded = decode(whole)
+            assertEquals("libopus decodes exactly the input", input48, decoded.size.toLong())
+
+            // bytes per second of each segment's audio follow the rungs
+            val kbps = closed.indices.map { i ->
+                val audio = pages(parts[i]).filter { !starts(it, "OpusHead") && !starts(it, "OpusTags") }
+                val n = audio.sumOf { it.packets.size }
+                val bytes = audio.sumOf { pg -> pg.packets.sumOf { it.size } }
+                Triple(n, parts[i].size, bytes * 8.0 / (n * 0.020) / 1000)
+            }
+            for ((i, k) in kbps.withIndex()) {
+                println("bitrate stream: segment %d at %d kbit/s: %d packets (%.2f s), %d bytes, %.1f kbit/s measured".format(java.util.Locale.ROOT,
+                    i + 1, want[i] / 1000, k.first, k.first * 0.020, k.second, k.third))
+            }
+            val m = kbps.map { it.third }
+            assertTrue("32k < 64k < 96k < 192k: $m", m[2] < m[3] && m[3] < m[1] && m[1] < m[0] && m[1] < m[4])
+            assertTrue("a 32k segment is clearly smaller than a 192k one: $m", m[2] * 3 < m[0] && m[2] * 3 < m[4])
+            // unconstrained VBR spends somewhat above the target on recitation, more so at the low rungs
+            for (i in m.indices) assertTrue("segment ${i + 1}: ${m[i]} kbit/s for ${want[i] / 1000}", m[i] > want[i] / 1000.0 * 0.6 && m[i] < want[i] / 1000.0 * 1.6)
+            println("bitrate stream: %d pages, %d bytes, %d packets, %d samples decoded (input %d at 48 kHz), last granule %d, pre-skip %d".format(java.util.Locale.ROOT,
+                ps.size, whole.size, packets, decoded.size, input48, ps.last().granule, w.preSkip))
+
+            val f = File(dir, "whole.opus").also { it.writeBytes(whole) }
+            val probe = OggTestKit.run("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", f.path)
+            if (probe == null) {
+                println("bitrate stream: ffprobe/ffmpeg not on PATH, their checks skipped")
+            } else {
+                val duration = String(probe.second, Charsets.US_ASCII).trim().toDouble()
+                println("bitrate stream: ffprobe duration %.6f s (input %d s)".format(java.util.Locale.ROOT, duration, seconds))
+                assertEquals("ffprobe exit", 0, probe.first)
+                assertEquals("ffprobe duration within 20 ms", seconds.toDouble(), duration, 0.020)
+                for (dec in listOf("opus", "libopus")) {
+                    val r = OggTestKit.run("ffmpeg", "-v", "error", "-c:a", dec, "-i", f.path, "-f", "f32le", "-ac", "1", "-")!!
+                    assertEquals("ffmpeg $dec exit", 0, r.first)
+                    println("bitrate stream: ffmpeg %s decoder: %d samples".format(dec, r.second.size / 4))
+                    assertEquals("ffmpeg $dec decodes exactly the input", input48, r.second.size / 4L)
+                }
+            }
+        } finally { dir.deleteRecursively() }
+    }
+
     /** Memory stays flat over a long session: 10 minutes (60 with TJ_LONG=1) at 44.1 kHz. */
     @Test fun memoryIsFlatOverALongSession() {
         val minutes = if (System.getenv("TJ_LONG") == "1") 60 else 10

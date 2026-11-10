@@ -22,19 +22,53 @@ object ModelProfile {
      *  SDKs before it look for `npu-model` only, so they see no build for such a SoC and stay on the CPU. */
     const val NPU_PART_ROLE = "npu-part"
 
-    private val ALL_NPU_ROLES = NPU_ROLES + NPU_PART_ROLE
+    /** A program shipped as a QLPD1 delta against the CPU weights (`<program>.qlpd`, gzip like every file; SDK 2.0.1):
+     *  it stands for the `npu-model` or `npu-part` of the same path, rebuilt on the device ([ai.quranlab.tajweedformer.accel.ProgramDelta]). */
+    const val NPU_DELTA_ROLE = "npu-delta"
+
+    private val ALL_NPU_ROLES = NPU_ROLES + NPU_PART_ROLE + NPU_DELTA_ROLE
+
+    /** The program a delta stands for: its decoded path without `.qlpd`. */
+    @JvmStatic
+    fun deltaProgram(e: ModelManifest.FileEntry): String = e.localPath.removeSuffix(".qlpd")
+
+    private val PART_NAME = Regex("\\.P\\d+\\.tflite$")
+
+    /**
+     * The programs of an NPU build: each program path with its full file (when listed) and its delta (when listed), the
+     * parts of a chained build in path order. A delta's program is a part when its name is `<base>.P<k>.tflite`.
+     */
+    @JvmStatic
+    fun npuPrograms(files: List<ModelManifest.FileEntry>): List<Program> {
+        val full = files.filter { it.role == "npu-model" || it.role == NPU_PART_ROLE }.associateBy { it.localPath }
+        val delta = files.filter { it.role == NPU_DELTA_ROLE && it.localPath.endsWith(".qlpd") }.associateBy { deltaProgram(it) }
+        return (full.keys + delta.keys).sortedWith { a, b -> ModelManifest.compareUtf8(a, b) }.map { p ->
+            val f = full[p]
+            Program(p, f, delta[p], part = f?.role == NPU_PART_ROLE || (f == null && PART_NAME.containsMatchIn(p)))
+        }
+    }
+
+    /** One NPU program: its local path, its full file and its delta (at least one of them). */
+    data class Program(val path: String, val full: ModelManifest.FileEntry?, val delta: ModelManifest.FileEntry?, val part: Boolean)
 
     /** Contexts with no NPU build by design: an NPU backend is never chosen for them, whatever a manifest lists.
      *  c8_l64 is 8 frames at 20 ms per step (160 ms chunks) with 64 left frames; it runs on the exact CPU engine. */
     @JvmField val CPU_ONLY_CONTEXTS = setOf("c8_l64")
 
-    /** The CPU profile of [context] for [platform]. */
+    /** Roles that belong to an accelerator's promotion, never to the CPU profile (whatever a manifest's `need` says):
+     *  the NPU builds, the Apple packages, and the self-test set. */
+    @JvmField val ACCELERATOR_ROLES = ALL_NPU_ROLES.toSet() + setOf("selftest", "coreml", "coreml-keeps", "coreml-compact", "correction",
+        "correction-compact")
+
+    /** The CPU profile of [context] for [platform]: the `required` files of that context and of every context, never
+     *  an accelerator file (a first install downloads only these). */
     @JvmStatic
     @JvmOverloads
     fun cpu(m: ModelManifest, context: String, platform: String = TajweedFormer.PLATFORM): List<ModelManifest.FileEntry> {
         if (context !in m.contexts) throw RecognizerException.InvalidAppOption("context", "$context is not shipped (${m.contexts})")
         return m.files.filter {
-            it.need == ModelManifest.Need.REQUIRED && it.forPlatform(platform) && (it.context == "*" || it.context == context)
+            it.need == ModelManifest.Need.REQUIRED && it.role !in ACCELERATOR_ROLES && it.forPlatform(platform) &&
+                (it.context == "*" || it.context == context)
         }
     }
 
@@ -57,8 +91,11 @@ object ModelProfile {
                 it.soc == soc && it.context == context
         }
         fun n(role: String) = files.count { it.role == role }
-        val one = n("npu-model") == 1 && n(NPU_PART_ROLE) == 0
-        val chain = n("npu-model") == 0 && n(NPU_PART_ROLE) >= 1
+        val programs = npuPrograms(files)
+        val models = programs.count { !it.part }
+        val parts = programs.count { it.part }
+        val one = models == 1 && parts == 0
+        val chain = models == 0 && parts >= 1
         return if ((one || chain) && n("npu-io") == 1 && n("npu-masks") == 1) files else emptyList()
     }
 

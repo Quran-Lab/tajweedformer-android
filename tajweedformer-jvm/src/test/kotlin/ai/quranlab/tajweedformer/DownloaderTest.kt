@@ -98,6 +98,20 @@ class DownloaderTest {
 
     private fun store(root: File) = ModelStore(root, base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier)
 
+    /** The CPU profile is the CPU files only: an accelerator or self-test file is never in it, whatever its `need`. */
+    @Test
+    fun theCpuProfileNeverHoldsAnAcceleratorFile() {
+        val files = TestKit.v4Files(listOf("tensor_g5")) +
+            TestKit.F("selftest/selftest.json", "{}".toByteArray(), "selftest", "*", "required") +
+            TestKit.F("selftest/expected_c16_l64.json", "{}".toByteArray(), "selftest", "c16_l64", "required") +
+            TestKit.F("npu/tensor_g5/c16_l64/x.tflite", ByteArray(8), "npu-model", "c16_l64", "required", listOf("android"), "tensor_g5")
+        val m = TestKit.manifest(files)
+        val cpu = ModelProfile.cpu(m, "c16_l64")
+        assertTrue(cpu.isNotEmpty())
+        assertTrue(cpu.map { it.role }.toString(), cpu.none { it.role in ModelProfile.ACCELERATOR_ROLES })
+        assertTrue(cpu.none { it.path.startsWith("npu/") || it.path.startsWith("selftest/") })
+    }
+
     @Test
     fun cpuProfileDownloadsVerifiesAndOpens() {
         val files = TestKit.v4Files(listOf("tensor_g5"))
@@ -115,6 +129,8 @@ class DownloaderTest {
         assertEquals(setOf("manifest.json", "tokens.txt", "calibration.json.gz", "expected_tj3.zfx.gz", "layers.zfw.gz", "frontend.zfw.gz",
             "c16_l64/model_engine2.onnx.zfg.gz", "c16_l64/model_engine2.onnx.zfg.bin.gz", "c16_l64/frames.zfw.gz"), asked)
         assertTrue(requests.all { it.endsWith("key=k1") })
+        assertTrue("a first install fetches no NPU file, though the manifest lists a build for this SoC: $requests",
+            requests.none { it.startsWith("npu/") || it.startsWith("selftest/") })
         // decoded files kept, transport files and parts gone
         assertArrayEquals(files.first { it.path == "layers.zfw" }.bytes, File(root, "layers.zfw").readBytes())
         assertFalse(File(root, "layers.zfw.gz").exists())
@@ -240,6 +256,75 @@ class DownloaderTest {
         // in place now: ready even on a metered network
         assertEquals("ready", s.ensureNpu("tensor_g5", "c16_l64", metered, true).reason)
         assertTrue(s.isNpuReady("tensor_g5", "c16_l64"))
+    }
+
+    private fun vec(name: String): ByteArray = javaClass.getResourceAsStream("/progdelta_vectors/$name")!!.use { it.readBytes() }
+
+    /** A V4 folder whose CPU files are the delta vectors' (so the vectors' deltas rebuild against them), with an NPU
+     *  build for exynos2600 made of [program] (full, delta, or both). */
+    private fun deltaFolder(delta: ByteArray?, full: ByteArray?): List<TestKit.F> {
+        val cpu = mapOf("layers.zfw" to "cpu/layers.zfw", "frontend.zfw" to "cpu/frontend.zfw",
+            "c16_l64/model_engine2.onnx.zfg" to "cpu/model_engine2.onnx.zfg", "c16_l64/model_engine2.onnx.zfg.bin" to "cpu/model_engine2.onnx.zfg.bin")
+        val files = TestKit.v4Files().map { f -> cpu[f.path]?.let { TestKit.F(f.path, vec(it), f.role, f.context, f.need, f.platforms, f.soc, f.gz) } ?: f }
+        val d = "npu/exynos2600/c16_l64/tajweedformer_v4_exynos2600_c16_l64"
+        val out = files.toMutableList()
+        if (full != null) out += TestKit.F("$d.tflite", full, "npu-model", "c16_l64", "optional", listOf("android"), "exynos2600")
+        if (delta != null) out += TestKit.F("$d.tflite.qlpd", delta, "npu-delta", "c16_l64", "optional", listOf("android"), "exynos2600")
+        out += TestKit.F("$d.io.json", "{}".toByteArray(), "npu-io", "c16_l64", "optional", listOf("android"), "exynos2600")
+        out += TestKit.F("$d.masks.json", "{}".toByteArray(), "npu-masks", "c16_l64", "optional", listOf("android"), "exynos2600")
+        return out
+    }
+
+    /** A program shipped as a QLPD1 delta: rebuilt from the CPU files on the device, checked, kept (the delta's decoded file
+     *  goes); preferred over the full program when both are listed; a delta that does not rebuild falls back to the full
+     *  program, and without one the download fails (`verify`). */
+    @Test
+    fun anNpuProgramComesFromItsDeltaFirstAndFromTheFullFileOnlyAsAFallback() {
+        val delta = java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(vec("cases/int8_frontend_and_two_tensors.qlpd.gz"))).use { it.readBytes() }
+        val target = vec("cases/int8_frontend_and_two_tensors.bin")
+        val program = "npu/exynos2600/c16_l64/tajweedformer_v4_exynos2600_c16_l64.tflite"
+        // delta and full both listed: the delta is used, the full program never requested
+        publish(deltaFolder(delta, target))
+        val root = dir()
+        val s = store(root)
+        s.ensureCpu()
+        requests.clear()
+        val ok = s.ensureNpu("exynos2600", "c16_l64", NetworkPolicy.ALWAYS_UNMETERED, true)
+        assertEquals("downloaded", ok.reason)
+        assertArrayEquals(target, ok.files!!.model.readBytes())
+        assertTrue("the full program was not fetched: $requests", requests.none { it.startsWith("$program.gz ") })
+        assertTrue(requests.any { it.startsWith("$program.qlpd.gz ") })
+        assertFalse("the delta's decoded file is gone", File(root, "$program.qlpd").exists())
+        assertTrue(s.isNpuReady("exynos2600", "c16_l64"))
+        assertEquals("ready", s.ensureNpu("exynos2600", "c16_l64", NetworkPolicy { false }, true).reason)
+        s.prune()
+        assertTrue("prune keeps the rebuilt program", File(root, program).isFile)
+        // a delta only: the same
+        publish(deltaFolder(delta, null))
+        val r2 = dir()
+        val s2 = store(r2).also { it.ensureCpu() }
+        assertArrayEquals(target, s2.ensureNpu("exynos2600", "c16_l64", NetworkPolicy.ALWAYS_UNMETERED, true).files!!.model.readBytes())
+        assertTrue(s2.isNpuReady("exynos2600", "c16_l64"))
+        // a delta that does not rebuild to its target (one body byte changed), with the full program listed: the full one
+        val bad = delta.copyOf().also { it[it.size - 1] = (it[it.size - 1] + 1).toByte() }
+        publish(deltaFolder(bad, target))
+        val r3 = dir()
+        val s3 = store(r3).also { it.ensureCpu() }
+        requests.clear()
+        assertArrayEquals(target, s3.ensureNpu("exynos2600", "c16_l64", NetworkPolicy.ALWAYS_UNMETERED, true).files!!.model.readBytes())
+        assertTrue("fell back to the full program: $requests", requests.any { it.startsWith("$program.gz ") })
+        // ... and without it: the download fails, nothing is left
+        publish(deltaFolder(bad, null))
+        val r4 = dir()
+        val s4 = store(r4).also { it.ensureCpu() }
+        try {
+            s4.ensureNpu("exynos2600", "c16_l64", NetworkPolicy.ALWAYS_UNMETERED, true)
+            fail("a delta that does not rebuild was used")
+        } catch (e: RecognizerException.DownloadFailed) {
+            assertTrue(e.reason, e.reason.contains("sha256"))
+        }
+        assertFalse(File(r4, program).exists())
+        assertFalse(s4.isNpuReady("exynos2600", "c16_l64"))
     }
 
     @Test

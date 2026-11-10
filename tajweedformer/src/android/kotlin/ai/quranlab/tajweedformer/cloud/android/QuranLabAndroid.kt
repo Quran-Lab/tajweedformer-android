@@ -39,14 +39,16 @@ import java.util.concurrent.TimeUnit
  * The Android entry point of the portal link. Call once, in `Application.onCreate`:
  *
  * ```
- * QuranLabAndroid.configure(this, CloudOptions(key = "qlk_v1_...", contributions = true))
+ * QuranLabAndroid.configure(this, CloudOptions(key = "qlk_v1_..."))
  * ```
  *
  * Then hand [observer] to the recognizer (the core SDK does this when it was configured). From there
- * everything is silent and in the background: registration at launch, the signed config at launch,
- * on every return to the foreground and every 60 s while the app is in use (portal changes apply at
- * the next session start), telemetry and issues through WorkManager, recitation sharing with the
- * SDK's own consent sheet and a persistent upload queue that survives process death and reboots.
+ * everything is silent and in the background: registration once a UTC day (at the first opening of the
+ * day), the signed config at launch, on every return to the foreground and every 60 s while the app is
+ * in use (portal changes apply at the next session start), telemetry deltas every 15 minutes in use and
+ * when the app goes to the background, sent through WorkManager with the issues, and recitation sharing
+ * (where Quran Lab's config offers it) with the SDK's consent sheet ([sharingTheme]) or the app's own UI
+ * ([sheets]), and a persistent upload queue that survives process death and reboots.
  */
 object QuranLabAndroid {
     @Volatile var cloud: QuranLabCloud? = null
@@ -55,8 +57,15 @@ object QuranLabAndroid {
     /** What the recognizer reports to (a no-op until [configure]). */
     val observer: TajweedObserver get() = cloud ?: object : TajweedObserver {}
 
-    /** The app's handler for the SDK's sheets; null: the SDK shows its own over the resumed activity. */
+    /**
+     * The app's own UI for the SDK's sheets; null: the SDK shows its own over the resumed activity. A
+     * [Sharing.SheetRequest.Consent] is an ask already counted: show the strings of `cloud.sharing.copy`
+     * and report the learner's tap with `sharing.accept()` or `sharing.decline()`.
+     */
     @Volatile var sheets: ((Sharing.SheetRequest) -> Unit)? = null
+
+    /** The look of the SDK's own sheets (colours, corner radius, fonts); the words stay the SDK's. */
+    @Volatile var sharingTheme: SharingTheme = SharingTheme()
 
     private val work = Executors.newSingleThreadExecutor { r -> Thread(r, "quranlab-cloud").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
     private val uploads = Executors.newSingleThreadExecutor { r -> Thread(r, "quranlab-uploads").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
@@ -80,7 +89,8 @@ object QuranLabAndroid {
         saveOptions(app, options)
         c.sharing.prompts = { r -> Handler(Looper.getMainLooper()).post { show(r) } }
         (app as? Application)?.registerActivityLifecycleCallbacks(Lifecycle)
-        work.execute { try { c.launch() } catch (_: Exception) {} }
+        // the opening itself (a launch, the day's registration) is counted when the first activity starts
+        work.execute { try { c.launch(foreground = false) } catch (_: Exception) {} }
         return c
     }
 
@@ -144,6 +154,7 @@ object QuranLabAndroid {
             locale = { context.resources.configuration.locales[0].toLanguageTag() },
             debugBuild = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
             unmetered = { !cm.isActiveNetworkMetered },
+            log = { android.util.Log.w("QuranLab", it) },
         )
     }
 
@@ -174,7 +185,7 @@ object QuranLabAndroid {
         val a = resumedActivity ?: return
         if (sessionOpen || a.isFinishing) return
         val c = cloud ?: return
-        SharingDialogs.show(a, c.sharing, r)
+        SharingDialogs.show(a, c.sharing, r, sharingTheme)
     }
 
     @Synchronized
@@ -186,7 +197,7 @@ object QuranLabAndroid {
             ticker = h
             val tick = object : Runnable {
                 override fun run() {
-                    work.execute { cloud?.refreshConfig() }
+                    work.execute { cloud?.let { it.refreshConfig(); it.tick() } }
                     h.postDelayed(this, 60_000)
                 }
             }
@@ -197,12 +208,21 @@ object QuranLabAndroid {
         }
     }
 
+    /** The last activity stopped for a configuration change (a rotation): its successor is no new opening. */
+    @Volatile private var changingConfig = false
+
+    /**
+     * The process's foreground and background, as ProcessLifecycleOwner sees them (the first activity started,
+     * the last one stopped), without its dependency: a rotation is neither.
+     */
     private object Lifecycle : Application.ActivityLifecycleCallbacks {
         override fun onActivityStarted(a: Activity) {
             val first = synchronized(QuranLabAndroid) { started++ == 0 }
             if (first) {
-                // back in the foreground: the config now, deliveries due
-                work.execute { cloud?.let { it.refreshConfig(); it.deliver() } }
+                val reopened = !changingConfig
+                changingConfig = false
+                // a cold start or back in the foreground: a launch counted, the day's registration, the config, deliveries due
+                if (reopened) work.execute { cloud?.let { try { it.foreground(); it.refreshConfig(); it.deliver() } catch (_: Exception) {} } }
             }
             updateTicker()
         }
@@ -211,7 +231,12 @@ object QuranLabAndroid {
             val last = synchronized(QuranLabAndroid) { --started <= 0 }
             if (last) {
                 started = 0
-                cloud?.telemetry?.flushToDisk()
+                if (a.isChangingConfigurations) {
+                    changingConfig = true
+                } else {
+                    // in the background: a telemetry send point (sealed on disk, sent by WorkManager)
+                    work.execute { cloud?.let { try { it.background() } catch (_: Exception) {} } }
+                }
             }
             updateTicker()
         }
@@ -253,7 +278,7 @@ object QuranLabAndroid {
     }
 }
 
-/** Telemetry days and issue reports. */
+/** Telemetry reports and issue reports. */
 class DeliveryWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val c = QuranLabAndroid.cloud ?: QuranLabAndroid.restore(applicationContext) ?: return Result.success()

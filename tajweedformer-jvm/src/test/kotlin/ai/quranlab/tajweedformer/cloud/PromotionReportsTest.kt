@@ -1,0 +1,269 @@
+package ai.quranlab.tajweedformer.cloud
+
+import ai.quranlab.tajweedformer.AcceleratorFailoverEvent
+import ai.quranlab.tajweedformer.AcceleratorIncident
+import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.PromotionEvent
+import ai.quranlab.tajweedformer.accel.Divergence
+import ai.quranlab.tajweedformer.accel.FailoverEvent
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import java.io.File
+import java.nio.file.Files
+
+/**
+ * The `promotions` telemetry entry and the accelerator incident reports (platform client doc, sections 6 and 7.1):
+ * the entry for a promoted attempt, a failure at each stage and failovers; the issue bodies of both kinds validated
+ * against the closed 7.1 schema, the path-stripped message, the first-report-per-revision rule across the dedupe
+ * window, nothing identifying, and a 2.0.0 server's 400 dropping the report.
+ */
+class PromotionReportsTest {
+    private lateinit var stub: StubQlab
+    private lateinit var dir: File
+    private var now = 1_762_700_000_000L
+    private val clock = { now }
+
+    @Before fun up() {
+        stub = StubQlab()
+        dir = Files.createTempDirectory("tj-promo").toFile()
+    }
+
+    @After fun down() {
+        stub.close()
+        dir.deleteRecursively()
+    }
+
+    private fun cloud() = QuranLabCloud(CloudOptions(stub.key, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
+        stub.environment(dir, clock = clock))
+
+    private val ctx = TelemetryContext(AppIdentity("org.example.recite", "3.2"), DeviceProfile("Pixel10", "tensor_g5", 16, "16", "8_16"))
+
+    @Suppress("UNCHECKED_CAST")
+    private fun promotions(t: Telemetry): List<Map<String, Any?>> {
+        t.seal(ctx)
+        val f = t.pendingReports().lastOrNull() ?: return emptyList()
+        val body = Json.parse(f.readText()) as Map<String, Any?>
+        t.dropReport(f)
+        return body["promotions"] as? List<Map<String, Any?>> ?: emptyList()
+    }
+
+    private fun incident(kind: String, stage: String, cause: String, rev: String = "v4.0-2026-11-09", error: Throwable? = null, attempt: Int? = 1,
+                         chunk: Int? = null, stall: Double? = null, clip: String? = null, divergence: Divergence? = null) =
+        AcceleratorIncident(kind, stage, cause, rev, "c16_l64", "npu:tensor_g5", error = error, message = error?.message, chunk = chunk,
+            elapsedMs = if (chunk != null) 301.4 else null, deadlineMs = if (chunk != null) 120.0 else null, clip = clip, divergence = divergence,
+            deviceModel = "Pixel 10", osBuild = "16/BD1A.250101.001/12345678", chip = "tensor_g5", computeUnits = "npu",
+            delegate = "LiteRtDispatch_GoogleTensor litert 2.2.0", thermal = "light", lowPower = false, stallMs = stall, attempt = attempt)
+
+    private fun promotion(promoted: Boolean, stage: String, reason: String?, compileMs: Long? = null, speedup: Double? = null) =
+        PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", promoted, stage, reason, 1, compileMs, speedup,
+            incident = if (promoted) null else incident(AcceleratorIncident.PROMOTION_FAILED, stage, AcceleratorIncident.cause(reason!!)))
+
+    @Test fun theEntryOfAPromotedAttempt() {
+        val t = Telemetry(File(dir, "t"), clock)
+        t.promotion(promotion(true, "promote", null, compileMs = 3200, speedup = 0.8))
+        val p = promotions(t).single()
+        assertEquals(mapOf("backend" to "npu:tensor_g5", "revision" to "v4.0-2026-11-09", "context" to "c16_l64", "attempts" to 1.0, "promoted" to 1.0,
+            "compile_ms" to mapOf("le_5000" to 1.0), "speedup" to mapOf("lt_1" to 1.0)), p)
+    }
+
+    @Test fun theEntryOfAFailureAtEachStage() {
+        for ((stage, reason) in listOf("download" to "network", "download" to "verify", "compile" to "compile_timeout", "warmup" to "non_finite",
+            "golden" to "golden_mismatch", "golden" to "cpu_mismatch")) {
+            val t = Telemetry(File(dir, "t-$stage-$reason"), clock)
+            t.promotion(promotion(false, stage, reason, compileMs = if (stage == "golden") 900 else null))
+            val p = promotions(t).single()
+            val want = linkedMapOf<String, Any?>("backend" to "npu:tensor_g5", "revision" to "v4.0-2026-11-09", "context" to "c16_l64",
+                "attempts" to 1.0, "failed_at" to mapOf(stage to 1.0), "reasons" to mapOf(reason to 1.0))
+            if (stage == "golden") want["compile_ms"] = mapOf("le_1000" to 1.0)
+            assertEquals("$stage $reason", want, p)
+        }
+    }
+
+    @Test fun failoversCountTheirCausesAndStalls() {
+        val t = Telemetry(File(dir, "t"), clock)
+        for ((cause, stall) in listOf("deadline" to 40.0, "deadline" to 180.0, "non_finite" to 260.0, "blank" to 1400.0)) {
+            val ev = FailoverEvent(cause, 3, stall, 10.0, 120.0, null, warm = false, replayedChunks = 3, exact = true)
+            t.failover(AcceleratorFailoverEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", ev,
+                incident(AcceleratorIncident.FAILOVER, "session", AcceleratorIncident.cause(cause), chunk = 3, stall = stall)))
+        }
+        val p = promotions(t).single()
+        assertEquals(4.0, p["failovers"])
+        assertEquals(mapOf("deadline" to 2.0, "non_finite" to 1.0, "blank" to 1.0), p["failover_causes"])
+        assertEquals(mapOf("le_50" to 1.0, "le_200" to 1.0, "le_300" to 1.0, "gt_1000" to 1.0), p["failover_stall_ms"])
+        assertEquals(mapOf("failover" to 4.0), p["reasons"])
+        assertFalse("no attempt ended", p.containsKey("attempts"))
+    }
+
+    @Test fun atMostEightEntriesAndNothingWhenNothingHappened() {
+        val t = Telemetry(File(dir, "t"), clock)
+        assertTrue(promotions(t).isEmpty())
+        for (i in 0 until 11) t.promotion(PromotionEvent("npu:soc$i", "r", "c16_l64", true, "promote", null, 1))
+        assertEquals(8, promotions(t).size)
+        // what is counted survives the day file (a new process seals it)
+        t.promotion(promotion(true, "promote", null))
+        t.flushToDisk()
+        assertEquals(1, promotions(Telemetry(File(dir, "t"), clock)).size)
+    }
+
+    // ------------------------------------------------------------------------------------------- incident reports
+
+    /** The closed 7.1 schema: the section 7 body with `message` and `detail`, `backend` left out, every detail field typed. */
+    @Suppress("UNCHECKED_CAST")
+    private fun validate(b: Map<String, Any?>) {
+        val top = setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "revision", "kind", "code", "frames", "message", "detail")
+        assertTrue("unknown fields ${b.keys - top}", (b.keys - top).isEmpty())
+        assertFalse(b.containsKey("backend"))
+        assertTrue(b["kind"] in setOf("accelerator_failover", "promotion_failed"))
+        assertTrue(Regex("^[A-Za-z0-9_.:-]{1,64}$").matches(b["code"] as String))
+        assertTrue(b["revision"] is String)
+        (b["message"] as String?)?.let { m ->
+            assertTrue(m.length <= 200)
+            assertFalse("a path in the message: $m", Regex("[\\\\/]").containsMatchIn(m))
+            assertFalse("a URL in the message: $m", m.contains("://"))
+            assertFalse("a long digit run in the message: $m", Regex("\\d{5,}").containsMatchIn(m))
+        }
+        val d = b["detail"] as Map<String, Any?>
+        val types = mapOf<String, (Any?) -> Boolean>(
+            "stage" to { v -> v in setOf("download", "compile", "warmup", "golden", "session") },
+            "cause" to { v -> v in setOf("exception", "nan", "out_of_range", "blank", "timeout", "crash_on_last_run", "golden_mismatch", "cpu_mismatch",
+                "compile_error", "compile_timeout", "load_error", "verify", "network", "storage", "other") },
+            "error_domain" to { v -> v is String && Regex("^[A-Za-z0-9_.:-]{1,64}$").matches(v) },
+            "error_code" to { v -> v is String && Regex("^[A-Za-z0-9_.:-]{1,32}$").matches(v) },
+            "chunk" to { v -> v is Double && v == Math.floor(v) && v in 0.0..1_000_000.0 },
+            "elapsed_ms" to { v -> v is Double && v in 0.0..600_000.0 },
+            "deadline_ms" to { v -> v is Double && v in 0.0..600_000.0 },
+            "clip" to { v -> v is String && v.length <= 32 },
+            "divergence" to { v -> v is Map<*, *> && v.keys == setOf("tokens_expected", "tokens_differ", "sites_differ", "words_differ") &&
+                v.values.all { it is Double && it == Math.floor(it) && it in 0.0..100_000.0 } },
+            "device_model" to { v -> v is String && Regex("^[A-Za-z0-9_.,-]{1,32}$").matches(v) },
+            "os_build" to { v -> v is String && Regex("^[A-Za-z0-9_.:/-]{1,64}$").matches(v) },
+            "chip" to { v -> v is String && Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$").matches(v) },
+            "accelerator" to { v -> v is String && Regex("^(ane|gpu|npu:[A-Za-z0-9][A-Za-z0-9_.-]{0,23})$").matches(v) },
+            "compute_units" to { v -> v in setOf("cpuAndNeuralEngine", "cpuAndGPU", "all", "cpuOnly", "npu", "gpu") },
+            "delegate" to { v -> v is String && Regex("^[A-Za-z0-9_.:/ -]{1,48}$").matches(v) },
+            "context" to { v -> v is String && Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$").matches(v) },
+            "thermal" to { v -> v in setOf("nominal", "fair", "serious", "critical", "none", "light", "moderate", "severe", "emergency", "shutdown") },
+            "low_power" to { v -> v is Boolean },
+            "stall_ms" to { v -> v is Double && v == Math.floor(v) && v in 0.0..600_000.0 },
+            "attempt" to { v -> v is Double && v == Math.floor(v) && v in 1.0..100.0 },
+        )
+        assertTrue("detail.stage and detail.cause are required", d.containsKey("stage") && d.containsKey("cause"))
+        for ((k, v) in d) {
+            val ok = types[k] ?: fail("detail.$k is not in the schema")
+            assertTrue("detail.$k = $v", (ok as (Any?) -> Boolean)(v))
+        }
+        assertEquals(b["code"], "${d["stage"]}:${d["cause"]}")
+        // nothing identifying: no ids of a user, install or contributor, no audio, no text of the learner
+        val text = Json.write(b)
+        for (bad in listOf("install", "user", "contributor", "audio", "transcript", "token_text")) assertFalse("$bad in $text", text.contains("\"$bad"))
+    }
+
+    private fun thrower(): Throwable = try {
+        throw IllegalStateException("LiteRtRunCompiledModel failed (status 13) for /data/user/0/org.example.recite/no_backup/tajweedformer/npu/" +
+            "tensor_g5/c16_l64/model.tflite at 1762700000123, see https://example.org/x?id=99999")
+    } catch (e: IllegalStateException) {
+        e
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    @Test fun bothKindsValidateAgainstTheClosedSchema() {
+        stub.incidentsAccepted = true
+        val c = cloud()
+        val ev = FailoverEvent("deadline", 7, 182.0, 301.4, 120.0, null, warm = false, replayedChunks = 7, exact = true)
+        c.onFailover(AcceleratorFailoverEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", ev,
+            incident(AcceleratorIncident.FAILOVER, "session", "timeout", error = thrower(), chunk = 7, stall = 182.4)))
+        for ((stage, reason) in listOf("download" to "network", "compile" to "compile_error", "warmup" to "non_finite", "golden" to "golden_mismatch")) {
+            c.onPromotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", false, stage, reason, 2, incident =
+                incident(AcceleratorIncident.PROMOTION_FAILED, stage, AcceleratorIncident.cause(reason), error = thrower(), attempt = 2,
+                    clip = if (stage == "golden") "Husary_112001_vsub2" else null,
+                    divergence = if (stage == "golden") Divergence(16, 1, 2, 1) else null)))
+        }
+        // a promoted attempt is no incident
+        c.onPromotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", true, "promote", null, 1))
+        assertEquals(5, c.issues.pending().size)
+        assertEquals(5, c.deliver().second)
+        val sent = stub.seen("/v1/issues").map { it.json!! }
+        assertEquals(listOf("session:timeout", "download:network", "compile:compile_error", "warmup:nan", "golden:golden_mismatch"), sent.map { it["code"] })
+        sent.forEach { validate(it) }
+        val f = sent[0]
+        assertEquals("accelerator_failover", f["kind"])
+        val d = f["detail"] as Map<String, Any?>
+        assertEquals(7.0, d["chunk"])
+        assertEquals(182.0, d["stall_ms"])
+        assertEquals(301.4, d["elapsed_ms"])
+        assertEquals(120.0, d["deadline_ms"])
+        assertEquals("Pixel_10", d["device_model"])
+        assertEquals("IllegalStateException", d["error_domain"])
+        assertEquals("LiteRtRunCompiledModel failed (status 13) for _ at _, see _", f["message"])
+        val g = sent[4]["detail"] as Map<String, Any?>
+        assertEquals("Husary_112001_vsub2", g["clip"])
+        assertEquals(mapOf("tokens_expected" to 16.0, "tokens_differ" to 1.0, "sites_differ" to 2.0, "words_differ" to 1.0), g["divergence"])
+        assertEquals(2.0, g["attempt"])
+    }
+
+    @Test fun theMessageIsPathStripped() {
+        assertEquals("open _ failed: _", IssueQueue.stripMessage("open /data/app/~~x==/lib/arm64/libLiteRt.so failed: dlopen 2"
+            // a Windows path, its drive letter joined at run time
+            .replace("dlopen 2", "Q" + ":\\models\\x.dll")))
+        assertEquals("status _ at _", IssueQueue.stripMessage("status 1234567 at content://media/external/1"))
+        assertEquals("plain message", IssueQueue.stripMessage("plain message"))
+        assertEquals("_", IssueQueue.stripMessage("/only/a/path"))
+        assertNull(IssueQueue.stripMessage(1.toChar().toString()))
+        assertEquals(200, IssueQueue.stripMessage("x".repeat(500))!!.length)
+    }
+
+    @Test fun theFirstReportOfEachKindPerRevisionGoesThroughTheDedupe() {
+        val c = cloud()
+        fun failover(rev: String) = c.reportIncident(incident(AcceleratorIncident.FAILOVER, "session", "nan", rev = rev, chunk = 3))
+        failover("rev-a")
+        failover("rev-a")
+        assertEquals("the same signature twice a day: once", 1, c.issues.pending().size)
+        // another revision, the same signature, the same day: its first report goes out anyway
+        failover("rev-b")
+        assertEquals(2, c.issues.pending().size)
+        failover("rev-b")
+        assertEquals(2, c.issues.pending().size)
+        // the other kind on rev-a is its own first
+        c.reportIncident(incident(AcceleratorIncident.PROMOTION_FAILED, "golden", "golden_mismatch", rev = "rev-a"))
+        assertEquals(3, c.issues.pending().size)
+        // a first report is never trimmed from the queue while it waits
+        for (i in 0 until 40) c.onIssue("engine_failed", "code$i")
+        val kinds = c.issues.pending().map { it["kind"] }
+        assertEquals(32, kinds.size)
+        assertEquals(3, kinds.count { it == "accelerator_failover" || it == "promotion_failed" })
+        // the queue's own marker never reaches the server
+        assertTrue(c.issues.pending().any { it.containsKey(IssueQueue.PIN) })
+        assertFalse(c.issues.firstToSend()!!.containsKey(IssueQueue.PIN))
+        // the next day the usual dedupe lets one through again
+        now += 86_400_000L
+        fun aFailovers() = c.issues.pending().count { it["revision"] == "rev-a" && it["kind"] == "accelerator_failover" }
+        val before = aFailovers()
+        failover("rev-a")
+        assertEquals(before + 1, aFailovers())
+    }
+
+    @Test fun aServerWithoutTheIncidentSchemaDropsTheReportWithoutALoop() {
+        stub.incidentsAccepted = false
+        val c = cloud()
+        c.reportIncident(incident(AcceleratorIncident.FAILOVER, "session", "exception", chunk = 0, error = thrower()))
+        assertEquals(0, c.deliver().second)
+        assertEquals("refused (400): dropped", 0, c.issues.pending().size)
+        assertEquals(1, stub.seen("/v1/issues").size)
+        c.deliver()
+        assertEquals("not sent again", 1, stub.seen("/v1/issues").size)
+    }
+
+    @Test fun issuesOffSendsNoIncident() {
+        stub.flags = stub.flags + ("issues" to false)
+        val c = cloud()
+        c.refreshConfig()
+        c.reportIncident(incident(AcceleratorIncident.FAILOVER, "session", "exception", chunk = 0))
+        assertTrue(c.issues.pending().isEmpty())
+    }
+}

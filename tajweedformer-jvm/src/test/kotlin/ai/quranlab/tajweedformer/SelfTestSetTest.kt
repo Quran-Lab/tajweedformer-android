@@ -199,9 +199,9 @@ class SelfTestSetTest {
             try {
                 val obs = SelfTestRunner.run(engine, engine, cal, ctx, set, dir)
                 val planted = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
-                val v = SelfTestSet.judge(expected, obs, emptyList(), TajweedModel.chunkMsOf(ctx), checkLatency = false, planted = planted)
+                val v = SelfTestSet.judge(expected, obs, planted, SelfTestSet.REQUIRED)
                 val pass = obs.count { (id, o) -> SelfTestSet.judge(SelfTestSet.Expected(ctx, "", "", "", mapOf(id to expected.clips.getValue(id))),
-                    mapOf(id to o), emptyList(), 320, checkLatency = false).passed }
+                    mapOf(id to o)).passed }
                 println("CPU self-test $ctx: $pass/${set.clips.size} clips identical (${v.detail}); chunk ms median " +
                     String.format(java.util.Locale.ROOT, "%.1f", SelfTestSet.percentile(obs.values.flatMap { it.chunkMs }, 0.5)))
                 assertTrue("$ctx: ${v.reason} ${v.detail}", v.passed)
@@ -219,15 +219,16 @@ class SelfTestSetTest {
         fun obs(tokens: List<Int> = listOf(1, 2, 3), sites: Set<Pair<Int, String>> = setOf(4 to "cons_sub"), words: Set<Int> = setOf(1),
                 finite: Boolean = true, ms: List<Double> = listOf(10.0, 12.0, 11.0)) =
             mapOf("a" to SelfTestSet.ClipObserved(3, tokens, sites, words, finite, ms))
-        val cpu = listOf(40.0, 42.0, 41.0)
-        assertEquals("ok", SelfTestSet.judge(e, obs(), cpu, 320).reason)
-        assertEquals("tokens", SelfTestSet.judge(e, obs(tokens = listOf(1, 2)), cpu, 320).reason)
-        assertEquals("site_flags", SelfTestSet.judge(e, obs(sites = emptySet()), cpu, 320).reason)
-        assertEquals("word_flags", SelfTestSet.judge(e, obs(words = setOf(0, 1)), cpu, 320).reason)
-        assertEquals("non_finite", SelfTestSet.judge(e, obs(finite = false), cpu, 320).reason)
-        assertEquals("latency_p90", SelfTestSet.judge(e, obs(ms = listOf(10.0, 200.0, 170.0)), cpu, 320).reason)
-        assertEquals("latency_median", SelfTestSet.judge(e, obs(ms = listOf(50.0, 50.0, 50.0)), cpu, 320).reason)
-        assertEquals("missing_clip", SelfTestSet.judge(e, emptyMap(), cpu, 320).reason)
+        assertEquals("ok", SelfTestSet.judge(e, obs()).reason)
+        assertEquals("tokens", SelfTestSet.judge(e, obs(tokens = listOf(1, 2))).reason)
+        assertEquals("site_flags", SelfTestSet.judge(e, obs(sites = emptySet())).reason)
+        assertEquals("word_flags", SelfTestSet.judge(e, obs(words = setOf(0, 1))).reason)
+        assertEquals("non_finite", SelfTestSet.judge(e, obs(finite = false)).reason)
+        // speed never decides (Quran Lab, 11-10): a slow accelerator passes on its decisions
+        assertEquals("ok", SelfTestSet.judge(e, obs(ms = listOf(10.0, 200.0, 170.0))).reason)
+        assertEquals("ok", SelfTestSet.judge(e, obs(ms = listOf(500.0, 500.0, 500.0))).reason)
+        assertEquals("missing_clip", SelfTestSet.judge(e, emptyMap()).reason)
+        assertEquals("missing_clip", SelfTestSet.judge(e, obs(), required = listOf("a", SelfTestSet.PLANTED_CLIP)).reason)
         // a planted clip: other tokens with the same flags pass; a missing site or word flag fails; a clean
         // clip's token mismatch still fails
         val two = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", mapOf(
@@ -238,11 +239,11 @@ class SelfTestSetTest {
             "clean" to SelfTestSet.ClipObserved(3, cleanTokens, emptySet(), emptySet(), true, listOf(10.0, 11.0)),
             "plant" to SelfTestSet.ClipObserved(3, plantTokens, plantSites, plantWords, true, listOf(10.0, 12.0)))
         val p = setOf("plant")
-        assertEquals("ok", SelfTestSet.judge(two, both(), cpu, 320, planted = p).reason)
-        assertEquals("tokens", SelfTestSet.judge(two, both(), cpu, 320).reason)
-        assertEquals("site_flags", SelfTestSet.judge(two, both(plantSites = setOf(6 to "cons_sub")), cpu, 320, planted = p).reason)
-        assertEquals("word_flags", SelfTestSet.judge(two, both(plantWords = emptySet()), cpu, 320, planted = p).reason)
-        assertEquals("tokens", SelfTestSet.judge(two, both(cleanTokens = listOf(1, 2)), cpu, 320, planted = p).reason)
+        assertEquals("ok", SelfTestSet.judge(two, both(), planted = p).reason)
+        assertEquals("tokens", SelfTestSet.judge(two, both()).reason)
+        assertEquals("site_flags", SelfTestSet.judge(two, both(plantSites = setOf(6 to "cons_sub")), planted = p).reason)
+        assertEquals("word_flags", SelfTestSet.judge(two, both(plantWords = emptySet()), planted = p).reason)
+        assertEquals("tokens", SelfTestSet.judge(two, both(cleanTokens = listOf(1, 2)), planted = p).reason)
         // the producer's int16 rounding: clamp(round(x * 32767)), half to even
         assertEquals(listOf<Short>(32767, -32768, 0, -16384), SelfTestSet.toS16(floatArrayOf(1.5f, -1.5f, 0f, -0.5f)).toList())
     }

@@ -1,11 +1,13 @@
 package ai.quranlab.tajweedformer.android
 
+import ai.quranlab.tajweedformer.AcceleratorFailoverEvent
 import ai.quranlab.tajweedformer.Backend
 import ai.quranlab.tajweedformer.BackendChoice
 import ai.quranlab.tajweedformer.ChunkStats
 import ai.quranlab.tajweedformer.Decoded
 import ai.quranlab.tajweedformer.DownloadResult
 import ai.quranlab.tajweedformer.ModelLoadInfo
+import ai.quranlab.tajweedformer.PromotionEvent
 import ai.quranlab.tajweedformer.SdkEvents
 import ai.quranlab.tajweedformer.SdkObserver
 import ai.quranlab.tajweedformer.SelfTestResult
@@ -21,16 +23,19 @@ import android.os.PowerManager
 /**
  * The core's [SdkObserver] events, mapped to the cloud module's [TajweedObserver]
  * ([QuranLabAndroid.observer]; a no-op until the app calls `QuranLabAndroid.configure`). Installed
- * once by [TajweedFormerAndroid.client]. The mapping (DELIVERY_android_cloud.md):
+ * once by [TajweedFormerAndroid.client]. The mapping:
  *
  * - load, self-test, download: one to one (download profile `android-cpu` / `android-npu` by role;
  *   files already in place are not reported);
- * - backend choice: only a real fallback ([BackendChoice.isFallback]) becomes `onFallback` (load failure,
- *   timeout or crash = model_load, thermal, memory, watchdog latency = deadline, watchdog NaN = non_finite,
- *   denylist = other, the rest = npu_unavailable); the NPU's time to ready is an `onModelLoad` of `npu:<soc>`;
+ * - backend choice: only a real fallback ([BackendChoice.isFallback]) becomes `onFallback` (a compile or load
+ *   failure, a hang or crash = model_load, thermal, memory, a failover past its deadline = deadline, a failover on
+ *   NaN or out-of-range values = non_finite, denylist = other, the rest = npu_unavailable); the NPU's time to ready
+ *   is an `onModelLoad` of `npu:<soc>`;
+ * - promotions and failovers: one to one (`promotions` telemetry and the incident reports);
  * - session start: the settings in force, the input route, `QuranLabAndroid.sessionOpen(true)`;
  * - every chunk: compute and audio ms, and the tokens' margins and conf-head confidences;
- * - a scored take: per-class sites scored and flagged, madd counts, words scored and flagged;
+ * - a scored take: per-class sites scored and flagged, madd counts, words scored and flagged, and per rule
+ *   the verdicts whose check ran and the flagged ones ([TajweedObserver.Scored.of]);
  * - session end: completed = finished, feedbackShown = scored, mistakeFlagged = something flagged;
  * - thermal: PowerManager's status (API 29+), throttled from MODERATE up.
  */
@@ -48,11 +53,11 @@ internal class CloudBridge private constructor(private val app: Context) : SdkOb
     override fun onBackendSelected(choice: BackendChoice) {
         if (!choice.isFallback) return
         val reason = when (choice.reason) {
-            "npu_load_failed", "npu_load_timeout", "npu_crashed_during_load" -> TajweedObserver.FallbackReason.MODEL_LOAD
+            "compile_error", "compile_timeout", "load_error", "crash", "hang" -> TajweedObserver.FallbackReason.MODEL_LOAD
             "thermal" -> TajweedObserver.FallbackReason.THERMAL
             "memory" -> TajweedObserver.FallbackReason.MEMORY
-            "watchdog_latency" -> TajweedObserver.FallbackReason.DEADLINE
-            "watchdog_non_finite" -> TajweedObserver.FallbackReason.NON_FINITE
+            "failover_deadline" -> TajweedObserver.FallbackReason.DEADLINE
+            "failover_non_finite", "failover_out_of_range" -> TajweedObserver.FallbackReason.NON_FINITE
             "denylist" -> TajweedObserver.FallbackReason.OTHER
             else -> TajweedObserver.FallbackReason.NPU_UNAVAILABLE
         }
@@ -65,6 +70,12 @@ internal class CloudBridge private constructor(private val app: Context) : SdkOb
             cloud.onModelLoad(TajweedObserver.ModelLoad(key.revision, key.context, "npu:${key.soc ?: "unknown"}", state.timeToReadyMs.toDouble(), false))
         }
     }
+
+    /** A promotion attempt ended (the `promotions` telemetry; a failure is also an incident report). */
+    override fun onPromotion(event: PromotionEvent) = cloud.onPromotion(event)
+
+    /** A session switched to the CPU (the `promotions` failovers; an incident report). */
+    override fun onFailover(event: AcceleratorFailoverEvent) = cloud.onFailover(event)
 
     override fun onDownloadFinished(result: DownloadResult) {
         if (result.ok && result.networkBytes == 0L) return
@@ -96,15 +107,7 @@ internal class CloudBridge private constructor(private val app: Context) : SdkOb
         }
     }
 
-    override fun onScored(session: SessionInfo, result: TajweedResult) {
-        val classes = result.sites.groupBy { it.siteClass.key }.mapValues { (_, v) -> v.size to v.count { it.flagged } }
-        cloud.onScored(TajweedObserver.Scored(
-            surah = result.surah, ayah = result.ayah, classes = classes,
-            maddC2 = result.madd.count { it.count == 2 }, maddC4 = result.madd.count { it.count == 4 },
-            maddC6 = result.madd.count { it.count == 6 }, maddFlagged = result.madd.count { it.flagged },
-            wordsScored = result.words.size, wordsFlagged = result.words.count { it.flagged },
-        ))
-    }
+    override fun onScored(session: SessionInfo, result: TajweedResult) = cloud.onScored(TajweedObserver.Scored.of(result))
 
     override fun onSessionEnd(session: SessionInfo, stats: SessionStats) {
         cloud.onSessionEnd(TajweedObserver.SessionEnd(stats.audioSeconds, stats.outcome == "finished", stats.scored, stats.flagged))

@@ -54,7 +54,12 @@ class StubQlab : AutoCloseable {
     val key = "qlk_v1_testkey01_" + "A".repeat(22)
 
     // what the stub serves
+    /** The portal's 2.0.1 change (platform client doc 7.1): incident reports may carry `message` and `detail`. Off, a
+     *  2.0.0 server: such a body is a 400. */
+    @Volatile var incidentsAccepted = false
     @Volatile var flags: Map<String, Any?> = mapOf("analytics" to true, "issues" to true, "contributions" to true, "upload_trust" to mapOf("android" to "attested"))
+    /** More top-level fields of the signed config (`sdk_latest`, `accel_deny`, fields no SDK knows). */
+    @Volatile var extra: Map<String, Any?> = emptyMap()
     @Volatile var tajweed: Map<String, Any?>? = mapOf("v" to 1.0, "preset" to "sensitive")
     @Volatile var expiresIn = 86_400L
     @Volatile var tamper = false
@@ -115,7 +120,8 @@ class StubQlab : AutoCloseable {
             "POST /v1/register" -> needToken(s) ?: closed(s, setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"))
                 ?: Reply.json(200, mapOf("ok" to true, "app_id" to "android:org.example.recite", "store_status" to "unlisted"))
             "POST /v1/events" -> needToken(s) ?: events(s)
-            "POST /v1/issues" -> needToken(s) ?: closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames"))
+            "POST /v1/issues" -> needToken(s) ?: closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames") +
+                (if (incidentsAccepted && s.json?.get("kind") in setOf("accelerator_failover", "promotion_failed")) setOf("message", "detail") else emptySet()))
                 ?: Reply.json(202, mapOf("ok" to true))
             "POST /v1/uploads" -> uploadStart(s)
             "POST /v1/contributions/challenge" -> noCredential(s) ?: closed(s, setOf("app", "contributor"))
@@ -173,12 +179,13 @@ class StubQlab : AutoCloseable {
             "denylist" to listOf(mapOf("platform" to "android", "device_class" to "SM-A1*", "backend_forced" to "exact", "reason" to "npu bug")),
             "flags" to flags)
         tajweed?.let { b["tajweed"] = it }
+        b.putAll(extra)
         return b
     }
 
     private fun config(s: Seen): Reply {
         needToken(s)?.let { return it }
-        if (s.q("sdk") != "2.0.0") return Reply.error(400, "invalid_query")
+        if (s.q("sdk") != ai.quranlab.tajweedformer.TajweedFormer.VERSION) return Reply.error(400, "invalid_query")
         if (tokenOf(s) == null && (s.q("platform") == null || s.q("bundle_id") == null)) return Reply.error(400, "invalid_query")
         val now = System.currentTimeMillis() / 1000
         val content = Json.write(configBody(0).filterKeys { it != "issued_at" && it != "expires_at" })
@@ -205,14 +212,36 @@ class StubQlab : AutoCloseable {
         "madd" to setOf("c2", "c4", "c6", "flagged"), "words" to setOf("scored", "flagged"),
     )
 
-    /** Telemetry v2's closed schema (qlab-api src/events2.js). */
+    /** A JSON body as the stub reads it. */
+    @Suppress("UNCHECKED_CAST")
+    fun parse(b: ByteArray): Map<String, Any?> = Json.parse(String(b, Charsets.UTF_8)) as Map<String, Any?>
+
+    /** The `report_id`s recorded (a repeat is answered 202 duplicate and writes nothing). */
+    val reports: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+
+    /** Telemetry v2's closed schema (qlab-api src/events2.js), with the 2.0.1 fields. */
     @Suppress("UNCHECKED_CAST")
     private fun events(s: Seen): Reply {
         if (s.body.size > 32 * 1024) return Reply.error(413, "too_large")
         val o = s.json ?: return Reply.error(400, "invalid_json")
         fun bad(why: String) = Reply.json(400, mapOf("error" to "invalid_body", "message" to why))
-        val top = setOf("v", "day", "product", "platform", "sdk_version", "app_version", "device", "cohorts", "coverage", "downloads")
+        val top = setOf("v", "day", "product", "platform", "sdk_version", "app_version", "device", "cohorts", "coverage", "downloads",
+            "report_id", "launches", "ayahs", "surah_ayahs", "words", "rule_checks", "rule_flags", "share_asked", "share_yes", "share_no")
         o.keys.firstOrNull { it !in top }?.let { return bad("json.$it: unknown field") }
+        val rid = o["report_id"] as? String
+        if (o.containsKey("report_id") && (rid == null || !Regex("^[0-9a-f]{32}$").matches(rid))) return bad("report_id")
+        for (k in listOf("launches", "ayahs", "words", "share_asked", "share_yes", "share_no")) {
+            if (o.containsKey(k)) { val n = o[k] as? Double ?: return bad(k); if (n < 0 || n > 10_000_000 || n != Math.floor(n)) return bad(k) }
+        }
+        (o["surah_ayahs"] as? Map<String, Any?>)?.keys?.firstOrNull { (it.toIntOrNull() ?: 0) !in 1..114 }?.let { return bad("surah_ayahs.$it") }
+        val checks = (o["rule_checks"] as? Map<String, Any?>) ?: emptyMap()
+        val flags = (o["rule_flags"] as? Map<String, Any?>) ?: emptyMap()
+        if (checks.size > 32 || flags.size > 32) return bad("rule_checks: at most 32 keys")
+        for (k in checks.keys + flags.keys) if (!Regex("^[a-z][a-z0-9_]{0,23}$").matches(k)) return bad("rule key $k")
+        for ((k, f) in flags) {
+            val c = checks[k] as? Double ?: return bad("rule_flags.$k not in rule_checks")
+            if ((f as Double) > c) return bad("rule_flags.$k > rule_checks.$k")
+        }
         if (o["v"] != 2.0 || o["product"] != "android" || o["platform"] != "android") return bad("v/product/platform")
         val dev = o["device"] as Map<String, Any?>
         dev.keys.firstOrNull { it !in setOf("class", "soc", "os_major", "ram_tier") }?.let { return bad("json.device.$it") }
@@ -234,6 +263,7 @@ class StubQlab : AutoCloseable {
         if (((o["downloads"] as? List<*>)?.size ?: 0) > 8) return bad("downloads")
         val day = java.time.LocalDate.parse(o["day"] as String)
         if (day.isBefore(java.time.LocalDate.now(java.time.ZoneOffset.UTC).minusDays(7))) return bad("day: older than 7 days")
+        if (rid != null && !reports.add(rid)) return Reply.json(202, mapOf("ok" to true, "points" to 0, "duplicate" to true))
         return Reply.json(202, mapOf("ok" to true, "points" to cohorts.size * 7))
     }
 
@@ -255,8 +285,13 @@ class StubQlab : AutoCloseable {
         if (trust == "attested" && t !in attestedTokens) return Reply.error(403, "attestation_required")
         val id = s.headers["x-qlab-id"] ?: ""
         if (!Regex("^[0-9a-f]{32}$").matches(id)) return Reply.error(400, "invalid_body")
-        closed(s, setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major"))?.let { return it }
+        // consent_text_sha256: the 2.0.1 server's field (custom wording), 64 lower-case hex next to a custom- version
+        closed(s, setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major",
+            "consent_text_sha256"))?.let { return it }
         val o = s.json!!
+        (o["consent_text_sha256"] as? String)?.let { h ->
+            if (!Regex("^[0-9a-f]{64}$").matches(h) || o["consent_version"] != "custom-" + h.take(24)) return Reply.error(400, "invalid_body")
+        }
         (o["audio"] as Map<String, Any?>).keys.firstOrNull { it !in setOf("codec", "container", "sample_rate", "channels", "input_sample_rate", "input_route") }
             ?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "json.audio.$it")) }
         (o["decode"] as Map<String, Any?>).keys.firstOrNull { it !in setOf("model_revision", "backend", "weights_sha256", "sdk_version") }
@@ -316,9 +351,10 @@ class StubQlab : AutoCloseable {
     // ---- a configured client against this stub ----
 
     fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { integrityToken(it) },
-                    clock: () -> Long = System::currentTimeMillis, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16")) =
+                    clock: () -> Long = System::currentTimeMillis, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
+                    debugBuild: Boolean = false, log: (String) -> Unit = {}) =
         CloudEnvironment(storage, AppIdentity("org.example.recite", "3.1", "Recite"), device, FileContributorKeyStore(File(storage, "keys")),
-            PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" })
+            PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" }, debugBuild, log = log)
 
     /** The client's network: offline (an IOException, no answer) while [down]. */
     val transport: HttpTransport = UrlConnectionTransport(5_000, 10_000).let { real ->

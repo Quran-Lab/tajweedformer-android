@@ -1,6 +1,8 @@
 package ai.quranlab.tajweedformer
 
 import ai.quranlab.tajweedformer.accel.AcceleratorController
+import ai.quranlab.tajweedformer.accel.FailoverEngine
+import ai.quranlab.tajweedformer.accel.FailoverEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -120,11 +122,13 @@ fun interface TajweedEngineFactory {
  * result.flaggedWords.forEach { show(it.word, it.score, it.best) }
  * ```
  *
- * Backends: the exact CPU engine serves from the first session. With an
- * [Options.accelerator] the NPU is prepared in the background and, once it passed its self-test, a NEW
- * session runs on it (never a session in progress); the per-chunk watchdog (latency over the chunk's
- * duration, NaN or inf, an all-blank take, an exception) sends the next takes back to the CPU.
- * [backendChoice] says which backend the last session got and why; every choice and fallback goes to
+ * Backends: the exact CPU engine serves from the first session. With an [Options.accelerator] the NPU
+ * is promoted in the background (download, compile, warm-up, the golden test against the CPU engine) and a
+ * NEW session runs on it once it is ready (never a session in progress). While it serves, the CPU engine's
+ * weights are released ([CpuSlot]); a chunk the NPU fails (an exception, NaN or inf, values out of range,
+ * blank output over audio, a missed deadline) switches the take to the CPU within that call
+ * ([FailoverEngine]: the recent audio replayed, the failed chunk redone), and later sessions start on the CPU.
+ * [backendChoice] says which backend the last session got and why; every choice and switch goes to
  * [SdkObserver.onBackendSelected].
  *
  * One session at a time (the exact engine runs one live stream per process). Every engine call runs
@@ -135,7 +139,8 @@ class TajweedRecognizer private constructor(
     /** The context the engine runs ("c16_l64"). */
     val context: String,
     val options: Options,
-    private val engine: TajweedEngine,
+    /** The exact CPU engine, the accelerator's standby (its weights released while the accelerator serves). */
+    private val engine: CpuSlot,
     choice: BackendChoice,
     /** The CPU self-test, when it ran ([Options.selfTest]). */
     val cpuSelfTest: SelfTestResult?,
@@ -203,29 +208,38 @@ class TajweedRecognizer private constructor(
         if (prev.backend != c.backend || prev.reason != c.reason) SdkEvents.emit { it.onBackendSelected(c) }
     }
 
+    /** The accelerator's session engine, kept while the same accelerator stays promoted. */
+    @Volatile private var accEngine: FailoverEngine? = null
+
+    /** Release the CPU weights while the accelerator serves (tests keep them to measure the warm switch). */
+    @Volatile internal var releaseCpuForAccelerator = true
+
+    private fun accelerator(): AcceleratorController? = options.accelerator.takeIf { options.backend != BackendPreference.CPU }
+
     /** The engine for a new session: the accelerator's when it is ready and nothing prefers the CPU. */
     private fun engineForSession(): TajweedEngine {
-        val acc = options.accelerator
-        if (acc == null || options.backend == BackendPreference.CPU) return engine
-        val e = acc.engineForNextSession(engine, options.sampleRate) { why -> fellBack(why) }
+        val acc = accelerator() ?: return engine
+        val e = acc.engineForNextSession(engine, options.sampleRate, accEngine) { ev -> switched(ev) }
         if (e != null) {
+            accEngine = e
             choose(BackendChoice(Backend.NPU, "npu", "", acc.key.soc, context, model.manifest.revision))
+            // no second resident copy of the weights while the accelerator serves: a failover loads them again
+            if (releaseCpuForAccelerator) executor.execute { try { engine.release() } catch (_: Exception) {} }
             return e
         }
         choose(BackendChoice(Backend.CPU, acc.lastCpuReason ?: "cpu", "", acc.key.soc, context, model.manifest.revision))
         return engine
     }
 
-    /** A take on the accelerator threw: it moved to the CPU (replayed), and so do the next takes. */
-    internal fun fellBack(why: String) {
-        options.accelerator?.watchdog("exception", why)
-        choose(BackendChoice(Backend.CPU, "npu_runtime_error", why, options.soc, context, model.manifest.revision))
-        SdkEvents.emit { it.onError("npu", RecognizerException.BackendUnavailable(why)) }
+    /** A take on the accelerator switched to the CPU: the app sees only the backend change. */
+    private fun switched(e: FailoverEvent) {
+        choose(BackendChoice(Backend.CPU, "failover_${e.cause}", e.error?.javaClass?.simpleName ?: "", options.soc, context, model.manifest.revision))
     }
 
-    /** The per-chunk watchdog tripped on the accelerator ([reason]): the next takes run on the CPU. */
-    internal fun watchdog(reason: String, detail: String) {
-        options.accelerator?.watchdog(reason, detail)
+    /** How a take's heads are scored: the accelerator's thresholds for a take that ran mostly there, else the CPU's. */
+    internal fun scoringOf(session: TajweedEngine, stream: TajweedEngineStream, chunks: Int): TajweedBackend {
+        val f = session as? FailoverEngine ?: return TajweedBackend.INT8
+        return if (stream.backend == Backend.NPU || f.mostlyAccelerator(stream, chunks)) f.headsBackend else TajweedBackend.INT8
     }
 
     /** The portal's `tajweed` block (JSON text), or null. Never throws: an invalid field is dropped
@@ -273,6 +287,8 @@ class TajweedRecognizer private constructor(
             val info = sessionInfo()
             val s = TajweedSession(this, info, sessionEngine)
             session = s
+            // the pipeline's golden and warm-up stages yield to sessions (and a first install starts it after one)
+            accelerator()?.sessionStarted()
             SdkEvents.emit { it.onSessionStart(info) }
             return s
         }
@@ -299,7 +315,17 @@ class TajweedRecognizer private constructor(
             weightsSha256 = model.manifest.file("layers.zfw")?.localSha256)
     }
 
-    internal fun release(s: TajweedSession) = synchronized(lock) { if (session === s) session = null }
+    internal fun release(s: TajweedSession) {
+        val ended = synchronized(lock) {
+            if (session === s) {
+                session = null
+                true
+            } else {
+                false
+            }
+        }
+        if (ended) accelerator()?.sessionEnded()
+    }
 
     /** Batched appends (TajweedSession.append): off only in the tests that compare with the unbatched path. */
     @Volatile internal var batchAppends = true
@@ -400,7 +426,6 @@ class TajweedRecognizer private constructor(
                     if (testCpu !== cpu) testCpu.close()
                 }
             } else null
-            cpuTest?.let { t -> if (t.result.passed) t.chunkMs.forEach { options.accelerator?.recordCpuChunk(it) } }
             val acc = options.accelerator
             val reason = when {
                 options.backend == BackendPreference.CPU -> "cpu_requested"
@@ -410,7 +435,12 @@ class TajweedRecognizer private constructor(
             }
             val c = BackendChoice(Backend.CPU, reason, "", options.soc, context, model.manifest.revision)
             SdkEvents.emit { it.onBackendSelected(c) }
-            return TajweedRecognizer(model, context, options, cpu, c, cpuTest?.result)
+            // a scoring handle without weights exists for the exact engine only: other engines stay loaded
+            val scorer: (() -> TajweedEngine)? = if (options.engine === TajweedEngineFactory.EXACT) {
+                { ai.quranlab.tajweedformer.engine.ExactTajweedEngine(model.dir, context, loadEngine = false) }
+            } else null
+            val slot = CpuSlot(cpu, { options.engine.open(model, context, options) }, scorer)
+            return TajweedRecognizer(model, context, options, slot, c, cpuTest?.result)
         }
     }
 }
@@ -444,6 +474,8 @@ class TajweedSession internal constructor(
     /** Hops onto the engine thread (for the tests). */
     internal var hops = 0
     @Volatile private var scored = false
+    /** The thresholds the finished take is scored with. */
+    @Volatile private var scoring = TajweedBackend.INT8
     @Volatile private var flagged = false
 
     /** Each chunk's heads (those the recognizer's options ask for) as the engine runs it. Completes
@@ -521,10 +553,7 @@ class TajweedSession internal constructor(
                 deliver(out, (System.nanoTime() - t0) / 1e9, s.backend)
                 val heads = s.takeHeads() ?: kept
                 val b = s.backend
-                // watchdog: an accelerator take of 5 s or more that heard nothing at all
-                if (b == Backend.NPU && this.samples >= 5L * info.sampleRate && TajweedHeads.concat(heads).greedy().isEmpty()) {
-                    recognizer.watchdog("all_blank", "no token in ${this.samples / info.sampleRate} s of audio")
-                }
+                scoring = recognizer.scoringOf(engine, s, heads.size)
                 val c0 = if (prof) System.nanoTime() else 0L
                 s.close()
                 stream = null
@@ -569,11 +598,12 @@ class TajweedSession internal constructor(
     }
 
     /** [finish], then the tajweed layer of the take as surah:ayah (CPU heads scored with the int8
-     *  thresholds, NPU heads with the fp32 ones). */
+     *  thresholds, NPU heads with the fp32 ones; a take that switched to the CPU by the source of most of
+     *  its chunks). */
     suspend fun finishAndScore(surah: Int, ayah: Int): TajweedResult {
         val (heads, b) = finishTake(scoring = true)
         val r = try {
-            recognizer.scoreAs(heads, surah, ayah, if (b == Backend.CPU) TajweedBackend.INT8 else TajweedBackend.FP32, b)
+            recognizer.scoreAs(heads, surah, ayah, scoring, b)
         } catch (e: Throwable) {
             emitEnd()
             throw e
@@ -604,14 +634,6 @@ class TajweedSession internal constructor(
             kept.add(h)
             val chunk = TajweedChunk(index++, h.only(select), seconds / heads.size, backend, frame)
             events.trySend(chunk)
-            val ms = 1000.0 * chunk.seconds
-            if (backend == Backend.NPU) {
-                // watchdog: a chunk slower than its audio, or a value that is not a number
-                if (ms > h.n40 * 40.0) recognizer.watchdog("latency", "chunk ${chunk.index}: ${ms.toInt()} ms for ${h.n40 * 40} ms of audio")
-                else if (!SelfTest.allFinite(h)) recognizer.watchdog("non_finite", "chunk ${chunk.index}")
-            } else {
-                recognizer.options.accelerator?.recordCpuChunk(ms)
-            }
             if (prof) tp = StageClock.lap(StageClock.DELIVER_OTHER, tp)
             if (observe) {
                 val stats = ChunkStats(chunk.index, 1000.0 * chunk.seconds, h.n40 * 40.0, backend)

@@ -64,6 +64,76 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
 
     fun expired(nowSec: Long): Boolean = expiresAt <= nowSec
 
+    /**
+     * The first `accel_deny` rule that keeps [v]'s accelerator off, or null. Every match field is a pattern (`*`,
+     * `prefix*` or exact) against the values the SDK puts in its incident reports; `os_build`, `device_model`, `chip`
+     * and `delegate` may be absent (any); `accelerator` is the kind (`ane`, `gpu`, `npu` or `*`); a rule whose `until`
+     * (unix seconds) has passed is ignored; a malformed rule (a missing required field, a field that is not a string,
+     * a non-numeric `until`) is skipped on its own.
+     */
+    fun accelDenyRule(v: AccelValues, nowSec: Long): Map<String, Any?>? {
+        @Suppress("UNCHECKED_CAST")
+        val rules = (raw["accel_deny"] as? List<Any?>)?.mapNotNull { it as? Map<String, Any?> } ?: return null
+        val kind = v.accelerator.substringBefore(':')
+        for (r in rules) {
+            val required = listOf("platform" to v.platform, "os_version" to v.osVersion, "device_class" to v.deviceClass,
+                "accelerator" to kind, "model_revision" to v.modelRevision, "sdk_version" to v.sdkVersion)
+            val optional = listOf("os_build" to v.osBuild, "device_model" to v.deviceModel, "chip" to v.chip, "delegate" to v.delegate)
+            if (required.any { (k, _) -> r[k] !is String } || optional.any { (k, _) -> r.containsKey(k) && r[k] !is String }) continue
+            val until = r["until"]
+            if (until != null && until !is Double) continue
+            if (until is Double && until <= nowSec) continue
+            if (required.all { (k, x) -> match(r[k], x) } && optional.all { (k, x) -> !r.containsKey(k) || match(r[k], x ?: "") }) return r
+        }
+        return null
+    }
+
+    /** What an `accel_deny` rule is matched against (the incident reports' values). */
+    data class AccelValues(
+        val platform: String, val osVersion: String, val deviceClass: String, val sdkVersion: String, val modelRevision: String,
+        /** `ane`, `gpu` or `npu:<soc>` (matched by its kind). */
+        val accelerator: String,
+        val osBuild: String? = null, val deviceModel: String? = null, val chip: String? = null,
+        /** `<name>/<version>`. */
+        val delegate: String? = null,
+    )
+
+    /** `sdk_latest`: the newest SDK Quran Lab publishes, or null when absent or malformed (ignored without an error). */
+    val sdkLatest: SdkLatest? get() = SdkLatest.parse(raw["sdk_latest"])
+
+    /** `sdk_latest` of the signed config: `{"version", "severity", "url"}`. */
+    data class SdkLatest(val version: String, val severity: String, val url: String) {
+        /** Whether [version] is newer than [running] (dotted numbers; anything else is never newer). */
+        fun newerThan(running: String): Boolean = newer(version, running)
+
+        companion object {
+            private val DOTTED = Regex("^\\d{1,9}(\\.\\d{1,9})*$")
+
+            @JvmStatic
+            fun parse(v: Any?): SdkLatest? {
+                val m = v as? Map<*, *> ?: return null
+                val version = (m["version"] as? String)?.takeIf { DOTTED.matches(it) } ?: return null
+                val severity = (m["severity"] as? String)?.takeIf { Regex("^[A-Za-z_-]{1,32}$").matches(it) } ?: return null
+                val url = (m["url"] as? String)?.takeIf { it.length <= 512 && Regex("^https://\\S+$").matches(it) } ?: return null
+                return SdkLatest(version, severity, url)
+            }
+
+            /** [a] newer than [b], both dotted numbers (missing parts are 0); false when either is not one. */
+            @JvmStatic
+            fun newer(a: String, b: String): Boolean {
+                if (!DOTTED.matches(a) || !DOTTED.matches(b)) return false
+                val x = a.split('.').map { it.toLong() }
+                val y = b.split('.').map { it.toLong() }
+                for (i in 0 until maxOf(x.size, y.size)) {
+                    val p = x.getOrElse(i) { 0 }
+                    val q = y.getOrElse(i) { 0 }
+                    if (p != q) return p > q
+                }
+                return false
+            }
+        }
+    }
+
     /** `flags`: booleans default to true when absent, `upload_trust` per platform. */
     class Flags(
         val analytics: Boolean = true,

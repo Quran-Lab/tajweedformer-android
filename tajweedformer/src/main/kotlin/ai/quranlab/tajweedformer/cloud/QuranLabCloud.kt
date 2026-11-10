@@ -15,11 +15,17 @@ data class CloudOptions @JvmOverloads constructor(
     val analytics: Analytics = Analytics.ON,
     /** Issue reports (no free text). */
     val issueReports: Boolean = true,
-    /** Recitation sharing: the SDK asks the learner with its own sheet, then uploads whole sessions. Off by default. */
+    /**
+     * Ignored since 2.0.1: whether the SDK offers recitation sharing (its own sheet, then whole sessions
+     * uploaded for a learner who said "Share") is Quran Lab's decision per app, in the signed config.
+     */
     val contributions: Boolean = false,
     /** Children: the sheet addresses the parent or guardian. */
     val audience: Audience = Audience.GENERAL,
-    /** Sharing uploads only on unmetered networks (default: any network; about 90 MB per hour at the shared settings). */
+    /**
+     * Sharing uploads only on unmetered networks (default: any network; about 86 MB per hour at the top
+     * bitrate, less where uploads struggle: the bitrate steps down to 32 kbit/s, about 16 MB an hour).
+     */
     val uploadsOnUnmeteredOnly: Boolean = false,
     /**
      * Quran Lab's Google Cloud project number for Play Integrity (attested uploads). Null: Play
@@ -55,11 +61,13 @@ class CloudEnvironment(
     val debugBuild: Boolean = false,
     /** The current network is unmetered (Wi-Fi, Ethernet). */
     val unmetered: () -> Boolean = { true },
+    /** The SDK's warnings for the developer (Android: `Log.w`); only debuggable builds write any. */
+    val log: (String) -> Unit = { System.err.println("W/QuranLab: $it") },
 )
 
 /** Where background work runs. */
 interface CloudScheduler {
-    /** Delivery of telemetry and issues is due. */
+    /** Delivery of telemetry reports and issues is due. */
     fun scheduleDelivery(cloud: QuranLabCloud)
     /** The sharing outbox has something to send (now, or at [atMs]). */
     fun scheduleUploads(cloud: QuranLabCloud, atMs: Long? = null)
@@ -78,12 +86,17 @@ interface CloudScheduler {
 }
 
 /**
- * Everything the SDK does with portal.quranlab.ai for one app (PLATFORM_CLIENT.md): the token, the
- * launch registration, the signed config (and its `tajweed` block and flags), telemetry v2, issue
+ * Everything the SDK does with portal.quranlab.ai for one app (docs/platform-client.md): the token, the
+ * daily registration, the signed config (and its `tajweed` block and flags), telemetry v2 deltas, issue
  * reports, and recitation sharing. It is the [TajweedObserver] the recognizer reports to. Nothing
  * here sits in the recognition path: network work runs on [CloudEnvironment.scheduler]'s threads.
  *
- * Blocking methods ([launch], [refreshConfig], [deliver]) are for background threads.
+ * The app's life (Android: `QuranLabAndroid` calls these): [launch] once per process, [foreground] at a
+ * cold start and every return to the foreground, [tick] while the app is in use, [background] when it
+ * goes to the background. Telemetry is sealed into a delta at launch, every 15 minutes in use
+ * ([Telemetry.SEND_INTERVAL_MS]) and at the background, and sent oldest first.
+ *
+ * Blocking methods ([launch], [foreground], [refreshConfig], [deliver]) are for background threads.
  */
 class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : TajweedObserver {
     val key: QuranLabKey? = QuranLabKey.parse(options.key)
@@ -99,9 +112,9 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     private val stopped = AtomicBoolean(false)
     @Volatile var stopReason: String? = null
         private set
-    private var registered = false
     @Volatile private var telemetryRetryAt = 0L
     private var telemetryFailures = 0
+    @Volatile private var lastSealAt = 0L
 
     init {
         telemetry.enabled = options.analytics == CloudOptions.Analytics.ON && config.current?.flags?.analytics != false
@@ -155,27 +168,70 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         }
     }
 
-    // ---- launch ----
+    // ---- the app's life ----
 
     /**
-     * The launch sequence (call once per process, off the main thread): registration, the signed
-     * config, then due deliveries (telemetry, issues) and the sharing outbox. Each step is
-     * independent: one failing (offline) does not stop the others.
+     * The launch sequence (call once per process, off the main thread): with [foreground] (the app is
+     * being opened, not woken for background work) a launch is counted and the install registered (once
+     * a UTC day); then the signed config, a telemetry send point (counts left by earlier runs included)
+     * and the sharing outbox. Each step is independent: one failing (offline) does not stop the others.
+     * Android calls it with `foreground = false` and counts the opening in [foreground].
      */
-    fun launch(modelRevision: String? = null) {
-        register(modelRevision)
+    @JvmOverloads
+    fun launch(modelRevision: String? = null, foreground: Boolean = true) {
+        if (foreground) {
+            telemetry.launch()
+            register(modelRevision)
+        }
         refreshConfig()
-        env.scheduler.scheduleDelivery(this)
+        sendPoint()
         if (sharing.outbox.hasWork()) env.scheduler.scheduleUploads(this)
+    }
+
+    /**
+     * A cold start or a return to the foreground (off the main thread): one launch counted, the daily
+     * registration if this is the day's first, a fresh telemetry backoff, and the 15-minute timer restarted.
+     */
+    @JvmOverloads
+    fun foreground(modelRevision: String? = null) {
+        telemetry.launch()
+        telemetryFailures = 0
+        telemetryRetryAt = 0
+        lastSealAt = env.clock()
+        register(modelRevision)
+    }
+
+    /** While the app is in use (Android: every minute): a send point once 15 minutes passed since the last. */
+    fun tick() {
+        if (env.clock() - lastSealAt >= Telemetry.SEND_INTERVAL_MS) sendPoint()
+    }
+
+    /** The app went to the background: a send point. */
+    fun background() = sendPoint()
+
+    /** What was counted since the last send point is sealed (one report per UTC day) and delivery is scheduled. */
+    fun sendPoint() {
+        lastSealAt = env.clock()
+        telemetry.seal(TelemetryContext(env.app, env.device))
+        env.scheduler.scheduleDelivery(this)
     }
 
     private val installedMarker get() = File(cloudDir, "installed")
     private val pendingNew get() = File(cloudDir, "register-pending")
+    private val registerDay get() = File(cloudDir, "register-day")
 
-    /** `POST /v1/register`, at most once per launch. The new-install flag survives a failed attempt. */
+    /** The UTC day of the last accepted registration. */
+    val registeredOn: String? get() = try { registerDay.takeIf { it.isFile }?.readText()?.trim() } catch (_: Exception) { null }
+
+    /**
+     * `POST /v1/register`, at most once per UTC day per install (a day stamp written only after a 200), so the
+     * server counts daily active installs. The new-install flag survives a failed attempt.
+     */
     @Synchronized
     fun register(modelRevision: String? = null): Boolean {
-        if (registered || key == null || stopped.get()) return registered
+        if (key == null || stopped.get()) return false
+        val today = Day.of(env.clock())
+        if (registeredOn == today) return true
         cloudDir.mkdirs()
         val isNew = !installedMarker.exists()
         if (isNew) { installedMarker.writeText(""); pendingNew.writeText("1") }
@@ -183,7 +239,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         return try {
             authed("register") { api.register(Credential.Token(it), env.app, modelRevision, newInstall) }
             pendingNew.delete()
-            registered = true
+            try { registerDay.writeText(today) } catch (_: Exception) {}
             true
         } catch (e: CloudException) {
             if (!e.retryable) pendingNew.delete()
@@ -198,13 +254,30 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
             val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, config.etagToSend()) }
             val c = config.apply(r)
             applyFlags(c)
+            noteSdkLatest(c)
             c
         } catch (e: ConfigRejected) {
             report("signature_invalid", "config:" + (e.message ?: "rejected").replace(' ', '_'))
-            config.current
+            config.current.also { noteSdkLatest(it) }
         } catch (e: CloudException) {
-            config.current
+            config.current.also { noteSdkLatest(it) }
         }
+    }
+
+    private val sdkLatestLogged = AtomicBoolean(false)
+
+    /**
+     * A debuggable build whose SDK is older than the signed config's `sdk_latest` gets one warning per launch (this
+     * cloud is the process's): `Quran Lab SDK X is available (severity), you have Y: URL`. Release builds stay silent;
+     * a missing or malformed field is ignored.
+     */
+    private fun noteSdkLatest(c: RemoteConfig?) {
+        if (!env.debugBuild) return
+        val l = c?.sdkLatest ?: return
+        val mine = ai.quranlab.tajweedformer.TajweedFormer.VERSION
+        if (!l.newerThan(mine)) return
+        if (!sdkLatestLogged.compareAndSet(false, true)) return
+        try { env.log("Quran Lab SDK ${l.version} is available (${l.severity}), you have $mine: ${l.url}") } catch (_: Exception) {}
     }
 
     private fun applyFlags(c: RemoteConfig?) {
@@ -219,32 +292,53 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         currentConfig?.denyRule(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.TajweedFormer.VERSION, revision)
             ?.get("backend_forced") as? String
 
+    private val accelDenyLogged = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    /**
+     * Whether the signed config's `accel_deny` keeps [accelerator] (`npu:<soc>`) off on this install for [revision]:
+     * the matching rule's `reason` (or "accel_deny"), else null. Read at every call from the verified config in force.
+     */
+    fun accelDenied(accelerator: String, revision: String, osBuild: String?, deviceModel: String?, chip: String?, delegate: String?): String? {
+        val c = currentConfig ?: return null
+        val v = RemoteConfig.AccelValues(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.TajweedFormer.VERSION,
+            revision, accelerator, osBuild, deviceModel?.replace(' ', '_'), chip, delegate)
+        val r = c.accelDenyRule(v, env.clock() / 1000) ?: return null
+        val reason = (r["reason"] as? String)?.takeIf { it.isNotBlank() } ?: "accel_deny"
+        if (env.debugBuild && accelDenyLogged.add("$accelerator|$revision|$reason")) {
+            try { env.log("accel_deny keeps $accelerator off for $revision: $reason") } catch (_: Exception) {}
+        }
+        return reason
+    }
+
     // ---- delivery: telemetry and issues ----
 
-    /** Sends complete days of telemetry and queued issues. Returns (days accepted, issues accepted). */
+    /** Sends the sealed telemetry reports (oldest first) and queued issues. Returns (reports accepted, issues accepted). */
     @Synchronized
     fun deliver(): Pair<Int, Int> {
         if (key == null || stopped.get()) return 0 to 0
-        var days = 0
+        var reports = 0
         var sent = 0
         val flags = currentConfig?.flags
-        if (telemetry.enabled && flags?.analytics != false && env.clock() >= telemetryRetryAt) days = sendTelemetry()
+        if (telemetry.enabled && flags?.analytics != false && env.clock() >= telemetryRetryAt) reports = sendTelemetry()
         if (options.issueReports && flags?.issues != false) sent = sendIssues()
-        return days to sent
+        return reports to sent
     }
 
+    /**
+     * Each sealed report, its exact bytes (a retry sends the same `report_id`, which the server counts once):
+     * 202 (duplicate or not) deletes it; 400 drops it and reports the SDK bug; 413 drops it; 401 renews the
+     * token and retries; 429, 5xx, 503 and network errors keep it and back off.
+     */
     private fun sendTelemetry(): Int {
-        val ctx = TelemetryContext(env.app, env.device)
         var n = 0
-        for (d in telemetry.pendingDays()) {
-            val body = telemetry.payload(d, ctx)
-            if (body == null) { telemetry.drop(d); continue }
+        for (f in telemetry.pendingReports()) {
+            val body = try { f.readBytes() } catch (_: Exception) { telemetry.dropReport(f); continue }
             try {
                 val r = authed("events") { api.events(it, body).also { r -> if (r.status == 401) throw CloudException(r.error, "events") } }
                 when {
-                    r.status == 202 || r.ok -> { telemetry.drop(d); n++; telemetryFailures = 0 }
-                    r.status == 400 -> { telemetry.drop(d); report("other", "bad_request:events") }
-                    r.status == 413 -> telemetry.drop(d)
+                    r.status == 202 || r.ok -> { telemetry.dropReport(f); n++; telemetryFailures = 0 }
+                    r.status == 400 -> { telemetry.dropReport(f); report("other", "bad_request:events") }
+                    r.status == 413 -> telemetry.dropReport(f)
                     r.status == 403 -> { refused(CloudException(r.error, "events"), "events"); return n }
                     else -> { backoffTelemetry(); return n }
                 }
@@ -256,7 +350,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         return n
     }
 
-    /** 1 min, 10 min, then the next launch. */
+    /** 1 min, 10 min, then the next launch or return to the foreground. */
     private fun backoffTelemetry() {
         telemetryFailures++
         telemetryRetryAt = env.clock() + when (telemetryFailures) {
@@ -269,7 +363,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     private fun sendIssues(): Int {
         var n = 0
         while (true) {
-            val b = issues.pending().firstOrNull() ?: break
+            val b = issues.firstToSend() ?: break
             try {
                 val r = authed("issues") { api.issue(it, b).also { r -> if (r.status == 401) throw CloudException(r.error, "issues") } }
                 if (r.ok || r.status == 400 || r.status == 413) { issues.removeFirst(); if (r.ok) n++ } else break
@@ -286,7 +380,23 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         if (issues.add(kind, code, IssueQueue.frames(error), env.app, env.device, backend, revision)) env.scheduler.scheduleDelivery(this)
     }
 
+    /** Queues an accelerator incident (section 7.1) and schedules delivery. */
+    fun reportIncident(i: ai.quranlab.tajweedformer.AcceleratorIncident) {
+        if (!options.issueReports || currentConfig?.flags?.issues == false) return
+        if (issues.addIncident(i, IssueQueue.frames(i.error), env.app, env.device)) env.scheduler.scheduleDelivery(this)
+    }
+
     // ---- TajweedObserver ----
+
+    override fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {
+        telemetry.promotion(e)
+        if (!e.promoted) e.incident?.let { reportIncident(it) }
+    }
+
+    override fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) {
+        telemetry.failover(e)
+        reportIncident(e.incident)
+    }
 
     override fun onModelLoad(e: TajweedObserver.ModelLoad) = telemetry.modelLoad(e)
     override fun onSelfTest(revision: String, context: String, backend: String, passed: Boolean) {
@@ -309,8 +419,8 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     override fun onSessionEnd(e: TajweedObserver.SessionEnd) {
         telemetry.sessionEnd(e)
         sharing.sessionEnded(e)
-        // a new UTC day's first session end delivers the finished days
-        if (telemetry.pendingDays().isNotEmpty()) env.scheduler.scheduleDelivery(this)
+        // a send point when 15 minutes passed (hosts without a timer of their own)
+        if (lastSealAt != 0L) tick()
     }
     override fun onIssue(kind: String, code: String, error: Throwable?) = report(kind, code, error)
 

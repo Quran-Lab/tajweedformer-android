@@ -120,6 +120,21 @@ class ModelDownloader @JvmOverloads constructor(
     /** Whether [e]'s kept file is in place with its size and SHA-256 (see [VerifiedStamps]). */
     fun isInPlace(e: ModelManifest.FileEntry): Boolean = stamps.verified(local(e), e.localSize, e.localSha256)
 
+    /** A file the SDK made itself and checked (a program rebuilt from a delta): its size and SHA-256 are kept next to it
+     *  (`<file>.target`), so it is known to be in place like a downloaded file. */
+    fun recordBuilt(f: File, size: Long, sha256: String) {
+        File(f.path + ".target").writeText("$size ${sha256.lowercase()}\n")
+        stamps.record(f, size, sha256)
+    }
+
+    /** Whether a file [recordBuilt] recorded is still in place with those bytes. */
+    fun isBuiltInPlace(f: File): Boolean {
+        val t = File(f.path + ".target").takeIf { it.isFile }?.readText()?.trim()?.split(' ') ?: return false
+        val size = t.getOrNull(0)?.toLongOrNull() ?: return false
+        val sha = t.getOrNull(1) ?: return false
+        return stamps.verified(f, size, sha)
+    }
+
     /**
      * Makes sure [e] is in place, downloading what is missing. [onProgress] gets stored bytes so far.
      * Returns the result (also sent to [SdkObserver.onDownloadFinished]). Throws

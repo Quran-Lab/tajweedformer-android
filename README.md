@@ -79,7 +79,7 @@ cd tajweedformer-android
 ./gradlew :tajweedformer:assembleRelease     # tajweedformer/build/outputs/aar/tajweedformer-release.aar
 ```
 
-Depend on `ai.quranlab:tajweedformer:2.0.0` (the AAR, or the `:tajweedformer` project).
+Depend on `ai.quranlab:tajweedformer:2.0.1` (the AAR, or the `:tajweedformer` project).
 
 ### Ten lines
 
@@ -98,9 +98,10 @@ result.flaggedWords.forEach { w -> show(w.word, w.score, w.best?.expected, w.bes
 ```
 
 `tf.recognizer()` downloads the CPU profile on the first call (any network), verifies it, runs the
-CPU self-test, and uses the NPU only when this phone's build is on disk, loads, and passes its own
-self-test against the CPU (NPU files are fetched in the background on an unmetered network after
-the CPU self-test passed). `tj.backendChoice` says which backend runs and why.
+CPU self-test, and serves on the exact CPU engine. The NPU is promoted in the background after the first
+session (download on an unmetered network, load, warm-up, the golden test against the CPU engine) and used
+from the next session once it is ready and warm ("CPU first, then the accelerator" below).
+`tj.backendChoice` says which backend runs and why.
 
 ## More
 

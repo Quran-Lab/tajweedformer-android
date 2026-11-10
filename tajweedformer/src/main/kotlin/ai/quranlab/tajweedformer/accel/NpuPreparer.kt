@@ -9,25 +9,30 @@ import ai.quranlab.tajweedformer.RecognizerException
 import ai.quranlab.tajweedformer.SelfTestRunner
 import ai.quranlab.tajweedformer.SelfTestSet
 import ai.quranlab.tajweedformer.TajweedBackend
-import ai.quranlab.tajweedformer.TajweedEngine
+import ai.quranlab.tajweedformer.TajweedEngineStream
+import ai.quranlab.tajweedformer.TajweedHead
 import ai.quranlab.tajweedformer.TajweedModel
 import ai.quranlab.tajweedformer.engine.ExactTajweedEngine
-import ai.quranlab.tajweedformer.npu.NpuChainRunner
 import ai.quranlab.tajweedformer.npu.NpuChainOpener
+import ai.quranlab.tajweedformer.npu.NpuChainRunner
 import ai.quranlab.tajweedformer.npu.NpuContract
 import ai.quranlab.tajweedformer.npu.NpuMasks
 import ai.quranlab.tajweedformer.npu.NpuRunner
 import java.io.File
 
 /**
- * The Android NPU as an [AcceleratorPreparer]: the SoC's three `npu-*` files and the `selftest` set from
- * [store] (downloaded only on an unmetered network), the model loaded by [runnerFactory] (LiteRT with the
- * vendor dispatch), the host loop of [NpuTajweedEngine], and the self-test on the shipped golden set
- * scored by the exact engine's scorer (opened without a stream, so it never competes with a session).
+ * The Android NPU as an [AcceleratorPreparer]:
  *
- * A chained build (io.json `parts`, the Exynos 2500) loads every part with [runnerFactory] (each with its own
- * part contract) and runs them as one [NpuChainRunner]; the self-test, watchdog, crash sentinel and fallback
- * are the same as for one model, over the whole chain.
+ * - `download`: the SoC's `npu-*` files of the context and the `selftest` set (unmetered network only; resumable, each
+ *   file verified as the CPU set is). On a first install none of them is fetched before the pipeline starts.
+ * - `compile`: the NPU program loaded by [runnerFactory] (LiteRT with the vendor dispatch). The shipped builds are
+ *   compiled ahead of time for each SoC, so the device step is LiteRT's CreateCompiledModel through the dispatch
+ *   library: no on-device compiler runs, and LiteRT's compiler cache does not apply to them.
+ * - `warmup`, `golden`: the host loop of [NpuTajweedEngine] (the exact engine's front end, the NPU per chunk), the
+ *   golden clips also through the exact CPU engine in the same run, scored by the CPU engine's scorer.
+ *
+ * A chained build (io.json `parts`, the Exynos 2500) loads every part with [runnerFactory] and runs them as one
+ * [NpuChainRunner]; everything else is the same over the whole chain.
  */
 class NpuPreparer(
     private val store: ModelStore,
@@ -42,54 +47,122 @@ class NpuPreparer(
         if (key.soc == null) return Reasons.SOC_UNKNOWN
         val m = store.manifest()
         if (store.npuFiles(key.soc, key.context).isEmpty()) return Reasons.NO_BUILD
-        if (selftestFiles(m, key.context).none { it.localPath == "${SelfTestSet.DIR}/expected_${key.context}.json" }) return "no_selftest_set"
+        if (selftestFiles(m, key.context).none { it.localPath == "${SelfTestSet.DIR}/expected_${key.context}.json" }) return Reasons.NO_SELFTEST_SET
         if (runnerFactory == null) return Reasons.RUNTIME_MISSING
         return null
     }
 
     override fun download(key: AcceleratorKey) {
-        val d = store.ensureNpu(key.soc, key.context, network, cpuSelfTestPassed = true)
-        if (d.files == null) throw RecognizerException.DownloadFailed("npu/${key.soc}/${key.context}", d.reason)
-        if (!network.isUnmetered() && selftestFiles(store.manifest(), key.context).any { !store.downloader.isInPlace(it) }) {
-            throw RecognizerException.DownloadFailed(SelfTestSet.DIR, "metered_network")
+        if (inPlace(key)) return
+        if (!network.isUnmetered()) throw StageWait("unmetered_network")
+        val d = try {
+            store.ensureNpu(key.soc, key.context, network, cpuSelfTestPassed = true)
+        } catch (e: RecognizerException.DownloadFailed) {
+            throw StageFailure(reason(e), "${e.path}: ${e.reason}", e)
         }
-        for (e in selftestFiles(store.manifest(), key.context)) store.downloader.fetch(e)
+        if (d.files == null) {
+            if (d.reason == "metered_network") throw StageWait("unmetered_network")
+            throw StageFailure(Reasons.OTHER, "npu/${key.soc}/${key.context}: ${d.reason}")
+        }
+        for (e in selftestFiles(store.manifest(), key.context)) {
+            try {
+                store.downloader.fetch(e)
+            } catch (x: RecognizerException.DownloadFailed) {
+                throw StageFailure(reason(x), "${x.path}: ${x.reason}", x)
+            }
+        }
     }
 
-    override fun load(key: AcceleratorKey): PreparedAccelerator {
+    override fun programId(key: AcceleratorKey): String = store.npuProgramId(key.soc, key.context)
+
+    override fun inPlace(key: AcceleratorKey): Boolean =
+        store.isNpuReady(key.soc, key.context) && selftestFiles(store.manifest(), key.context).all { store.downloader.isInPlace(it) }
+
+    private fun reason(e: RecognizerException.DownloadFailed): String {
+        val r = e.reason.lowercase()
+        return when {
+            "space" in r || "storage" in r -> Reasons.STORAGE
+            "sha" in r || "size" in r || "mismatch" in r || "signature" in r -> Reasons.VERIFY
+            "network" in r || "http" in r || "timeout" in r -> Reasons.NETWORK
+            else -> Reasons.NETWORK
+        }
+    }
+
+    override fun compile(key: AcceleratorKey): PreparedAccelerator {
         val files = store.ensureNpu(key.soc, key.context, network, cpuSelfTestPassed = true).files
-            ?: throw RecognizerException.BackendUnavailable("the NPU files are not in place")
+            ?: throw StageFailure(Reasons.OTHER, "the NPU files are not in place")
         val contract = NpuContract.read(files.io)
-        if (contract.context != key.context) throw RecognizerException.BackendUnavailable("io.json is for ${contract.context}")
+        if (contract.context != key.context) throw StageFailure(Reasons.COMPILE_ERROR, "io.json is for ${contract.context}")
         val masks = NpuMasks.read(files.masks, contract)
         val runner = if (contract.parts.isEmpty()) {
-            if (files.parts.isNotEmpty()) throw RecognizerException.BackendUnavailable("the manifest lists parts but io.json has none")
+            if (files.parts.isNotEmpty()) throw StageFailure(Reasons.COMPILE_ERROR, "the manifest lists parts but io.json has none")
             runnerFactory!!(files.model, contract)
         } else {
             chain(files, contract, runnerFactory!!)
         }
-        val scorer = ExactTajweedEngine(model.dir, key.context, loadEngine = false)
-        val dir = File(model.dir, SelfTestSet.DIR)
-        val set = SelfTestSet.read(dir)
-        val expected = SelfTestSet.readExpected(dir, key.context)
-        return object : PreparedAccelerator {
-            override val expected: SelfTestSet.Expected = expected
-            override val chunkMs: Int = contract.chunkMs
-            override val planted: Set<String> = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
+        return Prepared(key, contract, masks, runner)
+    }
 
-            override fun engine(cpu: TajweedEngine, sampleRate: Int, onFallback: (String) -> Unit): TajweedEngine =
-                NpuTajweedEngine(cpu, contract, masks, runner, sampleRate, onFallback).also { it.fallbackEnabled = true }
+    private inner class Prepared(
+        private val key: AcceleratorKey,
+        private val contract: NpuContract,
+        private val masks: NpuMasks,
+        private val runner: NpuRunner,
+    ) : PreparedAccelerator {
+        private val dir = File(model.dir, SelfTestSet.DIR)
+        private val set = SelfTestSet.read(dir)
+        override val expected: SelfTestSet.Expected = SelfTestSet.readExpected(dir, key.context)
+        override val chunkMs: Int = contract.chunkMs
+        override val headsBackend: TajweedBackend = TajweedBackend.FP32
+        override val planted: Set<String> = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
+        override val plantedSites = SelfTestSet.plantedSites(set, expected)
+        override val tolerance = store.manifest().toleranceFor("npu:${key.soc}:${key.context}")
 
-            override fun selfTest(): Map<String, SelfTestSet.ClipObserved> {
-                // fallback off: an NPU error fails the self-test instead of moving to the CPU
-                val e = NpuTajweedEngine(scorer, contract, masks, runner, 16_000) {}
-                return SelfTestRunner.run(e, scorer, model.calibration, key.context, set, dir, TajweedBackend.INT8)
+        /** The widest value any head of this build can take: int16 codes times the head output's scale. */
+        override val range: HeadRange = HeadRange.fromLogitBound(contract.heads.maxOf { 32768.0 * contract.outputs.getValue(it.output).scale })
+
+        private fun engine(rate: Int) = NpuTajweedEngine(contract, masks, runner, rate)
+
+        override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream = engine(sampleRate).createStream(heads)
+
+        override fun warmup() {
+            val clip = set.clips.first()
+            val audio = FloatArray(16_000) + SelfTestSet.samples(File(dir, clip.file))
+            stream(TajweedHead.SCORER_HEADS, 16_000).use { s ->
+                var at = 0
+                val got = ArrayList<ai.quranlab.tajweedformer.TajweedHeads>()
+                while (at < audio.size) {
+                    val k = minOf(SelfTestRunner.PIECE, audio.size - at)
+                    got += s.pushAudio(audio, at, k)
+                    at += k
+                }
+                got += s.finish()
+                for ((i, h) in got.withIndex()) {
+                    Failover.check(h, range)?.let { throw StageFailure(Reasons.NON_FINITE, "warm-up chunk $i: $it", clip = clip.id) }
+                }
             }
+        }
 
-            override fun close() {
-                try { runner.close() } catch (_: Exception) {}
+        override fun golden(abort: () -> Boolean): GoldenRun {
+            // the CPU engine first (it holds the process's one engine stream while it runs), then the NPU path,
+            // scored by a scoring-only handle (no weights)
+            val cpu = ExactTajweedEngine(model.dir, key.context, loadEngine = true)
+            val cpuObs = try {
+                SelfTestRunner.run({ cpu.createStream() }, cpu, model.calibration, key.context, set, dir, TajweedBackend.INT8, abort)
+            } finally {
+                cpu.close()
+            }
+            val scorer = ExactTajweedEngine(model.dir, key.context, loadEngine = false)
+            val accObs = try {
+                SelfTestRunner.run({ stream(TajweedHead.SCORER_HEADS, 16_000) }, scorer, model.calibration, key.context, set, dir, headsBackend, abort)
+            } finally {
                 scorer.close()
             }
+            return GoldenRun(accObs, cpuObs)
+        }
+
+        override fun close() {
+            try { runner.close() } catch (_: Exception) {}
         }
     }
 

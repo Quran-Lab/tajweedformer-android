@@ -18,8 +18,11 @@ object SegmentPlan {
     @JvmStatic fun seconds(n: Int, plan: List<Int> = SECONDS): Int = plan[minOf(n, plan.size) - 1]
 }
 
-/** A closed segment of an [OggOpusWriter]: its number, file, last granule position, and whether it ends the stream. */
-data class OggSegment(val n: Int, val file: File, val granule: Long, val last: Boolean)
+/**
+ * A closed segment of an [OggOpusWriter]: its number, file, last granule position, whether it ends the
+ * stream, and the bit rate (bit/s) every packet of it was encoded at.
+ */
+data class OggSegment(val n: Int, val file: File, val granule: Long, val last: Boolean, val bitrate: Int = 0)
 
 /**
  * Writes one session's audio as Ogg Opus while the session runs, byte for byte as the Swift SDK's
@@ -33,6 +36,12 @@ data class OggSegment(val n: Int, val file: File, val granule: Long, val last: B
  * packets; empty: one file): segment 1 starts with OpusHead and OpusTags, the last page of the last
  * segment has the end-of-stream flag and the encoder's final granule position, and granule
  * positions and page sequence numbers run on, so the segments concatenated are exactly one file.
+ *
+ * Bitrate ([bitrateFor], SDK 2.0.1): when a segment opens, the writer asks for its bit rate and sets it on
+ * the encoder (`OPUS_SET_BITRATE`) before the segment's first packet is encoded, so every packet of a
+ * segment has the same target. Segment 1's is asked for when the writer is created; segment n's after
+ * segment n - 1 closed (packet by packet around the boundary, so the closing is seen first). Opus takes a
+ * new bitrate on any packet: no new headers, one stream.
  */
 class OggOpusWriter @JvmOverloads constructor(
     private val segmentFile: (Int) -> File,
@@ -43,6 +52,8 @@ class OggOpusWriter @JvmOverloads constructor(
     encoder: OpusEncoding? = null,
     /** OpusTags' vendor string; null: [vendor] (the cross-SDK vector names its own). */
     vendor: String? = null,
+    /** The bit rate of segment n (1-based), asked when it opens; null: [settings]' bitrate throughout. */
+    private val bitrateFor: ((Int) -> Int)? = null,
     private val onSegment: (OggSegment) -> Unit = {},
 ) : AutoCloseable {
     private val encoder: OpusEncoding
@@ -55,6 +66,25 @@ class OggOpusWriter @JvmOverloads constructor(
     private val packets = ArrayDeque<ByteArray>()
     private var paged = 0L
     private var clean = FloatArray(0)
+    /** Packets handed over by the encoder so far. */
+    private var encoded = 0L
+    /** The segment that opens next and the index of its first packet. */
+    private var nextSegment = 2
+    private var nextStart = Long.MAX_VALUE
+    private val bitrates = ArrayList<Int>()
+    private val sink = object : PacketSink {
+        override fun beforePacket() {
+            if (encoded == nextStart) openNext()
+        }
+
+        override fun packet(p: ByteArray) {
+            packets.addLast(p)
+            encoded++
+        }
+    }
+
+    /** The bit rate of each segment opened so far, in order (bit/s). */
+    val segmentBitrates: List<Int> get() = bitrates.toList()
 
     /** Input frames given to the writer, at the input rate. */
     var inputFrames = 0L
@@ -82,14 +112,30 @@ class OggOpusWriter @JvmOverloads constructor(
         if (inputRate < 8_000 || inputRate > 384_000) throw SharingException("unsupported_audio", "$inputRate Hz")
         resampler = if (inputRate == RATE) null else ShareResampler(inputRate)
         this.encoder = encoder ?: LibOpusEncoder(OpusSettings.CODED_RATE, 1, settings)
+        bitrates.add(rateOf(1))
+        segmentLimit(1)?.let { nextStart = it.toLong() }
         page(listOf(opusHead(this.encoder.preSkip, inputRate)), 0, 0x02, audio = false)
         page(listOf(opusTags(vendor ?: Companion.vendor())), 0, 0, audio = false)
+    }
+
+    /** Segment [n]'s bit rate, set on the encoder now (the settings' when there is no [bitrateFor] or the encoder has none). */
+    private fun rateOf(n: Int): Int {
+        val want = bitrateFor?.invoke(n) ?: return settings.bitrate
+        return if (encoder.setBitrate(want)) want else settings.bitrate
+    }
+
+    /** The next packet starts segment [nextSegment]: the current one is closed first, then the new rate is set. */
+    private fun openNext() {
+        writePages(final = false)
+        bitrates.add(rateOf(nextSegment))
+        nextStart += segmentLimit(nextSegment)!!
+        nextSegment++
     }
 
     /** Test seam: encoded packets in place of audio (the cross-SDK muxer vector). */
     internal fun appendPackets(p: List<ByteArray>) {
         if (ended) return
-        packets.addAll(p)
+        for (x in p) { sink.beforePacket(); sink.packet(x) }
         writePages(final = false)
     }
 
@@ -106,9 +152,9 @@ class OggOpusWriter @JvmOverloads constructor(
         nonFiniteSamples += bad
         val r = resampler
         if (r != null) {
-            r.process(clean, 0, length) { x, o, n -> packets.addAll(encoder.encode(x, o, n)) }
+            r.process(clean, 0, length) { x, o, n -> encoder.encodeTo(x, o, n, sink) }
         } else {
-            packets.addAll(encoder.encode(clean, 0, length))
+            encoder.encodeTo(clean, 0, length, sink)
         }
         writePages(final = false)
     }
@@ -117,8 +163,8 @@ class OggOpusWriter @JvmOverloads constructor(
     fun finish(): Int {
         if (!ended) {
             ended = true
-            resampler?.flush { x, o, n -> packets.addAll(encoder.encode(x, o, n)) }
-            packets.addAll(encoder.flush())
+            resampler?.flush { x, o, n -> encoder.encodeTo(x, o, n, sink) }
+            encoder.flushTo(sink)
             writePages(final = true)
             closeSegment(last = true)
             encoder.close()
@@ -171,7 +217,7 @@ class OggOpusWriter @JvmOverloads constructor(
         val o = out ?: return
         try { o.close() } catch (_: IOException) {}
         out = null
-        onSegment(OggSegment(segment, segmentFile(segment), lastGranule, last))
+        onSegment(OggSegment(segment, segmentFile(segment), lastGranule, last, bitrates.getOrElse(segment - 1) { settings.bitrate }))
     }
 
     private fun page(packets: List<ByteArray>, granule: Long, flags: Int, audio: Boolean = true) {
@@ -242,7 +288,7 @@ class OggOpusWriter @JvmOverloads constructor(
             return d
         }
 
-        /** The vendor string, "QuranLab SDK 2.0.0 libopus 1.6.1" as the Swift SDK writes it. */
+        /** The vendor string, "QuranLab SDK 2.0.1 libopus 1.6.1" as the Swift SDK writes it. */
         @JvmStatic
         fun vendor(): String = "QuranLab SDK ${TajweedFormer.VERSION} ${OpusVersion.string}"
 

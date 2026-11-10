@@ -100,7 +100,7 @@ class NpuReplayTest {
         val dir = File(model.dir, SelfTestSet.DIR)
         val set = SelfTestSet.read(dir)
         val expected = SelfTestSet.readExpected(dir, "c16_l64")
-        val e = NpuTajweedEngine(scorer, contract, masks, NpuChainRunner(contract, parts), 16_000) {}
+        val e = NpuTajweedEngine(contract, masks, NpuChainRunner(contract, parts), 16_000, scorer)
         val observed = SelfTestRunner.run(e, scorer, model.calibration, "c16_l64", set, dir, TajweedBackend.INT8)
         assertEquals(0, parts.sumOf { it.misses })
         for ((id, o) in observed) {
@@ -108,7 +108,7 @@ class NpuReplayTest {
             println("$id: tokens ${if (o.tokens == x.tokens) "=" else "DIFFER"}, sites ${o.flaggedSites} vs ${x.flaggedSites}, words ${o.flaggedWords} vs ${x.flaggedWords}")
         }
         val planted = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
-        val v = SelfTestSet.judge(expected, observed, emptyList(), 320, checkLatency = false, planted = planted)
+        val v = SelfTestSet.judge(expected, observed, planted)
         println("self-test verdict (decisions; latency is the device's): $v")
         scorer.close()
     }

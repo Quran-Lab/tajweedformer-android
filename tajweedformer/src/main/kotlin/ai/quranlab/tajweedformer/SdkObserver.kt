@@ -34,9 +34,15 @@ interface SdkObserver {
     /** A recognizer opened its engines (the CPU engine, and the NPU when chosen). */
     fun onModelLoad(load: ModelLoadInfo) {}
 
-    /** The accelerator's state changed: preparing, ready (with its time to ready),
-     *  disabled (with the reason), or cpu (none for this device). */
+    /** The accelerator's state changed: preparing (with its stage), ready (with its time to ready), disabled (with
+     *  the reason), or cpu (none for this device). */
     fun onAcceleratorState(state: ai.quranlab.tajweedformer.accel.AcceleratorState, key: ai.quranlab.tajweedformer.accel.AcceleratorKey) {}
+
+    /** A promotion attempt ended: promoted, or failed at a stage (the `promotions` telemetry; a failure is an incident). */
+    fun onPromotion(event: PromotionEvent) {}
+
+    /** A session switched from the accelerator to the CPU (the `promotions` telemetry's failovers, and an incident). */
+    fun onFailover(event: AcceleratorFailoverEvent) {}
 
     /**
      * The audio of a take exactly as the app pushed it, before any resampling: mono float in -1..1 at
@@ -124,12 +130,12 @@ enum class Backend(val key: String) {
 
 /**
  * A recognizer's backend and the reason for it. [reason] is a stable short code for telemetry:
- * `npu` (the NPU passed its self-test), `cpu_requested` (the app asked for the CPU), `no_npu_build`
- * (no NPU file for this SoC and context), `soc_unknown`, `npu_not_downloaded` (not yet on the
- * device, for instance waiting for an unmetered network), `cpu_self_test_pending`, `runtime_missing`
- * (no LiteRT or vendor dispatch library in the app), `npu_load_failed`, `npu_self_test_failed`,
- * `npu_runtime_error` (a run failed mid-take; the take continued on the CPU), `sample_rate`; [detail]
- * is free text for logs.
+ * `npu` (the NPU was promoted), `cpu_requested` (the app asked for the CPU), `no_npu_build` (no NPU file for
+ * this SoC and context), `soc_unknown`, `runtime_missing` (no LiteRT or vendor dispatch library in the app),
+ * `preparing` (the promotion pipeline has not finished), a pipeline failure reason (`compile_error`,
+ * `golden_mismatch`, ...), `failover` (the key was demoted by a failover), `failover_<cause>` (this session
+ * switched to the CPU: `exception`, `non_finite`, `out_of_range`, `blank`, `deadline`), `thermal`, `memory`,
+ * `denylist`, `forced_cpu`; [detail] is free text for logs.
  */
 data class BackendChoice(
     val backend: Backend,
@@ -143,11 +149,11 @@ data class BackendChoice(
 ) {
     /** A move away from a backend that was there (not a plain CPU choice): the NPU failed to load,
      *  its self-test failed, its runtime is missing, or it failed mid-take. */
-    val isFallback: Boolean get() = backend == Backend.CPU && (reason in FALLBACK_REASONS || reason.startsWith("watchdog_"))
+    val isFallback: Boolean get() = backend == Backend.CPU && (reason in FALLBACK_REASONS || reason.startsWith("failover_"))
 
     companion object {
-        @JvmField val FALLBACK_REASONS = setOf("npu_load_failed", "npu_load_timeout", "npu_crashed_during_load", "npu_self_test_failed",
-            "runtime_missing", "npu_runtime_error", "thermal", "memory", "denylist", "npu_watchdog_repeated")
+        @JvmField val FALLBACK_REASONS = setOf("compile_error", "compile_timeout", "load_error", "crash", "hang", "non_finite",
+            "golden_mismatch", "cpu_mismatch", "failover", "runtime_missing", "thermal", "memory", "denylist")
     }
 }
 

@@ -1,9 +1,26 @@
 package ai.quranlab.tajweedformer.cloud
 
+import ai.quranlab.tajweedformer.CheckStatus
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.LetterVerdict
+import ai.quranlab.tajweedformer.MaddClass
+import ai.quranlab.tajweedformer.MaddVerdict
+import ai.quranlab.tajweedformer.ResolvedCheck
+import ai.quranlab.tajweedformer.ResolvedSite
+import ai.quranlab.tajweedformer.ResolvedTajweedSettings
+import ai.quranlab.tajweedformer.SettingSource
+import ai.quranlab.tajweedformer.SiteClass
+import ai.quranlab.tajweedformer.SiteVerdict
+import ai.quranlab.tajweedformer.TajweedBackend
+import ai.quranlab.tajweedformer.TajweedPreset
+import ai.quranlab.tajweedformer.TajweedResult
+import ai.quranlab.tajweedformer.TajweedSummary
+import ai.quranlab.tajweedformer.WordVerdict
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -12,7 +29,7 @@ import org.junit.Test
 import java.io.File
 import java.nio.file.Files
 
-/** The platform client (PLATFORM_CLIENT.md sections 2 to 8) against [StubQlab] on 127.0.0.1. */
+/** The platform client (docs/platform-client.md and the API it talks to) against [StubQlab] on 127.0.0.1. */
 class CloudTest {
     private lateinit var stub: StubQlab
     private lateinit var dir: File
@@ -44,32 +61,41 @@ class CloudTest {
         assertFalse(QuranLabKey.parse(stub.key).toString().contains("AAAA"))
     }
 
-    @Test fun registerOncePerLaunchWithTheNewInstallFlagOnlyFirst() {
+    @Test fun registerOncePerUtcDayWithTheNewInstallFlagOnlyFirst() {
         val c = cloud()
         assertTrue(c.register("v4.0+abc"))
         assertTrue(c.register("v4.0+abc"))
         val regs = stub.seen("/v1/register")
-        assertEquals("at most once per launch", 1, regs.size)
+        assertEquals("at most once a day", 1, regs.size)
         val b = regs[0].json!!
         assertEquals(setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"), b.keys)
         assertEquals("android", b["platform"])
-        assertEquals("2.0.0", b["sdk_version"])
+        assertEquals("2.0.1", b["sdk_version"])
         assertEquals(true, b["new_install"])
         assertTrue(regs[0].headers["authorization"]!!.startsWith("Bearer qlt_v1."))
         // the token came from POST /v1/attest with the key, unattested (sharing is off)
         val att = stub.seen("/v1/attest").single()
         assertEquals(stub.key, att.headers["x-qlab-key"])
         assertEquals(setOf("platform", "bundle_id"), att.json!!.keys)
-        // the next launch: not new, and the cached token is reused
+        // another launch and returns to the foreground the same UTC day: no call
         val c2 = cloud()
         assertTrue(c2.register(null))
+        c2.foreground()
+        c2.foreground()
+        assertEquals(1, stub.seen("/v1/register").size)
+        assertEquals(Day.of(now), c2.registeredOn)
+        // the next UTC day: one more at the first foreground, not new
+        now += 86_400_000
+        c2.foreground()
+        c2.foreground()
+        assertEquals(2, stub.seen("/v1/register").size)
         assertEquals(false, stub.seen("/v1/register")[1].json!!["new_install"])
-        assertEquals(1, stub.seen("/v1/attest").size)
     }
 
     @Test fun aFailedFirstRegistrationKeepsTheNewInstallFlag() {
         stub.down = true
         assertFalse(cloud().register(null))
+        assertNull("no day stamp without a 200", cloud().registeredOn)
         stub.down = false
         assertTrue(cloud().register(null))
         assertEquals(true, stub.seen("/v1/register").last().json!!["new_install"])
@@ -79,7 +105,7 @@ class CloudTest {
         val c = cloud()
         val cfg = c.refreshConfig()
         assertNotNull(cfg)
-        assertEquals("2.0.0", stub.seen("/v1/config")[0].q("sdk"))
+        assertEquals("2.0.1", stub.seen("/v1/config")[0].q("sdk"))
         assertNotNull(stub.seen("/v1/config")[0].q("bucket"))
         assertTrue(c.tajweedJson!!.contains("\"sensitive\""))
         assertEquals("v4.0+abc", cfg!!.recommendedRevision)
@@ -167,27 +193,39 @@ class CloudTest {
         c.onSessionEnd(TajweedObserver.SessionEnd(seconds, completed = true, feedbackShown = true))
     }
 
+    private fun body(f: File) = stub.parse(f.readBytes())
+
     @Suppress("UNCHECKED_CAST")
-    @Test fun telemetryIsADailyAnonymousAggregateSentTheNextDay() {
+    @Test fun aDeltaIsSealedAtASendPointWithTheDaysSumsAndThe201Fields() {
         val c = cloud()
         c.refreshConfig()
+        // a sheet the learner leaves unanswered (an ask nobody can show is not counted)
+        c.sharing.prompts = {}
         c.onModelLoad(TajweedObserver.ModelLoad("v4.0+abc", "c16_l64", "cpu", 800.0, cold = true))
         c.onDownload(TajweedObserver.Download("v4.0+abc", "android-cpu", 72_000_000, success = true, resumed = true))
         session(c)
         session(c, 15.0)
         c.onSelfTest("v4.0+abc", "c16_l64", "cpu", true)
-        // today is not complete: nothing goes
+        // nothing is sent before a send point
         assertEquals(0 to 0, c.deliver())
         assertTrue(stub.seen("/v1/events").isEmpty())
-        // the next UTC day
-        now += 86_400_000
-        val (days, _) = c.deliver()
-        assertEquals(1, days)
+        assertTrue(c.telemetry.pendingReports().isEmpty())
+        // the app goes to the background: one sealed report, on disk before it is sent
+        c.background()
+        val sealed = c.telemetry.pendingReports().single()
+        val sealedBytes = sealed.readBytes()
+        assertTrue(c.telemetry.openDays().isEmpty())
+        val (n, _) = c.deliver()
+        assertEquals(1, n)
         val ev = stub.seen("/v1/events").single()
+        assertArrayEquals("the sealed bytes are the body", sealedBytes, ev.body)
         assertTrue(ev.headers["authorization"]!!.startsWith("Bearer qlt_v1."))
         val b = ev.json!!
         assertEquals(2.0, b["v"])
-        assertEquals(Day.of(now - 86_400_000), b["day"])
+        assertEquals(Day.of(now), b["day"])
+        assertEquals("2.0.1", b["sdk_version"])
+        assertTrue(Regex("^[0-9a-f]{32}$").matches(b["report_id"] as String))
+        assertTrue(sealed.name.contains(b["report_id"] as String))
         assertEquals(mapOf("class" to "Pixel8", "soc" to "tensor_g3", "os_major" to 15.0, "ram_tier" to "8_16"), b["device"])
         val co = (b["cohorts"] as List<Map<String, Any?>>)
         val main = co.first { it["preset"] == "balanced" && (it["sessions"] as Double) > 0 }
@@ -207,63 +245,222 @@ class CloudTest {
         assertEquals(mapOf("scored" to 14.0, "flagged" to 2.0), main["words"])
         assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["coverage"])
         assertEquals(listOf(mapOf("revision" to "v4.0+abc", "profile" to "android-cpu", "bytes" to 7.2E7, "success" to 1.0, "failed" to 0.0, "resumed" to 1.0)), b["downloads"])
+        // 2.0.1: the delta's counters (zero ones left out)
+        assertEquals(4.0, b["ayahs"])
+        assertEquals(14.0, b["words"])
+        assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["surah_ayahs"])
+        assertEquals("each finished session with feedback asks while the learner has not answered (the config offers sharing, a sheet is registered; 3 at most)", 2.0, b["share_asked"])
+        for (k in listOf("launches", "rule_checks", "rule_flags", "share_yes", "share_no")) assertFalse(k, b.containsKey(k))
         // nothing that could identify anyone: only the schema's fields (the stub refuses any other)
         val text = String(ev.body)
         assertFalse(text.contains("org.example.recite"))
         assertFalse(text.contains("Recite"))
-        // 202 deleted the day: nothing more to send
+        // 202 deleted it; counting starts again from zero: the next send point has nothing to seal
         assertEquals(0 to 0, c.deliver())
+        c.background()
+        assertTrue(c.telemetry.pendingReports().isEmpty())
         assertEquals(1, stub.seen("/v1/events").size)
     }
 
-    @Test fun refusedDaysAreDroppedAndFailuresBackOff() {
+    @Test fun aRetrySendsTheSameReportIdAndARefusalDropsIt() {
         val c = cloud()
         session(c)
-        now += 86_400_000
+        c.background()
         stub.overrides["/v1/events"] = { _, _ -> StubQlab.Reply.error(503, "storage_unavailable") }
         assertEquals(0, c.deliver().first)
-        assertEquals(1, c.telemetry.pendingDays().size)
+        assertEquals("503 keeps it", 1, c.telemetry.pendingReports().size)
         // backoff: a minute
         assertEquals(0, c.deliver().first)
         assertEquals(1, stub.seen("/v1/events").size)
+        // counts after the seal go into the next delta, not into the waiting one
+        session(c, 6.0)
         now += 61_000
+        stub.overrides["/v1/events"] = { _, _ -> StubQlab.Reply.error(500, "internal") }
+        assertEquals(0, c.deliver().first)
+        now += 600_001
+        stub.overrides.remove("/v1/events")
+        assertEquals(1, c.deliver().first)
+        val sent = stub.seen("/v1/events")
+        assertEquals(3, sent.size)
+        assertEquals("a retry sends the same bytes", sent[0].body.toList(), sent[2].body.toList())
+        assertEquals(sent[0].json!!["report_id"], sent[2].json!!["report_id"])
+        // the server counts a report once: the same bytes again are a 202 duplicate, and it is deleted all the same
+        val again = c.api.events(c.tokens!!.token().token, sent[2].body)
+        assertEquals(202, again.status)
+        assertEquals(true, again.json()!!["duplicate"])
+        // the next delta has its own id
+        c.background()
+        assertEquals(1, c.deliver().first)
+        assertNotEquals(sent[0].json!!["report_id"], stub.seen("/v1/events").last().json!!["report_id"])
+        // 400 drops it (and reports the SDK bug), 413 drops it
+        session(c)
+        c.background()
         stub.overrides["/v1/events"] = { _, _ -> StubQlab.Reply.error(400, "invalid_body") }
         assertEquals(0, c.deliver().first)
-        assertTrue("a refused body is never retried", c.telemetry.pendingDays().isEmpty())
+        assertTrue("a refused body is never retried", c.telemetry.pendingReports().isEmpty())
         assertTrue("reported, and delivered in the same pass", stub.seen("/v1/issues").any { it.json!!["code"] == "bad_request:events" })
+        session(c)
+        c.background()
+        stub.overrides["/v1/events"] = { _, _ -> StubQlab.Reply.error(413, "too_large") }
+        assertEquals(0, c.deliver().first)
+        assertTrue(c.telemetry.pendingReports().isEmpty())
+    }
+
+    @Test fun anInvalidTokenOnEventsIsRenewedAndTheSameReportSent() {
+        val c = cloud()
+        session(c)
+        c.background()
+        stub.overrides["/v1/events"] = { n, _ -> if (n == 1) StubQlab.Reply.error(401, "invalid_token") else null }
+        assertEquals(1, c.deliver().first)
+        val sent = stub.seen("/v1/events")
+        assertEquals(2, sent.size)
+        assertEquals(sent[0].body.toList(), sent[1].body.toList())
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    @Test fun noDeltaSpansMidnight() {
+        now = (now / 86_400_000L) * 86_400_000L + 23 * 3_600_000L + 50 * 60_000L
+        val c = cloud()
+        session(c)
+        val first = Day.of(now)
+        now += 20 * 60_000L
+        val second = Day.of(now)
+        assertNotEquals(first, second)
+        session(c, 15.0)
+        c.background()
+        val reports = c.telemetry.pendingReports()
+        assertEquals(2, reports.size)
+        assertEquals(2, c.deliver().first)
+        val sent = stub.seen("/v1/events").map { it.json!! }
+        assertEquals("oldest first, each under its own day", listOf(first, second), sent.map { it["day"] })
+        assertEquals(listOf(1.0, 1.0), sent.map { ((it["cohorts"] as List<Map<String, Any?>>).single())["sessions"] })
+        assertEquals(listOf(0.5, 0.25), sent.map { ((it["cohorts"] as List<Map<String, Any?>>).single())["minutes"] })
+        assertNotEquals(sent[0]["report_id"], sent[1]["report_id"])
+    }
+
+    @Test fun sendPointsAtLaunchEveryFifteenMinutesInUseAndInTheBackground() {
+        now = (now / 86_400_000L) * 86_400_000L + 12 * 3_600_000L
+        val c = cloud()
+        // a cold start: a launch counted, the day's registration, a send point
+        c.launch()
+        assertEquals(1, stub.seen("/v1/register").size)
+        assertEquals(1, c.telemetry.pendingReports().size)
+        assertEquals(1, c.deliver().first)
+        assertEquals(1.0, stub.seen("/v1/events").last().json!!["launches"])
+        session(c)
+        now += 14 * 60_000L
+        c.tick()
+        assertTrue("not before 15 minutes", c.telemetry.pendingReports().isEmpty())
+        now += 60_000L
+        c.tick()
+        assertEquals(1, c.telemetry.pendingReports().size)
+        assertEquals(1, c.deliver().first)
+        assertFalse(stub.seen("/v1/events").last().json!!.containsKey("launches"))
+        c.tick()
+        assertTrue("the timer restarted", c.telemetry.pendingReports().isEmpty())
+        // the background
+        session(c)
+        c.background()
+        assertEquals(1, c.deliver().first)
+        // back in the foreground: a launch, no second registration the same day, the 15 minutes from now
+        now += 10 * 60_000L
+        c.foreground()
+        now += 10 * 60_000L
+        c.tick()
+        assertTrue(c.telemetry.pendingReports().isEmpty())
+        c.background()
+        assertEquals(1, c.deliver().first)
+        assertEquals(1.0, stub.seen("/v1/events").last().json!!["launches"])
+        assertEquals(1, stub.seen("/v1/register").size)
+        // leftovers of an earlier run are sealed and sent at the next launch
+        session(c)
+        val next = cloud()
+        next.launch(foreground = false)
+        assertEquals(1, next.deliver().first)
+        assertFalse(stub.seen("/v1/events").last().json!!.containsKey("launches"))
+        assertEquals(1, (stub.seen("/v1/events").last().json!!["cohorts"] as List<*>).size)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    @Test fun aScoredResultGivesTheRuleCountsOfTheChecksThatRan() {
+        fun site(cls: SiteClass, status: CheckStatus, flagged: Boolean) = SiteVerdict(cls, status, 3, 0, 32, 33, 2.0, 1.0, 1.8, 1.0, flagged, 4, 6)
+        fun madd(cls: MaddClass, flagged: Boolean) = MaddVerdict(5, 1, 40, cls, CheckStatus.VALIDATED, 2.0, if (flagged) 4 else 2, 2.0, 2, 2, flagged, 10, 20)
+        fun letter(status: CheckStatus, flagged: Boolean) = LetterVerdict(7, 2, 12, status, 0.5, 0.6, flagged, 30, 33)
+        val on = ResolvedSite(CheckStatus.VALIDATED, true, 1.0, TajweedPreset.BALANCED, SettingSource.CALIBRATION)
+        val settings = ResolvedTajweedSettings("c16_l64", TajweedBackend.INT8, TajweedPreset.BALANCED,
+            mapOf(SiteClass.VOWEL_SUB to on, SiteClass.CONS_SUB to on.copy(status = CheckStatus.EXPERIMENTAL, enabled = false),
+                SiteClass.INSERTION to on.copy(status = CheckStatus.OFF, enabled = false)),
+            madd = ResolvedCheck(CheckStatus.VALIDATED, true), lazim = ResolvedCheck(CheckStatus.EXPERIMENTAL, false),
+            gemination = ResolvedCheck(CheckStatus.EXPERIMENTAL, false), qalqalah = ResolvedCheck(CheckStatus.VALIDATED, true, tau = 0.6),
+            dropped = emptyList(), refused = emptyList())
+        val result = TajweedResult(2, 255, settings,
+            sites = listOf(site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, true), site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, false),
+                site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, false), site(SiteClass.CONS_SUB, CheckStatus.EXPERIMENTAL, false),
+                site(SiteClass.CONS_SUB, CheckStatus.EXPERIMENTAL, false), site(SiteClass.INSERTION, CheckStatus.OFF, false)),
+            madd = listOf(madd(MaddClass.FIXED2, true), madd(MaddClass.FREE, false), madd(MaddClass.LAZIM, false)),
+            qalqalah = listOf(letter(CheckStatus.VALIDATED, true), letter(CheckStatus.VALIDATED, false)),
+            gemination = listOf(letter(CheckStatus.EXPERIMENTAL, false)),
+            summary = TajweedSummary(6, 1, 3, 1, 2, 1, 1, 0, 2.0, true),
+            words = listOf(WordVerdict(0, 1.0, 2.0, false), WordVerdict(1, 3.0, 2.0, true), WordVerdict(2, -1.0, 2.0, false)))
+        val e = TajweedObserver.Scored.of(result)
+        assertEquals("only the checks that ran: no cons_sub (disabled), insertion (off), gemination (disabled) or lazim (disabled)",
+            mapOf("vowel_sub" to 3, "madd" to 2, "qalqalah" to 2, "word" to 3), e.ruleChecks)
+        assertEquals(mapOf("vowel_sub" to 1, "madd" to 1, "qalqalah" to 1, "word" to 1), e.ruleFlags)
+        assertEquals(mapOf("vowel_sub" to (3 to 1), "cons_sub" to (2 to 0), "insertion" to (1 to 0)), e.classes)
+        val c = cloud()
+        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", "balanced", "general"))
+        c.onScored(e)
+        c.onScored(e)
+        c.onSessionEnd(TajweedObserver.SessionEnd(12.0, completed = true))
+        c.background()
+        assertEquals(1, c.deliver().first)
+        val b = stub.seen("/v1/events").single().json!!
+        assertEquals(2.0, b["ayahs"])
+        assertEquals(6.0, b["words"])
+        assertEquals(mapOf("2" to 2.0), b["surah_ayahs"])
+        val checks = b["rule_checks"] as Map<String, Double>
+        val flags = b["rule_flags"] as Map<String, Double>
+        assertEquals(mapOf("vowel_sub" to 6.0, "madd" to 4.0, "qalqalah" to 4.0, "word" to 6.0), checks)
+        assertEquals(mapOf("vowel_sub" to 2.0, "madd" to 2.0, "qalqalah" to 2.0, "word" to 2.0), flags)
+        for ((k, f) in flags) assertTrue("$k: flags <= checks", f <= checks.getValue(k))
     }
 
     @Test fun theKillSwitchAndTheDeveloperOptOutDropEverything() {
         val c = cloud()
         session(c)
+        c.background()
         stub.flags = stub.flags + ("analytics" to false)
         c.refreshConfig()
         assertFalse(c.telemetry.enabled)
-        now += 86_400_000
         assertEquals(0, c.deliver().first)
         assertTrue(stub.seen("/v1/events").isEmpty())
-        assertTrue(c.telemetry.pendingDays().isEmpty())
+        assertTrue(c.telemetry.pendingReports().isEmpty())
+        assertTrue(c.telemetry.openDays().isEmpty())
 
         val off = QuranLabCloud(CloudOptions(stub.key, analytics = CloudOptions.Analytics.OFF, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
             stub.environment(Files.createTempDirectory("tj-off").toFile(), clock = clock))
         session(off)
-        now += 86_400_000
+        off.background()
         assertEquals(0, off.deliver().first)
-        assertTrue(off.telemetry.pendingDays().isEmpty())
+        assertTrue(off.telemetry.pendingReports().isEmpty())
+        assertTrue(off.telemetry.openDays().isEmpty())
     }
 
-    @Test fun daysOlderThanAWeekAreDropped() {
+    @Test fun daysAndReportsOlderThanAWeekAreDropped() {
         val c = cloud()
         session(c)
+        c.background()
+        session(c)
         now += 9 * 86_400_000L
-        assertTrue(c.telemetry.pendingDays().isEmpty())
+        assertTrue(c.telemetry.openDays().isEmpty())
+        assertTrue(c.telemetry.pendingReports().isEmpty())
     }
 
     @Suppress("UNCHECKED_CAST")
     @Test fun cohortsBeyondSixteenAreMergedIntoTheLargest() {
         val c = cloud()
         for (i in 0 until 20) session(c, backend = if (i < 17) "npu:soc$i" else "cpu")
-        now += 86_400_000
+        c.background()
         assertEquals(1, c.deliver().first)
         val co = stub.seen("/v1/events").single().json!!["cohorts"] as List<Map<String, Any?>>
         assertEquals(16, co.size)
@@ -340,7 +537,9 @@ class CloudTest {
         val c = QuranLabCloud(CloudOptions(null, apiUrl = stub.base), stub.environment(dir, clock = clock))
         c.launch()
         session(c)
+        c.background()
         now += 86_400_000
+        c.foreground()
         c.deliver()
         assertTrue(stub.seen.isEmpty())
     }

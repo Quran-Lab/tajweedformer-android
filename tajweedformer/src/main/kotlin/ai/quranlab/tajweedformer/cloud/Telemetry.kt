@@ -5,13 +5,18 @@ import ai.quranlab.tajweedformer.TajweedFormer
 import java.io.File
 
 /**
- * Telemetry v2 (PLATFORM_CLIENT.md section 6): on by default, silent, anonymous by construction. The
- * recorder keeps one aggregate per UTC day: sums and histograms per cohort (revision, context,
- * backend, preset, word level), surah coverage and downloads. No audio, text, phonemes, verdict
- * lists, timestamps finer than the day, or identifiers are ever recorded, so none can be sent.
+ * Telemetry v2 (docs/platform-client.md): on by default, silent, anonymous by construction. The
+ * recorder sums what happens per UTC day: per cohort (revision, context, backend, preset, word level)
+ * sums and histograms, surah coverage, downloads, and since 2.0.1 launches, ayahs, words, per-rule checks
+ * and flags, and the sharing sheet's asks and answers. No audio, text, phonemes, verdict lists,
+ * timestamps finer than the day, or identifiers are ever recorded, so none can be sent.
  *
- * Each day is a JSON file `<dir>/<yyyy-mm-dd>.json`, written when a session ends, when a download
- * or load is recorded, and at most every 30 s while chunks come in; at most 7 days are kept.
+ * Deltas (2.0.1): what was counted since the last send point waits in `<dir>/<yyyy-mm-dd>.json` (one per
+ * UTC day, written when a session ends, when a download or load is recorded, and at most every 30 s while
+ * chunks come in). At a send point ([seal]) each day's counts become a sealed report: the exact body, with
+ * a fresh random `report_id`, written to `<dir>/sealed/` before it is sent, so a retry sends the same bytes
+ * and the server counts it once. A report never spans midnight; reports go oldest first; unsent ones older
+ * than 7 days are deleted.
  */
 class Telemetry(
     private val dir: File,
@@ -34,6 +39,8 @@ class Telemetry(
     private var coldStartPending = true
     private var lastWrite = 0L
     private var dirty = false
+    private var lastSeq = 0L
+    private val sealedDir get() = File(dir, "sealed")
 
     // ---- recording (TajweedObserver calls these through QuranLabCloud) ----
 
@@ -97,7 +104,35 @@ class Telemetry(
         confidences?.forEach { Hist.confidence(c.confidence, it.toDouble()) }
     }
 
+    /** The app was launched or came back to the foreground. */
+    fun launch() = rec { a ->
+        a.launches++
+        persist(force = true)
+    }
+
+    /** A consent sheet was shown, or the app's own UI was asked to ask (where the SDK counts an ask). */
+    fun shareAsked() = rec { a ->
+        a.shareAsked++
+        persist(force = true)
+    }
+
+    /** The learner answered a consent sheet (the SDK's or the app's own): share, or not now. */
+    fun shareAnswer(yes: Boolean) = rec { a ->
+        if (yes) a.shareYes++ else a.shareNo++
+        persist(force = true)
+    }
+
     fun scored(e: TajweedObserver.Scored) = rec { a ->
+        a.ayahs++
+        a.words += e.wordsScored
+        for ((k, n) in e.ruleChecks) {
+            if (!RULE_KEY.matches(k) || n <= 0) continue
+            if (k !in a.ruleChecks && a.ruleChecks.size >= MAX_RULES) continue
+            a.ruleChecks[k] = (a.ruleChecks[k] ?: 0) + n
+            val f = minOf(e.ruleFlags[k] ?: 0, n)
+            if (f > 0) a.ruleFlags[k] = (a.ruleFlags[k] ?: 0) + f
+        }
+        if (e.surah in 1..114) a.coverage[e.surah]++
         val c = a.cohort(session ?: return@rec)
         for ((cls, sf) in e.classes) {
             if (cls !in CLASSES) continue
@@ -113,8 +148,35 @@ class Telemetry(
         c.maddFlagged += e.maddFlagged
         c.wordsScored += e.wordsScored
         c.wordsFlagged += e.wordsFlagged
-        if (e.surah in 1..114) a.coverage[e.surah]++
     }
+
+    /** A promotion attempt ended (or a crash at a session's first accelerator call was found at launch). */
+    fun promotion(e: ai.quranlab.tajweedformer.PromotionEvent) = rec { a ->
+        val p = a.promotion(PromoKey(e.backend, e.revision, e.context))
+        if (e.countsAttempt) {
+            p.attempts++
+            if (e.promoted) p.promoted++ else if (e.stage in Promo.FAILED_AT) inc(p.failedAt, e.stage)
+        }
+        if (!e.promoted) inc(p.reasons, e.reason?.takeIf { it in Promo.REASONS } ?: "other")
+        // a crash at a promoted build's first session call (found at launch) took it back to the CPU
+        if (!e.promoted && e.stage == "session") p.demoted++
+        e.compileMs?.let { Hist.compile(p.compileMs, it.toDouble()) }
+        e.speedup?.let { Hist.speedup(p.speedup, it) }
+        persist(force = true)
+    }
+
+    /** A session switched from the accelerator to the CPU (the key was demoted: `reasons.failover` too). */
+    fun failover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = rec { a ->
+        val p = a.promotion(PromoKey(e.backend, e.revision, e.context))
+        p.failovers++
+        p.demoted++
+        inc(p.causes, e.failover.cause.takeIf { it in Promo.CAUSES } ?: "exception")
+        Hist.stall(p.stall, e.failover.stallMs)
+        inc(p.reasons, "failover")
+        persist(force = true)
+    }
+
+    private fun inc(h: MutableMap<String, Int>, k: String) { h[k] = (h[k] ?: 0) + 1 }
 
     fun thermal(throttled: Boolean) = rec { a ->
         val c = a.cohort(session ?: return@rec)
@@ -182,39 +244,99 @@ class Telemetry(
         null
     }
 
-    // ---- sending ----
+    // ---- sealing and sending ----
 
-    /** Complete days on disk, oldest first; days older than 7 are deleted. */
-    fun pendingDays(): List<String> {
-        val today = Day.of(clock())
+    private fun age(d: String): Long = try { Day.between(d, Day.of(clock())) } catch (_: Exception) { 99L }
+
+    /** Days with counts not sealed yet, oldest first (today's included); days older than 7 are deleted. */
+    fun openDays(): List<String> = synchronized(lock) {
+        persistNow()
         val out = ArrayList<String>()
         for (f in dir.listFiles() ?: emptyArray()) {
-            val m = Regex("^(\\d{4}-\\d{2}-\\d{2})\\.json$").matchEntire(f.name) ?: continue
+            val m = DAY_FILE.matchEntire(f.name) ?: continue
             val d = m.groupValues[1]
-            val age = try { Day.between(d, today) } catch (_: Exception) { 99 }
-            if (age > 7) f.delete() else if (age >= 1) out.add(d)
+            if (age(d) > 7) f.delete() else out.add(d)
         }
-        return out.sorted()
+        out.sorted()
     }
 
-    /** The v2 body of [d] (closed schema, at most 32 KB), or null when there is nothing in it. */
-    fun payload(d: String, ctx: TelemetryContext): ByteArray? {
-        val a = synchronized(lock) { if (d == day) agg else load(d) } ?: return null
-        return TelemetryPayload.build(d, a, ctx)
+    /**
+     * A send point: every day's counts since the last seal become one sealed report each (the v2 body with a
+     * fresh `report_id`), on disk before anything is sent; the counting starts again from zero. Returns the
+     * number of reports sealed.
+     */
+    fun seal(ctx: TelemetryContext): Int {
+        if (!enabled) return 0
+        return try {
+            synchronized(lock) {
+                var n = 0
+                for (d in openDays()) {
+                    val f = File(dir, "$d.json")
+                    val a = if (d == day) agg else load(d)
+                    val id = newReportId()
+                    val body = a?.let { TelemetryPayload.build(d, it, ctx, id) }
+                    if (body != null) {
+                        sealedDir.mkdirs()
+                        lastSeq = maxOf(clock(), lastSeq + 1)
+                        val name = "%s.%015d.%s.json".format(d, lastSeq, id)
+                        val tmp = File(sealedDir, "$name.tmp")
+                        tmp.writeBytes(body)
+                        val out = File(sealedDir, name)
+                        if (!tmp.renameTo(out)) { out.delete(); if (!tmp.renameTo(out)) throw java.io.IOException("cannot write $name") }
+                        n++
+                    }
+                    f.delete()
+                    if (d == day) {
+                        // the open session goes on counting into a fresh aggregate (its cold start still pending)
+                        val pending = session?.let { agg?.cohorts?.get(it)?.coldStartPending } == true
+                        agg = DayAggregate()
+                        if (pending) session?.let { agg!!.cohort(it).coldStartPending = true }
+                        dirty = false
+                    }
+                }
+                n
+            }
+        } catch (_: Exception) {
+            0
+        }
     }
 
-    fun drop(d: String) = synchronized(lock) {
-        File(dir, "$d.json").delete()
-        if (d == day) { agg = DayAggregate(); dirty = false }
+    /** Sealed reports not yet accepted, oldest first; unsent ones older than 7 days are deleted. */
+    fun pendingReports(): List<File> = synchronized(lock) {
+        val out = ArrayList<File>()
+        for (f in sealedDir.listFiles() ?: emptyArray()) {
+            val m = REPORT_FILE.matchEntire(f.name) ?: continue
+            if (age(m.groupValues[1]) > 7) f.delete() else out.add(f)
+        }
+        out.sortedBy { it.name }
     }
+
+    /** A report was accepted (202) or refused for good (400, 413): it is never sent again. */
+    fun dropReport(f: File) = synchronized(lock) { f.delete() }
 
     private fun dropAll() = synchronized(lock) {
-        dir.listFiles()?.forEach { it.delete() }
+        dir.listFiles()?.forEach { it.deleteRecursively() }
         agg = DayAggregate()
         dirty = false
     }
 
     companion object {
+        /** A send point while the app is in use: every 15 minutes (Quran Lab's choice for 2.0.1). */
+        const val SEND_INTERVAL_MS = 15 * 60_000L
+        /** `rule_checks` / `rule_flags` keys: the server's pattern, at most 32 of them. */
+        val RULE_KEY = Regex("^[a-z][a-z0-9_]{0,23}$")
+        const val MAX_RULES = 32
+        private val DAY_FILE = Regex("^(\\d{4}-\\d{2}-\\d{2})\\.json$")
+        private val REPORT_FILE = Regex("^(\\d{4}-\\d{2}-\\d{2})\\.(\\d+)\\.([0-9a-f]{32})\\.json$")
+        private val random = java.security.SecureRandom()
+
+        /** 16 random bytes, 32 lower-case hex: drawn per report, never per install or user. */
+        fun newReportId(): String {
+            val b = ByteArray(16)
+            random.nextBytes(b)
+            return b.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        }
+
         val CLASSES = listOf("vowel_sub", "vowel_del", "vowel_ins", "short_to_long", "long_to_short", "cons_sub", "cons_del", "insertion")
         val CHECKS = listOf("letters", "vowels", "length", "madd", "gemination", "qalqalah", "lazim")
         val FALLBACKS = TajweedObserver.FallbackReason.values().map { it.key }
@@ -228,6 +350,65 @@ internal data class CohortKey(val revision: String, val context: String, val bac
                               val wordLevel: String, val wordBucket: String, val siteOverrides: Int)
 
 internal data class DownloadKey(val revision: String, val profile: String)
+
+internal data class PromoKey(val backend: String, val revision: String, val context: String)
+
+/** One `promotions` entry's counts. */
+internal class PromoCounts {
+    var attempts = 0
+    var promoted = 0
+    val failedAt = LinkedHashMap<String, Int>()
+    val reasons = LinkedHashMap<String, Int>()
+    val compileMs = LinkedHashMap<String, Int>()
+    val speedup = LinkedHashMap<String, Int>()
+    var failovers = 0
+    /** Promoted builds taken back to the CPU after an in-session failure. */
+    var demoted = 0
+    val causes = LinkedHashMap<String, Int>()
+    val stall = LinkedHashMap<String, Int>()
+}
+
+/** The `promotions` entry's closed key sets. */
+internal object Promo {
+    const val MAX = 8
+    val FAILED_AT = listOf("download", "compile", "warmup", "golden")
+    val REASONS = listOf("network", "storage", "verify", "compile_error", "compile_timeout", "load_error", "crash", "hang", "non_finite",
+        "golden_mismatch", "cpu_mismatch", "failover", "denylist", "other")
+    val CAUSES = listOf("exception", "non_finite", "out_of_range", "blank", "deadline")
+
+    /** The entry as the payload has it (and as the day file keeps it): zero counts and empty objects left out. */
+    fun json(k: PromoKey, c: PromoCounts, store: Boolean = false): Map<String, Any?> {
+        fun cap(n: Int) = n.coerceIn(0, 10_000_000)
+        fun hist(h: Map<String, Int>, names: List<String>): Map<String, Int>? =
+            names.filter { (h[it] ?: 0) > 0 }.associateWith { cap(h[it]!!) }.takeIf { it.isNotEmpty() }
+        val o = LinkedHashMap<String, Any?>()
+        o["backend"] = k.backend
+        o["revision"] = k.revision
+        o["context"] = k.context
+        if (c.attempts > 0 || store) o["attempts"] = cap(c.attempts)
+        if (c.promoted > 0 || store) o["promoted"] = cap(c.promoted)
+        hist(c.failedAt, FAILED_AT)?.let { o["failed_at"] = it }
+        hist(c.reasons, REASONS)?.let { o["reasons"] = it }
+        hist(c.compileMs, Hist.COMPILE)?.let { o["compile_ms"] = it }
+        hist(c.speedup, Hist.SPEEDUP)?.let { o["speedup"] = it }
+        if (c.failovers > 0 || store) o["failovers"] = cap(c.failovers)
+        hist(c.causes, CAUSES)?.let { o["failover_causes"] = it }
+        hist(c.stall, Hist.STALL)?.let { o["failover_stall_ms"] = it }
+        if (c.demoted > 0 || store) o["demoted"] = cap(c.demoted)
+        return o
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun fromJson(o: Map<String, Any?>): Pair<PromoKey, PromoCounts> {
+        val c = PromoCounts()
+        fun n(v: Any?) = (v as? Double)?.toInt() ?: 0
+        fun h(key: String, dst: MutableMap<String, Int>) { (o[key] as? Map<String, Any?>)?.forEach { (b, v) -> dst[b] = n(v) } }
+        c.attempts = n(o["attempts"]); c.promoted = n(o["promoted"]); c.failovers = n(o["failovers"]); c.demoted = n(o["demoted"])
+        h("failed_at", c.failedAt); h("reasons", c.reasons); h("compile_ms", c.compileMs); h("speedup", c.speedup)
+        h("failover_causes", c.causes); h("failover_stall_ms", c.stall)
+        return PromoKey(o["backend"] as String, o["revision"] as String, o["context"] as String) to c
+    }
+}
 
 internal class DownloadCounts(var bytes: Long = 0, var success: Int = 0, var failed: Int = 0, var resumed: Int = 0)
 
@@ -276,10 +457,22 @@ internal class DayAggregate {
     val cohorts = LinkedHashMap<CohortKey, Cohort>()
     val coverage = IntArray(115)
     val downloads = LinkedHashMap<DownloadKey, DownloadCounts>()
+    var launches = 0
+    var ayahs = 0
+    var words = 0
+    val ruleChecks = LinkedHashMap<String, Int>()
+    val ruleFlags = LinkedHashMap<String, Int>()
+    var shareAsked = 0
+    var shareYes = 0
+    var shareNo = 0
+    val promotions = LinkedHashMap<PromoKey, PromoCounts>()
 
     fun cohort(k: CohortKey): Cohort = cohorts.getOrPut(k) { Cohort() }
 
-    fun isEmpty(): Boolean = cohorts.isEmpty() && downloads.isEmpty() && coverage.all { it == 0 }
+    fun promotion(k: PromoKey): PromoCounts = promotions.getOrPut(k) { PromoCounts() }
+
+    fun isEmpty(): Boolean = cohorts.isEmpty() && downloads.isEmpty() && coverage.all { it == 0 } && launches == 0 && ayahs == 0 &&
+        words == 0 && ruleChecks.isEmpty() && shareAsked == 0 && shareYes == 0 && shareNo == 0 && promotions.isEmpty()
 
     /** The on-disk form (the payload's fields plus the cohort keys). */
     fun toStore(): Map<String, Any?> = linkedMapOf(
@@ -287,6 +480,9 @@ internal class DayAggregate {
         "coverage" to coverage.withIndex().filter { it.value > 0 }.associate { it.index.toString() to it.value },
         "downloads" to downloads.map { (k, d) -> linkedMapOf("revision" to k.revision, "profile" to k.profile, "bytes" to d.bytes,
             "success" to d.success, "failed" to d.failed, "resumed" to d.resumed) },
+        "launches" to launches, "ayahs" to ayahs, "words" to words, "rule_checks" to ruleChecks, "rule_flags" to ruleFlags,
+        "share" to linkedMapOf("asked" to shareAsked, "yes" to shareYes, "no" to shareNo),
+        "promotions" to promotions.map { (k, c) -> Promo.json(k, c, store = true) },
     )
 
     companion object {
@@ -331,6 +527,12 @@ internal class DayAggregate {
                     (o["bytes"] as? Double)?.toLong() ?: 0, (o["success"] as? Double)?.toInt() ?: 0,
                     (o["failed"] as? Double)?.toInt() ?: 0, (o["resumed"] as? Double)?.toInt() ?: 0)
             }
+            fun n(v: Any?) = (v as? Double)?.toInt() ?: 0
+            a.launches = n(m["launches"]); a.ayahs = n(m["ayahs"]); a.words = n(m["words"])
+            (m["rule_checks"] as? Map<String, Any?>)?.forEach { (k, v) -> a.ruleChecks[k] = n(v) }
+            (m["rule_flags"] as? Map<String, Any?>)?.forEach { (k, v) -> a.ruleFlags[k] = n(v) }
+            (m["share"] as? Map<String, Any?>)?.let { sh -> a.shareAsked = n(sh["asked"]); a.shareYes = n(sh["yes"]); a.shareNo = n(sh["no"]) }
+            (m["promotions"] as? List<Any?>)?.forEach { x -> val (k, c) = Promo.fromJson(x as Map<String, Any?>); a.promotions[k] = c }
             return a
         }
     }
@@ -353,6 +555,9 @@ internal object Hist {
     val CONFIDENCE = listOf("le_0_5", "le_0_7", "le_0_8", "le_0_9", "le_0_95", "gt_0_95")
     val FLAG_PCT = listOf("le_1", "le_2", "le_5", "le_10", "le_20", "gt_20")
     val WORD = listOf("le_3", "le_4", "le_5", "le_6", "le_7", "gt_7")
+    val COMPILE = listOf("le_1000", "le_5000", "le_15000", "le_30000", "le_60000", "le_120000", "gt_120000")
+    val SPEEDUP = listOf("lt_0_5", "lt_1", "le_1_5", "le_2", "le_3", "le_5", "gt_5")
+    val STALL = listOf("le_50", "le_100", "le_200", "le_300", "le_500", "le_1000", "gt_1000")
 
     fun latency(h: MutableMap<String, Int>, ms: Double) = bucket(h, ms, doubleArrayOf(5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0), LATENCY)
     fun rtf(h: MutableMap<String, Int>, r: Double) = bucket(h, r, doubleArrayOf(0.1, 0.25, 0.5, 1.0), RTF)
@@ -360,6 +565,23 @@ internal object Hist {
     fun margin(h: MutableMap<String, Int>, m: Double) = bucket(h, m, doubleArrayOf(0.5, 1.0, 2.0, 4.0, 8.0), MARGIN)
     fun confidence(h: MutableMap<String, Int>, c: Double) = bucket(h, c, doubleArrayOf(0.5, 0.7, 0.8, 0.9, 0.95), CONFIDENCE)
     fun flagPct(h: MutableMap<String, Int>, p: Double) = bucket(h, p, doubleArrayOf(1.0, 2.0, 5.0, 10.0, 20.0), FLAG_PCT)
+    fun compile(h: MutableMap<String, Int>, ms: Double) = bucket(h, ms, doubleArrayOf(1000.0, 5000.0, 15000.0, 30000.0, 60000.0, 120000.0), COMPILE)
+    fun stall(h: MutableMap<String, Int>, ms: Double) = bucket(h, ms, doubleArrayOf(50.0, 100.0, 200.0, 300.0, 500.0, 1000.0), STALL)
+
+    /** CPU median over the accelerator's: `lt_0_5` and `lt_1` mean the accelerator was slower (and promoted anyway). */
+    fun speedup(h: MutableMap<String, Int>, x: Double) {
+        if (!x.isFinite()) return
+        val k = when {
+            x < 0.5 -> "lt_0_5"
+            x < 1.0 -> "lt_1"
+            x <= 1.5 -> "le_1_5"
+            x <= 2.0 -> "le_2"
+            x <= 3.0 -> "le_3"
+            x <= 5.0 -> "le_5"
+            else -> "gt_5"
+        }
+        add(h, k)
+    }
 
     fun wordBucket(t: Double): String {
         val edges = doubleArrayOf(3.0, 4.0, 5.0, 6.0, 7.0)
@@ -415,7 +637,8 @@ internal object TelemetryPayload {
         return o
     }
 
-    fun build(day: String, a: DayAggregate, ctx: TelemetryContext): ByteArray? {
+    /** The v2 body of one delta; [reportId] (32 lower-case hex) is always sent. Null when nothing was counted. */
+    fun build(day: String, a: DayAggregate, ctx: TelemetryContext, reportId: String): ByteArray? {
         if (a.isEmpty()) return null
         // the 16 largest cohorts by sessions; the rest merged into the 16th
         val sorted = a.cohorts.entries.sortedByDescending { it.value.sessions }
@@ -444,6 +667,24 @@ internal object TelemetryPayload {
             linkedMapOf("revision" to k.revision, "profile" to k.profile, "bytes" to d.bytes.coerceIn(0, 1_000_000_000_000), "success" to cap(d.success),
                 "failed" to cap(d.failed), "resumed" to cap(d.resumed))
         }
+        // 2.0.1: the delta's id and counters, each left out when zero
+        b["report_id"] = reportId
+        if (a.launches > 0) b["launches"] = cap(a.launches)
+        if (a.ayahs > 0) b["ayahs"] = cap(a.ayahs)
+        if (cov.isNotEmpty()) b["surah_ayahs"] = cov
+        if (a.words > 0) b["words"] = cap(a.words)
+        val checks = a.ruleChecks.filter { (k, n) -> n > 0 && Telemetry.RULE_KEY.matches(k) }.entries.take(Telemetry.MAX_RULES).associate { it.key to cap(it.value) }
+        if (checks.isNotEmpty()) b["rule_checks"] = checks
+        // every flagged key is a checked key, with a count no larger
+        val flags = checks.mapNotNull { (k, n) -> minOf(a.ruleFlags[k] ?: 0, n).takeIf { it > 0 }?.let { k to it } }.toMap()
+        if (flags.isNotEmpty()) b["rule_flags"] = flags
+        if (a.shareAsked > 0) b["share_asked"] = cap(a.shareAsked)
+        if (a.shareYes > 0) b["share_yes"] = cap(a.shareYes)
+        if (a.shareNo > 0) b["share_no"] = cap(a.shareNo)
+        // the accelerator's promotions and failovers: at most 8 entries, the busiest kept
+        val promos = a.promotions.entries.sortedByDescending { it.value.attempts + it.value.failovers }.take(Promo.MAX)
+            .map { (k, c) -> Promo.json(k, c) }.filter { it.size > 3 }
+        if (promos.isNotEmpty()) b["promotions"] = promos
         var bytes = Json.write(b).toByteArray(Charsets.UTF_8)
         // over the cap (never seen in practice): the histograms of quality go first, then cohorts
         if (bytes.size > MAX_BYTES) {

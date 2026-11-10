@@ -31,7 +31,52 @@ class ModelManifest(
     val contexts: List<String>,
     val files: List<FileEntry>,
     val signature: String? = null,
+    /** The `golden_tolerance` field as the JSON has it (null: absent). */
+    private val toleranceRaw: Any? = null,
 ) {
+    /**
+     * `golden_tolerance` (SDK 2.0.1): per accelerator build (`coreml`, `coreml-compact`, `npu:<soc>:<context>`) the
+     * differences from the CPU engine its golden test may show; null when the field is absent. An entry whose values
+     * are not three non-negative integers is null (exact). In force only when the signature covers it ([toleranceFor]).
+     */
+    val goldenTolerance: Map<String, GoldenTolerance?>? =
+        (toleranceRaw as? Map<*, *>)?.entries?.filter { it.key is String }?.associate { (k, v) -> k as String to GoldenTolerance.parse(v) }
+            ?: if (toleranceRaw != null) emptyMap() else null
+
+    /** Each entry's three values as the signed text writes them (a JSON integer as digits). */
+    private val toleranceText: Map<String, String> = (toleranceRaw as? Map<*, *>)?.entries
+        ?.filter { it.key is String && it.value is Map<*, *> }?.associate { (k, v) ->
+            val o = v as Map<*, *>
+            fun num(x: Any?): String = when (x) {
+                is Double -> if (x == Math.floor(x) && !x.isInfinite() && Math.abs(x) < 1e15) x.toLong().toString() else x.toString()
+                is Number -> x.toString()
+                null -> "-"
+                else -> x.toString()
+            }
+            k as String to "${num(o["token_diffs"])} ${num(o["site_flag_diffs"])} ${num(o["word_flag_diffs"])}"
+        } ?: emptyMap()
+
+    /** The signature verified WITH the `golden_tolerance` lines ([ManifestVerifier]); otherwise the tolerance is ignored. */
+    @Volatile internal var toleranceSigned = false
+
+    /** The tolerance of [build] when the signature covers it, else exact. */
+    fun toleranceFor(build: String): GoldenTolerance =
+        (if (toleranceSigned) goldenTolerance?.get(build) else null) ?: GoldenTolerance.EXACT
+
+    /** The golden test's allowance for one build: totals over the self-test set against the CPU run. */
+    data class GoldenTolerance(val tokenDiffs: Int, val siteFlagDiffs: Int, val wordFlagDiffs: Int) {
+        companion object {
+            @JvmField val EXACT = GoldenTolerance(0, 0, 0)
+
+            /** Three non-negative integers, else null (exact). */
+            @JvmStatic
+            fun parse(v: Any?): GoldenTolerance? {
+                val m = v as? Map<*, *> ?: return null
+                fun n(k: String): Int? = (m[k] as? Number)?.toDouble()?.takeIf { it >= 0 && it == Math.floor(it) && it <= 1_000_000 }?.toInt()
+                return GoldenTolerance(n("token_diffs") ?: return null, n("site_flag_diffs") ?: return null, n("word_flag_diffs") ?: return null)
+            }
+        }
+    }
     /** How a file is stored on the server. */
     enum class Encoding(val key: String) {
         IDENTITY("identity"), GZIP("gzip");
@@ -105,13 +150,21 @@ class ModelManifest(
      * Files sorted by the path's UTF-8 bytes; platforms comma-joined in the order
      * android,apple,web,native (or `*`); the three decoded fields `-` for identity files.
      */
-    val signedMessage: ByteArray
-        get() {
+    val signedMessage: ByteArray get() = signedMessage(withTolerance = true)
+
+    /**
+     * The signed text; with [withTolerance] and a `golden_tolerance` field, one line per build after the header lines
+     * and before the first `file` line, sorted by the build's UTF-8 bytes:
+     * `golden_tolerance <build> <token_diffs> <site_flag_diffs> <word_flag_diffs>`. Without the field the text is the
+     * 2.0.0 one, byte for byte.
+     */
+    fun signedMessage(withTolerance: Boolean): ByteArray {
             val s = StringBuilder("quranlab-model-manifest $format\n")
             s.append("model_id $modelId\nfamily $family\nrevision $revision\nmin_sdk_version $minSdkVersion\n")
             s.append("engine_format $engineFormat\ncoreml_format $coremlFormat\ntokens $tokens\n")
             s.append("tokens_sha256 ${tokensSha256.lowercase()}\ndefault_context $defaultContext\n")
             s.append("contexts ${contexts.joinToString(",")}\n")
+            if (withTolerance) for (k in toleranceText.keys.sortedWith { a, b -> compareUtf8(a, b) }) s.append("golden_tolerance $k ${toleranceText[k]}\n")
             for (f in files.sortedWith { a, b -> compareUtf8(a.path, b.path) }) {
                 val d = f.decoded
                 s.append("file ${f.sha256.lowercase()} ${f.size} ${f.path} ${platformsText(f.platforms)} ${f.soc} ")
@@ -120,7 +173,7 @@ class ModelManifest(
                 s.append('\n')
             }
             return s.toString().toByteArray(Charsets.UTF_8)
-        }
+    }
 
     /** The JSON layout make_manifest3.py writes (keys sorted). */
     fun toJson(): String {
@@ -145,13 +198,20 @@ class ModelManifest(
             f.decoded?.let { o["decoded"] = sortedMapOf("path" to it.path, "size" to it.size, "sha256" to it.sha256) }
             o
         }
+        if (toleranceRaw != null) m["golden_tolerance"] = toleranceRaw
         if (signature != null) m["signature"] = signature
         return Json.write(m)
     }
 
     fun withSignature(signature: String?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, signature,
+        defaultContext, contexts, files, signature, toleranceRaw,
+    )
+
+    /** The same manifest with another `golden_tolerance` field (null: none), unsigned. */
+    fun withTolerance(raw: Any?) = ModelManifest(
+        format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
+        defaultContext, contexts, files, null, raw,
     )
 
     /** The model can run in this SDK: format 3, [minSdkVersion] at or below [sdkVersion], engine
@@ -261,6 +321,7 @@ class ModelManifest(
                 )
             }
             val contexts = J.list(m, "contexts").map { it as? String ?: throw JsonException("contexts") }
+            // golden_tolerance never fails the manifest (the CPU path does not depend on it); a bad entry is exact
             ModelManifest(
                 format = format,
                 modelId = tok(m, "model_id", "model_id"),
@@ -275,6 +336,7 @@ class ModelManifest(
                 contexts = contexts,
                 files = files,
                 signature = m["signature"] as? String,
+                toleranceRaw = m["golden_tolerance"],
             )
         } catch (e: JsonException) {
             throw RecognizerException.ManifestInvalid(e.message ?: "not JSON")
@@ -338,9 +400,16 @@ class ManifestVerifier @JvmOverloads constructor(
         } catch (e: IllegalArgumentException) {
             throw RecognizerException.SignatureInvalid("the signature is not base64")
         }
-        val message = m.signedMessage
-        if (trustedKeys.none { Ed25519.verify(it, message, raw) }) {
-            throw RecognizerException.SignatureInvalid("no trusted key verifies it")
+        fun ok(message: ByteArray) = trustedKeys.any { Ed25519.verify(it, message, raw) }
+        if (m.goldenTolerance == null) {
+            if (!ok(m.signedMessage(withTolerance = false))) throw RecognizerException.SignatureInvalid("no trusted key verifies it")
+            return
+        }
+        // golden_tolerance is signed in its own lines; a manifest signed without them still verifies, its tolerance ignored
+        when {
+            ok(m.signedMessage(withTolerance = true)) -> m.toleranceSigned = true
+            ok(m.signedMessage(withTolerance = false)) -> m.toleranceSigned = false
+            else -> throw RecognizerException.SignatureInvalid("no trusted key verifies it")
         }
     }
 

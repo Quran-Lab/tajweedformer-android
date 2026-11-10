@@ -73,6 +73,26 @@ object OggTestKit {
         Assume.assumeTrue("no libtajweedformer_opus (scripts/opus/build_opus_host.sh)", ok)
     }
 
+    /**
+     * Runs a tool from PATH (ffmpeg, ffprobe): its exit code and stdout, or null when it is not there.
+     * Stderr goes to a file so a chatty tool never blocks.
+     */
+    fun run(vararg cmd: String): Pair<Int, ByteArray>? {
+        val err = Files.createTempFile("tj-tool", ".log").toFile()
+        return try {
+            val p = ProcessBuilder(*cmd).redirectError(err).start()
+            p.outputStream.close()
+            val out = p.inputStream.use { it.readBytes() }
+            val code = p.waitFor()
+            if (code != 0) println("${cmd[0]}: ${err.readText().take(400)}")
+            code to out
+        } catch (_: java.io.IOException) {
+            null
+        } finally {
+            err.delete()
+        }
+    }
+
     /** Appends [x] in pieces of random length (multiples of [unit] from 1 to [maxUnits]). */
     fun feed(w: OggOpusWriter, x: FloatArray, unit: Int, maxUnits: Int, rnd: java.util.Random = java.util.Random(7)) {
         var at = 0

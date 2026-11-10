@@ -29,13 +29,15 @@ data class Contribution(
     val status: Status,
     val attempts: Int,
     val lastError: String?,
+    /** The bit rate (bit/s) each closed segment was encoded at, in segment order (SDK 2.0.1, [BitrateLadder]). */
+    val segmentBitrates: List<Int> = emptyList(),
 ) {
     enum class Status { QUEUED, UPLOADED, FAILED }
 }
 
 /** What the outbox needs to know from the rest of the SDK, read at every pass. */
 internal interface SharingGate {
-    /** Sharing is on here: the app's option, the learner's consent, the signed config's flags and trust tier. */
+    /** Sharing is on here: the learner's consent to the wording in force, the signed config's flags and trust tier. */
     fun uploadsAllowed(): Boolean
     /** The token for this platform's tier (attested where the tier asks for it). Throws [CloudException]. */
     fun uploadToken(): String
@@ -54,7 +56,9 @@ internal interface SharingGate {
 /**
  * One session being shared: Ogg Opus segments written while the session runs, into its folder in the
  * outbox, each closed segment handed to the outbox at once. Audio is copied on the caller's thread
- * and encoded on a thread of its own, so recognition never waits for the encoder.
+ * and encoded on a thread of its own, so recognition never waits for the encoder. Each segment is
+ * encoded at the outbox's [BitrateLadder] rate in force when it opens; a closed segment tells the ladder
+ * how much audio waits.
  */
 internal class ShareCapture(
     private val outbox: ContributionOutbox,
@@ -71,6 +75,8 @@ internal class ShareCapture(
     @Volatile private var failed = false
     private var segments = 0
     @Volatile private var ended = false
+    private var preSkip = -1
+    private val bitrates = ArrayList<Int>()
 
     init { ACTIVE.add(id) }
 
@@ -86,8 +92,10 @@ internal class ShareCapture(
                     folder.mkdirs()
                     File(folder, ShareFiles.SESSION).writeBytes(session(sampleRate, route))
                     rate = sampleRate
-                    val w = OggOpusWriter({ File(folder, ShareFiles.name(it) + ".opus") }, SegmentPlan.SECONDS, sampleRate) { closed(it) }
-                    ShareFiles.writeJson(File(folder, ShareFiles.CAPTURE), linkedMapOf("preSkip" to w.preSkip))
+                    val w = OggOpusWriter({ File(folder, ShareFiles.name(it) + ".opus") }, SegmentPlan.SECONDS, sampleRate,
+                        bitrateFor = ::opened) { closed(it) }
+                    preSkip = w.preSkip
+                    ShareFiles.writeCapture(folder, w.preSkip, bitrates)
                     writer = w
                 }
                 if (sampleRate == rate) writer?.append(copy)
@@ -97,14 +105,24 @@ internal class ShareCapture(
         }
     }
 
+    /** Segment [n] opens: the ladder's rate now, written where recovery reads it. */
+    private fun opened(n: Int): Int {
+        val b = outbox.ladder.bitrate
+        bitrates.add(b)
+        // segment 1 opens inside the writer's constructor: capture.json is written right after it
+        if (preSkip >= 0) try { ShareFiles.writeCapture(folder, preSkip, bitrates) } catch (_: Exception) {}
+        return b
+    }
+
     private fun closed(seg: OggSegment) {
         segments = seg.n
         try {
-            ShareFiles.mark(folder, seg.n, seg.granule)
+            ShareFiles.mark(folder, seg.n, seg.granule, seg.bitrate)
         } catch (_: Exception) {
             failed = true
             return
         }
+        outbox.ladder.segmentClosed(outbox.backlogSeconds())
         outbox.poke()
     }
 
@@ -162,7 +180,7 @@ internal class ShareCapture(
          */
         fun sessionJson(modelRevision: String?, backend: String, weightsSha256: String?, consentVersion: String?, contributor: String,
                         contributorKey: String?, recoveryHash: String?, day: String, deviceClass: String, osMajor: Int,
-                        inputSampleRate: Int, inputRoute: String): ByteArray {
+                        inputSampleRate: Int, inputRoute: String, consentTextSha256: String? = null): ByteArray {
             val audio = sortedMapOf<String, Any?>("codec" to "opus", "container" to "ogg", "sample_rate" to 48_000, "channels" to 1,
                 "input_sample_rate" to inputSampleRate.coerceIn(8_000, 192_000), "input_route" to inputRoute)
             val decode = sortedMapOf<String, Any?>("model_revision" to modelRevision?.take(64), "backend" to backend,
@@ -170,6 +188,8 @@ internal class ShareCapture(
             val o = sortedMapOf<String, Any?>("format" to 1, "audio" to audio, "decode" to decode, "contributor" to contributor,
                 "day" to day, "device_class" to deviceClass, "os_major" to osMajor.coerceIn(1, 99))
             consentVersion?.let { o["consent_version"] = it }
+            // only under the app's own wording (2.0.0 servers' closed schema refuses the field)
+            consentTextSha256?.let { o["consent_text_sha256"] = it }
             contributorKey?.let { o["contributor_key"] = it }
             recoveryHash?.let { o["recovery_hash"] = it }
             return Json.write(o).toByteArray(Charsets.UTF_8)
@@ -186,6 +206,9 @@ internal class ShareCapture(
  * Everything is on disk (`item.json` per session), so a killed app or a reboot resumes where it
  * stopped; on Android a WorkManager job drains it whenever the network allows.
  *
+ * The [ladder] hears how uploads go: a network failure of any upload request (no connection, a
+ * timeout, HTTP 408 or 5xx) steps it down, a segment PUT answered 2xx counts towards a step up.
+ *
  * Blocking; [drain] runs one pass at a time (a call during a pass runs one more after it).
  */
 class ContributionOutbox internal constructor(
@@ -194,6 +217,8 @@ class ContributionOutbox internal constructor(
     private val contributor: () -> String,
     private val gate: SharingGate,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** The adaptive bitrate of the captures that write into this outbox. */
+    val ladder: BitrateLadder = BitrateLadder(),
     /** Called when a segment closed or a session ended (Android: schedule the WorkManager job). */
     private val onWork: () -> Unit = {},
 ) {
@@ -225,6 +250,17 @@ class ContributionOutbox internal constructor(
 
     /** A capture closed a segment or ended. */
     internal fun poke() = onWork()
+
+    /** Seconds of audio in closed segments not yet uploaded, of every session still to send. */
+    fun backlogSeconds(): Double = synchronized(records) {
+        scan()
+        records.values.filter { it.state == "active" }.sumOf { r ->
+            ShareFiles.seconds(ShareFiles.markers(File(root, r.id))) { ShareFiles.name(it.n) + ".opus" in r.uploaded }
+        }
+    }
+
+    /** A network failure of an upload request: no answer, or HTTP 408 or 5xx. */
+    private fun networkFailure(status: Int?): Boolean = status == null || status == 408 || status in 500..599
 
     /** Sharing was turned off: every session not fully uploaded goes, and nothing else is sent. */
     fun cancelQueued() = synchronized(records) {
@@ -320,6 +356,7 @@ class ContributionOutbox internal constructor(
             val r = try {
                 api.putSegment(url.first, File(folder, name))
             } catch (e: CloudException) {
+                ladder.uploadFailed()
                 retry(id, "PUT $name: ${e.message}")
                 return false
             }
@@ -331,7 +368,9 @@ class ContributionOutbox internal constructor(
                 rec.lastError = null
                 save(rec)
                 File(folder, name).delete()
+                ladder.uploadOk(backlogSeconds())
             } else {
+                if (networkFailure(r.status)) ladder.uploadFailed()
                 // 403: the URL expired or its signature is no longer valid: fresh URLs from this segment
                 rec.attempts++
                 if (r.status == 403) rec.urls.remove(m.n)
@@ -368,12 +407,16 @@ class ContributionOutbox internal constructor(
         lastOffline = false
         val r = try { call() } catch (e: CloudException) {
             lastOffline = true
+            if (networkFailure(e.api?.status)) ladder.uploadFailed()
             retry(id, e.message ?: "offline")
             return null
         }
         if (r.ok) return r
+        if (networkFailure(r.status)) ladder.uploadFailed()
         val e = r.error
         val rec = synchronized(records) { records[id] }
+        // a request timeout is the network's, not a refusal: tried again with the backoff
+        if (r.status == 408) { retry(id, e.toString()); return null }
         when (e.action) {
             ErrorAction.RENEW_TOKEN, ErrorAction.STOP, ErrorAction.NEW_TOKEN -> {
                 gate.invalidateToken()
@@ -509,7 +552,8 @@ class ContributionOutbox internal constructor(
             else -> Contribution.Status.QUEUED
         }
         val day = ShareFiles.readJson(File(f, ShareFiles.SESSION))?.get("day") as? String ?: ""
-        return Contribution(r.id, markers.size, markers.sumOf { it.bytes }, end?.durationMs ?: 0, day, end?.completed, status, r.attempts, r.lastError)
+        return Contribution(r.id, markers.size, markers.sumOf { it.bytes }, end?.durationMs ?: 0, day, end?.completed, status, r.attempts, r.lastError,
+            markers.map { it.bitrate ?: ShareFiles.LEGACY_BITRATE })
     }
 
     private fun save(r: Record) {

@@ -7,9 +7,10 @@ import java.security.MessageDigest
 
 /**
  * The files of one shared session in its outbox folder (`<storage>/outbox/<id>/`), as the Swift
- * SDK lays them out: `session.json` (what POST /v1/uploads gets), `capture.json` (the pre-skip),
- * `seg-NNNNN.opus` and a marker `seg-NNNNN.json` per closed segment, `end.json` once the session
- * ended, and the outbox's own `item.json`.
+ * SDK lays them out: `session.json` (what POST /v1/uploads gets), `capture.json` (the pre-skip and,
+ * since 2.0.1, the bit rate of every segment opened so far, written when a segment opens so recovery
+ * can read it), `seg-NNNNN.opus` and a marker `seg-NNNNN.json` per closed segment (`n`, `bytes`,
+ * `sha256`, `granule`, `bitrate`), `end.json` once the session ended, and the outbox's own `item.json`.
  */
 object ShareFiles {
     const val SESSION = "session.json"
@@ -18,8 +19,11 @@ object ShareFiles {
 
     fun name(n: Int): String = "seg-%05d".format(n)
 
-    /** A closed segment: size, hash and where the stream stood. */
-    data class Marker(val n: Int, val bytes: Long, val sha256: String, val granule: Long)
+    /** A closed segment: size, hash, where the stream stood, and its bit rate (null in a 2.0.0 marker: 192 kbit/s). */
+    data class Marker(val n: Int, val bytes: Long, val sha256: String, val granule: Long, val bitrate: Int? = null)
+
+    /** 2.0.0 encoded every segment at this rate. */
+    const val LEGACY_BITRATE = 192_000
 
     data class End(val durationMs: Int, val completed: Boolean)
 
@@ -50,16 +54,34 @@ object ShareFiles {
     fun readJson(f: File): Map<String, Any?>? = try { Json.parse(f.readText()) as? Map<String, Any?> } catch (_: Exception) { null }
 
     /** Closes segment [n]: its marker, from the file as it is on disk. */
-    fun mark(folder: File, n: Int, granule: Long) {
+    fun mark(folder: File, n: Int, granule: Long, bitrate: Int? = null) {
         val (bytes, sha) = sha256(File(folder, name(n) + ".opus")) ?: throw java.io.IOException("no segment $n")
-        writeJson(File(folder, name(n) + ".json"), linkedMapOf("n" to n, "bytes" to bytes, "sha256" to sha, "granule" to granule))
+        val o = linkedMapOf<String, Any?>("n" to n, "bytes" to bytes, "sha256" to sha, "granule" to granule)
+        bitrate?.let { o["bitrate"] = it }
+        writeJson(File(folder, name(n) + ".json"), o)
+    }
+
+    /** `capture.json`: the pre-skip and the bit rate of each segment opened so far. */
+    fun writeCapture(folder: File, preSkip: Int, bitrates: List<Int>) =
+        writeJson(File(folder, CAPTURE), linkedMapOf("preSkip" to preSkip, "bitrates" to bitrates))
+
+    /** Seconds of audio in [markers] (from their granule positions; segment 1 from 0), those [skip] says not to count left out. */
+    fun seconds(markers: List<Marker>, skip: (Marker) -> Boolean = { false }): Double {
+        var prev = 0L
+        var s = 0.0
+        for (m in markers) {
+            if (!skip(m)) s += maxOf(0L, m.granule - prev) / 48_000.0
+            prev = m.granule
+        }
+        return s
     }
 
     fun markers(folder: File): List<Marker> =
         (folder.listFiles() ?: emptyArray()).filter { it.name.startsWith("seg-") && it.name.endsWith(".json") }.mapNotNull { f ->
             val o = readJson(f) ?: return@mapNotNull null
             val n = (o["n"] as? Double)?.toInt() ?: return@mapNotNull null
-            Marker(n, (o["bytes"] as? Double)?.toLong() ?: 0, o["sha256"] as? String ?: "", (o["granule"] as? Double)?.toLong() ?: 0)
+            Marker(n, (o["bytes"] as? Double)?.toLong() ?: 0, o["sha256"] as? String ?: "", (o["granule"] as? Double)?.toLong() ?: 0,
+                (o["bitrate"] as? Double)?.toInt())
         }.sortedBy { it.n }
 
     fun end(folder: File): End? = readJson(File(folder, END))?.let {
@@ -77,6 +99,7 @@ object ShareFiles {
         val cap = readJson(File(folder, CAPTURE))
         if (cap == null) { folder.deleteRecursively(); return false }
         val preSkip = (cap["preSkip"] as? Double)?.toLong() ?: 312
+        val bitrates = (cap["bitrates"] as? List<*>)?.map { (it as? Double)?.toInt() } ?: emptyList()
         val marked = markers(folder).map { it.n }.toSet()
         val open = (folder.listFiles() ?: emptyArray()).filter { it.name.matches(Regex("^seg-\\d{5,}\\.opus$")) }
             .mapNotNull { it.name.substring(4, it.name.length - 5).toIntOrNull() }.filter { it !in marked }.sorted()
@@ -86,7 +109,7 @@ object ShareFiles {
             val (keep, granule) = wholePages(d)
             if (keep == 0) { audio.delete(); continue }
             if (keep < d.size) RandomAccessFile(audio, "rw").use { it.setLength(keep.toLong()) }
-            try { mark(folder, n, granule) } catch (_: Exception) {}
+            try { mark(folder, n, granule, bitrates.getOrNull(n - 1)) } catch (_: Exception) {}
         }
         val last = markers(folder).lastOrNull()
         if (last == null) { folder.deleteRecursively(); return false }
