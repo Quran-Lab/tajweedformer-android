@@ -78,10 +78,8 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:2.0.1") }
+dependencies { implementation("ai.quranlab:tajweedformer:2.0.2") }
 ```
-
-Maven Central serves 2.0.1 today. 2.0.2 is tagged in this repository and follows there; the quick start below is the same for both.
 
 ## Before you start
 
