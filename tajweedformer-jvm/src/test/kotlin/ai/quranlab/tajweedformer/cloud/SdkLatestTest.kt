@@ -47,12 +47,12 @@ class SdkLatestTest {
         mapOf("sdk_latest" to mapOf("version" to version, "severity" to severity, "url" to url))
 
     @Test fun aNewerSdkLogsOneLinePerLaunchInADebuggableBuild() {
-        stub.extra = latest("2.0.2")
+        stub.extra = latest("2.0.9")
         val c = cloud()
         c.refreshConfig()
         stub.extra = latest("2.1.0", "required")
         c.refreshConfig()
-        assertEquals(listOf("Quran Lab SDK 2.0.2 is available (recommended), you have ${TajweedFormer.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
+        assertEquals(listOf("Quran Lab SDK 2.0.9 is available (recommended), you have ${TajweedFormer.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
             lines.toList())
         // the next launch (a new cloud for the process) logs again, once
         cloud().refreshConfig()

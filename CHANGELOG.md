@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.2
+
+The in-session failover no longer punishes a healthy accelerator (a developer measured two 2.0.1 rules firing on
+normal recitation: blank output during held vowels and madd, and a deadline missed by the first chunk after the
+accelerator sat idle).
+
+- Blank output is a suspicion: when the NPU writes nothing over audio with sound (4 s of blank output), the same audio is
+  checked on the CPU engine in the background while the NPU keeps serving. The CPU blank too: nothing happens
+  (`promotions[].blank_confirmed_ok`). The CPU writing tokens: the take switches to the CPU from the first silent
+  chunk, with nothing lost, and the incident carries the divergence.
+- Behaviour change for apps that read chunks: after a confirmed disagreement, the chunks from the first silent one
+  are delivered again with the SAME `index` and `TajweedChunk.replaces = true` (they replace what the NPU wrote
+  there). An app that keeps or draws chunks must replace the entries of that index and drop what it drew from that
+  index on, not append them. Takes without a disagreement are unchanged.
+- A cold start is not a failure: a warm-up when a take starts and on `TajweedFormerClient.appActivated()` for hosts without activities; the first chunk of a take gets
+  at least 1 s (max(1000 ms, 10 x p90)); later limits come from warm chunks only.
+- A late chunk is served by the CPU and demotes nothing; late chunks in 3 sessions within 24 h, or one confirmed
+  disagreement with the CPU, pause the build for 6 h (no new golden test). Off for good only for NaN or out-of-range
+  output, a second confirmed disagreement, a golden or CPU mismatch, or a crash. An exception from the NPU keeps the
+  2.0.1 rule (tested again a day later, at most three times).
+- On the first launch of 2.0.2, builds that 2.0.1 set aside for silence or a late chunk are tested again and
+  promoted again.
+- Incident reports are kept on the device (7 days) even before `QuranLabAndroid.configure` is called, and sent once Quran Lab is
+  configured and online. An app that never configures Quran Lab sends none.
+- Staying on 2.0.1: no option keeps the NPU without the automatic rules (`client.accelerator(model)?.forced = Backend.NPU` still applies every failover rule);
+  after a demotion for silence or a late chunk, `AcceleratorStore(client.store.root).forget()` before any recognizer is made, at the next launch makes the device test and promote again. Upgrading to
+  2.0.2 is the fix.
+
 ## 2.0.1
 
 ### CPU first, then the NPU

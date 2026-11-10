@@ -5,7 +5,7 @@ package ai.quranlab.tajweedformer
  * needs 2.0.0, and SDKs before 2.0.0 are never offered it.
  */
 object TajweedFormer {
-    const val VERSION = "2.0.1"
+    const val VERSION = "2.0.2"
 
     /** The manifest format this SDK reads (LAYOUT.md layout v2: tagged files, gzip transport). */
     const val MANIFEST_FORMAT = 3

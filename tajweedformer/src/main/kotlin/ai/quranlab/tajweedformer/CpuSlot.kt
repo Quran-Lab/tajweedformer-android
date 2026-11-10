@@ -41,7 +41,7 @@ internal class CpuSlot(
 
     /** Releases the weights when scoring can go on without them. Returns whether it did. */
     @Synchronized
-    fun release(): Boolean {
+    override fun release(): Boolean {
         val f = full ?: return false
         if (openScorer == null || closed) return false
         if (scorerOnly == null) scorerOnly = openScorer.invoke()

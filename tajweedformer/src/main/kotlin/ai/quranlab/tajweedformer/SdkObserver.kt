@@ -44,6 +44,9 @@ interface SdkObserver {
     /** A session switched from the accelerator to the CPU (the `promotions` telemetry's failovers, and an incident). */
     fun onFailover(event: AcceleratorFailoverEvent) {}
 
+    /** The CPU confirmed a blank stretch of an accelerator take (the `promotions` telemetry's `blank_confirmed_ok`). */
+    fun onBlankConfirmed(event: BlankConfirmedEvent) {}
+
     /**
      * The audio of a take exactly as the app pushed it, before any resampling: mono float in -1..1 at
      * [sampleRate] (16000 when the app pushes 16 kHz, as recommended; 8000 to 48000 otherwise). The

@@ -130,13 +130,15 @@ class BackendFallbackTest {
     fun aMidTakeNpuFailureMovesTheTakeToTheCpu() {
         var fake: NpuFake? = null
         val contract = NpuContract.read(npuFiles.io)
-        fallbackTake(contract, NpuMasks.read(npuFiles.masks, contract), "tensor_g5") { NpuFake(contract, failAt = 2).also { fake = it } }
-        assertEquals(2, fake!!.runs)
+        // the runner's first run is the warm-up at take start (silence, off the audio path); it throws on the take's third chunk
+        fallbackTake(contract, NpuMasks.read(npuFiles.masks, contract), "tensor_g5") { NpuFake(contract, failAt = 3).also { fake = it } }
+        assertEquals(3, fake!!.runs)
     }
 
     /**
      * The same with the Exynos 2500's 9-part chain (the staged io.json with folded constants and its masks.json):
-     * part 4 of 9 throws on the third chunk, after parts 0-3 ran; the take moves to the CPU like a one-model failure.
+     * part 4 of 9 throws on the take's third chunk (the chain's fourth run: the warm-up at take start is its first), after
+     * parts 0-3 ran; the take moves to the CPU like a one-model failure.
      */
     @Test
     fun aPartFailureInTheExynos2500ChainMovesTheTakeToTheCpu() {
@@ -150,7 +152,7 @@ class BackendFallbackTest {
             val pc = contract.partContract(k)
             object : NpuRunner {
                 override fun run(inputs: Map<String, ShortArray>): Map<String, ShortArray> {
-                    if (k == 4 && runs[k] == 2) throw IllegalStateException("part 4 of 9 went away")
+                    if (k == 4 && runs[k] == 3) throw IllegalStateException("part 4 of 9 went away")
                     val chunk = runs[k]++
                     val out = pc.outputs.mapValues { (_, t) -> ShortArray(t.size) }
                     out["logits"]?.let { lp -> for (f in 0 until 8) lp[f * 38 + topAt(chunk * 8 + f)] = 20000 }
@@ -160,7 +162,7 @@ class BackendFallbackTest {
             }
         }
         fallbackTake(contract, NpuMasks.read(mf, contract), "exynos2500") { NpuChainRunner(contract, parts) }
-        assertEquals(listOf(3, 3, 3, 3, 2, 2, 2, 2, 2), runs.toList())
+        assertEquals(listOf(4, 4, 4, 4, 3, 3, 3, 3, 3), runs.toList())
     }
 
     private fun fallbackTake(contract: NpuContract, masks: NpuMasks, soc: String, runner: () -> NpuRunner) = runBlocking {

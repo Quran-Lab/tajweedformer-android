@@ -10,7 +10,9 @@ import java.io.File
  * (`File.kt:line`), with the day, platform, versions and device class. Never a path or user data; a message only
  * for the accelerator incidents (section 7.1, path-stripped), with their closed `detail` object. At most one report
  * per signature (kind, code, frames) per day per install, except an incident kind's first report for a model
- * revision; queued on disk (`issues.json`, at most 32) until sent.
+ * revision; queued on disk (`issues.json`, at most 32) until sent. An incident report is kept at most
+ * [INCIDENT_KEEP_MS] (7 days); one made before the app configured Quran Lab waits in the [IncidentSpool] and joins
+ * the queue when it does ([adopt]).
  */
 class IssueQueue(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val queueFile = File(dir, "issues.json")
@@ -54,22 +56,51 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
      * `promotion_failed`, code `<stage>:<cause>`, the revision, the error's path-stripped [message][stripMessage] and the
      * closed `detail` object. The usual dedupe applies (one per signature per day), except that the FIRST report of each
      * kind per model revision on this install is always queued, and kept (never trimmed from the queue) until the
-     * server accepted or refused it. Returns whether it was queued.
+     * server accepted or refused it, at most [INCIDENT_KEEP_MS]. Returns whether it was queued.
      */
-    fun addIncident(i: AcceleratorIncident, frames: List<String>, app: AppIdentity, device: DeviceProfile): Boolean = synchronized(lock) {
+    fun addIncident(i: AcceleratorIncident, frames: List<String>, app: AppIdentity, device: DeviceProfile): Boolean {
         if (i.kind !in INCIDENT_KINDS) return false
-        val day = Day.of(clock())
-        val c = cleanCode(i.code)
         val rev = cleanRevision(i.revision) ?: return false
-        val pin = "${i.kind}|$rev"
+        return addIncidentBody(i.kind, cleanCode(i.code), rev, stripMessage(i.message ?: i.error?.message), detail(i), frames, clock(), app, device)
+    }
+
+    /**
+     * Moves the [spool]'s incidents (made before the app configured Quran Lab) into the queue, each as made at its
+     * own time (its day; the first-per-revision rule and the dedupe as if it had been queued then). Returns how many
+     * were queued.
+     */
+    fun adopt(spool: IncidentSpool, app: AppIdentity, device: DeviceProfile): Int {
+        var n = 0
+        for (e in spool.drain()) {
+            @Suppress("UNCHECKED_CAST")
+            val detail = (e["detail"] as? Map<String, Any?>) ?: continue
+            @Suppress("UNCHECKED_CAST")
+            val frames = (e["frames"] as? List<Any?>)?.mapNotNull { it as? String } ?: emptyList()
+            val at = (e["at_ms"] as? Double)?.toLong() ?: continue
+            val kind = e["kind"] as? String ?: continue
+            val rev = cleanRevision(e["revision"] as? String) ?: continue
+            if (kind !in INCIDENT_KINDS) continue
+            if (addIncidentBody(kind, cleanCode(e["code"] as? String ?: "other"), rev, stripMessage(e["message"] as? String), detail, frames, at, app, device)) n++
+        }
+        return n
+    }
+
+    private fun addIncidentBody(kind: String, c: String, rev: String, message: String?, detail: Map<String, Any?>, frames: List<String>, atMs: Long,
+                                app: AppIdentity, device: DeviceProfile): Boolean = synchronized(lock) {
+        if (clock() - atMs > INCIDENT_KEEP_MS) return false
+        val day = Day.of(atMs)
+        val pin = "$kind|$rev"
         val firsts = readFirsts()
         val first = pin !in firsts
-        val sig = "${i.kind}|$c|" + frames.take(8).joinToString(",") { it.replace(Regex("\\d+"), "") }
+        val sig = "$kind|$c|" + frames.take(8).joinToString(",") { it.replace(Regex("\\d+"), "") }
         val seen = readSeen()
-        val today = if (seen.first == day) seen.second.toMutableSet() else mutableSetOf()
-        if (!first && sig in today) return false
-        today.add(sig)
-        write(seenFile, linkedMapOf("day" to day, "sigs" to today.toList()))
+        // the dedupe window is the UTC day: a spooled report of an earlier day is not deduped against today's
+        val today = if (seen.first == day) seen.second.toMutableSet() else if (day == Day.of(clock())) mutableSetOf() else null
+        if (!first && today != null && sig in today) return false
+        if (today != null) {
+            today.add(sig)
+            write(seenFile, linkedMapOf("day" to day, "sigs" to today.toList()))
+        }
         if (first) write(firstsFile, (firsts + pin).toList())
         val b = LinkedHashMap<String, Any?>()
         b["day"] = day
@@ -79,12 +110,13 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
         b["os_version"] = device.osVersion.take(32)
         b["device_class"] = device.deviceClass
         b["revision"] = rev
-        b["kind"] = i.kind
+        b["kind"] = kind
         b["code"] = c
         if (frames.isNotEmpty()) b["frames"] = frames.take(16)
-        stripMessage(i.message ?: i.error?.message)?.let { b["message"] = it }
-        b["detail"] = detail(i)
+        message?.let { b["message"] = it }
+        b["detail"] = detail
         if (first) b[PIN] = pin
+        b[AT] = atMs
         val q = read().toMutableList()
         q.add(b)
         write(queueFile, trim(q))
@@ -102,8 +134,18 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
         return out
     }
 
-    /** The first queued report as it is sent (without the queue's own fields). */
-    fun firstToSend(): Map<String, Any?>? = synchronized(lock) { read().firstOrNull()?.filterKeys { !it.startsWith("_") } }
+    /** The first queued report as it is sent (without the queue's own fields); incident reports older than
+     *  [INCIDENT_KEEP_MS] are dropped first. */
+    fun firstToSend(): Map<String, Any?>? = synchronized(lock) { fresh().firstOrNull()?.filterKeys { !it.startsWith("_") } }
+
+    /** The queue without its expired incident reports (written back when one went). */
+    private fun fresh(): List<Map<String, Any?>> {
+        val q = read()
+        val now = clock()
+        val keep = q.filter { b -> (b[AT] as? Double)?.let { now - it.toLong() <= INCIDENT_KEEP_MS } ?: true }
+        if (keep.size != q.size) write(queueFile, keep)
+        return keep
+    }
 
     @Suppress("UNCHECKED_CAST")
     private fun readFirsts(): Set<String> = try {
@@ -112,7 +154,7 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
         emptySet()
     }
 
-    fun pending(): List<Map<String, Any?>> = synchronized(lock) { read() }
+    fun pending(): List<Map<String, Any?>> = synchronized(lock) { fresh() }
 
     /** Removes the first queued report (sent, or refused for good). */
     fun removeFirst() = synchronized(lock) {
@@ -153,6 +195,12 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
 
         /** The queue's own field on a pinned first report (never sent). */
         const val PIN = "_pin"
+
+        /** The queue's own field with an incident's time (never sent). */
+        const val AT = "_at"
+
+        /** Incident reports are kept on the device at most this long (offline, or before the app configured Quran Lab). */
+        const val INCIDENT_KEEP_MS = 7 * 24 * 3_600_000L
 
         val STAGES = setOf("download", "compile", "warmup", "golden", "session")
         val CAUSES = setOf("exception", "nan", "out_of_range", "blank", "timeout", "crash_on_last_run", "golden_mismatch", "cpu_mismatch",
@@ -244,4 +292,79 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
             return out
         }
     }
+}
+
+/**
+ * Accelerator incidents made while no Quran Lab cloud is configured in the process (the app has not called
+ * `QuranLabAndroid.configure`, or a background process that never does): kept on the device (`incidents-offline.json`
+ * in the cloud folder, at most [MAX] reports, each at most [IssueQueue.INCIDENT_KEEP_MS]), already reduced to what
+ * the report may carry (the 7.1 detail, the path-stripped message, the SDK frames). When the app configures Quran
+ * Lab, [IssueQueue.adopt] moves them into the issue queue and they are sent with its key once the network is there.
+ * An app that never configures Quran Lab sends none: there is no key to send them with.
+ */
+class IncidentSpool(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
+    private val file = File(dir, "incidents-offline.json")
+
+    fun add(i: AcceleratorIncident, frames: List<String>) = synchronized(LOCK) {
+        if (i.kind !in IssueQueue.INCIDENT_KINDS) return
+        val rev = IssueQueue.cleanRevision(i.revision) ?: return
+        val now = clock()
+        val e = LinkedHashMap<String, Any?>()
+        e["at_ms"] = now
+        e["kind"] = i.kind
+        e["code"] = IssueQueue.cleanCode(i.code)
+        e["revision"] = rev
+        IssueQueue.stripMessage(i.message ?: i.error?.message)?.let { e["message"] = it }
+        e["detail"] = IssueQueue.detail(i)
+        if (frames.isNotEmpty()) e["frames"] = frames.take(16)
+        write((read(now) + e).takeLast(MAX))
+    }
+
+    /** The kept incidents (the expired ones dropped). */
+    fun pending(): List<Map<String, Any?>> = synchronized(LOCK) { read(clock()) }
+
+    /** Takes every kept incident out (oldest first). */
+    fun drain(): List<Map<String, Any?>> = synchronized(LOCK) {
+        val out = read(clock())
+        file.delete()
+        out
+    }
+
+    fun clear() = synchronized(LOCK) { file.delete(); Unit }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun read(now: Long): List<Map<String, Any?>> = try {
+        (Json.parse(file.readText()) as List<Any?>).map { it as Map<String, Any?> }
+            .filter { e -> (e["at_ms"] as? Double)?.let { now - it.toLong() <= IssueQueue.INCIDENT_KEEP_MS } == true }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun write(v: List<Map<String, Any?>>) {
+        try {
+            dir.mkdirs()
+            val tmp = File(dir, file.name + ".tmp")
+            tmp.writeText(Json.write(v))
+            if (!tmp.renameTo(file)) { file.delete(); tmp.renameTo(file) }
+        } catch (_: Exception) {
+        }
+    }
+
+    companion object {
+        /** At most this many kept (the newest). */
+        const val MAX = 32
+        private val LOCK = Any()
+    }
+}
+
+/**
+ * The cloud observer while the app has not configured Quran Lab: nothing is counted or sent, but every accelerator
+ * incident (a failed promotion, a failover) is kept in the [IncidentSpool] for when it does.
+ */
+class OfflineIncidents(private val spool: IncidentSpool) : TajweedObserver {
+    override fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {
+        if (!e.promoted) e.incident?.let { spool.add(it, IssueQueue.frames(it.error)) }
+    }
+
+    override fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = spool.add(e.incident, IssueQueue.frames(e.incident.error))
 }

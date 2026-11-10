@@ -71,6 +71,8 @@ object Reasons {
     const val FORCED_CPU = "forced_cpu"
     const val THERMAL = "thermal"
     const val MEMORY = "memory"
+    /** A late call of the last take has not returned yet: this session runs on the CPU, the next may use it again. */
+    const val BUSY = "accelerator_busy"
 
     // pipeline failures (telemetry `reasons`)
     const val NETWORK = "network"
@@ -157,6 +159,10 @@ interface AcceleratorEnvironment {
 
     /** The pipeline's conditions now (battery, battery saver, thermal). */
     fun conditions(): Conditions = Conditions()
+
+    /** Registers [listener] for every time the app becomes active (Android: the first activity started, a rotation
+     *  not counted): the accelerator is warmed up then and the next chunk gets the first-chunk limit. */
+    fun onAppActive(listener: () -> Unit) {}
 
     /** Whether the network is unmetered now (the download stage waits otherwise). */
     fun unmetered(): Boolean = true
@@ -271,6 +277,15 @@ data class PromotionRecord(
     val denyCounted: Boolean = false,
     /** What the promotion was verified on: the SHA-256 of the accelerator program files; another one reruns the golden test. */
     val programSha: String = "",
+    /** A promoted key paused by a transient demotion (missed limits in three sessions within a day, one confirmed blank
+     *  disagreement): no session uses it before this time; then the same verified build serves again (no golden test). */
+    val pausedUntilMs: Long = 0,
+    /** The failover cause of that pause. */
+    val pauseCause: String = "",
+    /** When each of the recent sessions that missed a chunk limit did (the last 24 h; one entry per session). */
+    val missSessionsAtMs: List<Long> = emptyList(),
+    /** Confirmed blank disagreements with the CPU for this key (the second turns the build off for good). */
+    val blankDisagreements: Int = 0,
 ) {
     val speedup: Double get() = if (accMedianMs > 0 && cpuMedianMs > 0) cpuMedianMs / accMedianMs else Double.NaN
 
@@ -279,7 +294,8 @@ data class PromotionRecord(
         "failed_stage" to failedStage, "detail" to detail, "next_attempt_at_ms" to nextAttemptAtMs, "launch" to launch,
         "compile_ms" to compileMs, "cpu_median_ms" to num(cpuMedianMs), "acc_median_ms" to num(accMedianMs),
         "acc_p90_ms" to num(accP90Ms), "promoted_at_ms" to promotedAtMs, "updated_at_ms" to updatedAtMs,
-        "deny_counted" to denyCounted, "program_sha256" to programSha,
+        "deny_counted" to denyCounted, "program_sha256" to programSha, "paused_until_ms" to pausedUntilMs, "pause_cause" to pauseCause,
+        "miss_sessions_at_ms" to missSessionsAtMs, "blank_disagreements" to blankDisagreements,
     )
 
     companion object {
@@ -296,7 +312,31 @@ data class PromotionRecord(
             fun d(k: String) = o[k] as? Double ?: Double.NaN
             return PromotionRecord(s("stage"), (o["status"] as? String) ?: PENDING, l("attempt").toInt(), l("failures").toInt(), s("reason"),
                 s("failed_stage"), s("detail"), l("next_attempt_at_ms"), s("launch"), l("compile_ms", -1), d("cpu_median_ms"),
-                d("acc_median_ms"), d("acc_p90_ms"), l("promoted_at_ms"), l("updated_at_ms"), o["deny_counted"] == true, s("program_sha256"))
+                d("acc_median_ms"), d("acc_p90_ms"), l("promoted_at_ms"), l("updated_at_ms"), o["deny_counted"] == true, s("program_sha256"),
+                l("paused_until_ms"), s("pause_cause"), (o["miss_sessions_at_ms"] as? List<*>).orEmpty().mapNotNull { (it as? Double)?.toLong() },
+                l("blank_disagreements").toInt())
+        }
+
+        /** 2.0.1's demotions for silence or a late chunk (2.0.2 no longer counts those as faults): failover causes
+         *  `blank` and `deadline`, as the record's reason or as the cause of a `failover`. */
+        private val UPGRADE_CLEARED = setOf("blank", "deadline")
+
+        /**
+         * The upgrade from 2.0.1 (run once per records file): a key demoted or turned off for good by a `blank` or
+         * `deadline` failover goes back to the golden stage (the golden test runs again in the background, then
+         * promotes as usual) with a fresh retry budget; every other record stays as it is (NaN, a crash, a golden
+         * mismatch: still off). Returns null when [r] stays.
+         */
+        @JvmStatic
+        fun upgradedFrom201(r: PromotionRecord): PromotionRecord? {
+            if (r.status != FAILED && r.status != FINAL) return null
+            val cause = when (r.reason) {
+                Reasons.FAILOVER -> r.detail
+                else -> r.reason
+            }
+            if (cause !in UPGRADE_CLEARED) return null
+            return r.copy(status = PENDING, stage = Stages.WARMUP, failures = 0, reason = "", detail = "", failedStage = "", nextAttemptAtMs = 0,
+                launch = "", attempt = r.attempt + 1, missSessionsAtMs = emptyList(), blankDisagreements = 0, pausedUntilMs = 0, pauseCause = "")
         }
     }
 }
@@ -363,7 +403,8 @@ class AcceleratorStore(private val dir: File) {
         dir.mkdirs()
         val tmp = File(records.path + ".tmp")
         FileOutputStream(tmp).use { out ->
-            out.write(Json.write(linkedMapOf("format" to FORMAT, "install" to install,
+            // every file this SDK writes says its upgrades are done (a file 2.0.2 made is never upgraded again)
+            out.write(Json.write(linkedMapOf("format" to FORMAT, "install" to install, "upgrades" to UPGRADES,
                 "keys" to all.mapValues { it.value.toJson() }.toSortedMap())).toByteArray())
             out.flush()
             out.fd.sync()
@@ -382,7 +423,12 @@ class AcceleratorStore(private val dir: File) {
             if (m["format"] != FORMAT) return emptyMap<String, Any?>() to emptyMap()
             @Suppress("UNCHECKED_CAST")
             val install = (m["install"] as? Map<String, Any?>).orEmpty()
-            install to (m["keys"] as? Map<*, *>).orEmpty().entries.associate { (k, v) -> k as String to PromotionRecord.fromJson(v as Map<*, *>) }
+            val all = (m["keys"] as? Map<*, *>).orEmpty().entries.associate { (k, v) -> k as String to PromotionRecord.fromJson(v as Map<*, *>) }
+            if ((m["upgrades"] as? List<*>)?.contains(UPGRADE_2_0_2) == true) return install to all
+            // a 2.0.1 file: its blank and deadline demotions are cleared, once (the file is written back with the mark)
+            val up = all.mapValues { (_, r) -> PromotionRecord.upgradedFrom201(r) ?: r }
+            try { save(install, up) } catch (_: Exception) {}
+            install to up
         } catch (_: Exception) {
             emptyMap<String, Any?>() to emptyMap()
         }
@@ -390,5 +436,9 @@ class AcceleratorStore(private val dir: File) {
 
     companion object {
         const val FORMAT = "quranlab.accelerator/2"
+
+        /** The records file's upgrades done ([PromotionRecord.upgradedFrom201]). */
+        const val UPGRADE_2_0_2 = "2.0.2"
+        private val UPGRADES = listOf(UPGRADE_2_0_2)
     }
 }

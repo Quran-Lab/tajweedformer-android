@@ -35,8 +35,15 @@ data class PromotionTimeouts(
     val yieldMs: Long = 2_000L,
     /** Retries for the same key after the first attempt: 1 h, 6 h, 24 h, then no more. */
     val backoffMs: List<Long> = listOf(3_600_000L, 6 * 3_600_000L, 24 * 3_600_000L),
-    /** A failover's retry comes at least this long after it. */
+    /** A failover's retry comes at least this long after it (an exception in a session: the 2.0.1 rule). */
     val failoverRetryMs: Long = 24 * 3_600_000L,
+    /** A transient demotion (missed limits in [missSessions] sessions within [missWindowMs], one confirmed blank
+     *  disagreement): the pause before the same verified build serves again. Not the pipeline's retry budget. */
+    val transientBackoffMs: Long = 6 * 3_600_000L,
+    val missWindowMs: Long = 24 * 3_600_000L,
+    val missSessions: Int = 3,
+    /** Confirmed blank disagreements for one key that turn the build off for good. */
+    val blankDisagreementsOff: Int = 2,
 )
 
 /**
@@ -58,9 +65,13 @@ data class PromotionTimeouts(
  *    golden_mismatch, cpu_mismatch, non_finite and crash are never retried for the key. One attempt in flight, at most
  *    one per launch. The crash sentinel is armed around every compile, load, warm-up, golden run and a session's
  *    first accelerator call.
- * 5. In a session ([FailoverEngine]): a failed chunk switches the take to the CPU at once; the key is demoted (a
- *    retryable `failover`, at least 24 h later) and later sessions start on the CPU.
- * 6. Every attempt that ends and every failover goes to [SdkEvents] (`promotions` telemetry, incident reports).
+ * 5. In a session ([FailoverEngine]): a failed chunk switches the take to the CPU at once. What it does to the key
+ *    depends on its cause ([failingOver]): a missed limit nothing, unless it happened in 3 sessions within 24 h (then
+ *    a 6 h pause); a confirmed blank disagreement a 6 h pause, the second one for the key off for good; NaN, inf or
+ *    out-of-range values off for good; an exception a retryable `failover` at least 24 h later (golden test again). A
+ *    paused key stays promoted and verified: after the pause it loads, warms up and serves again.
+ * 6. Every attempt that ends, every failover and every blank the CPU confirmed goes to [SdkEvents] (`promotions`
+ *    telemetry, incident reports).
  */
 class AcceleratorController @JvmOverloads constructor(
     private val env: AcceleratorEnvironment,
@@ -82,6 +93,8 @@ class AcceleratorController @JvmOverloads constructor(
         private val firstCallGuarded = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     }
 
+    private val activationHooked = AtomicBoolean(false)
+
     private val _state = MutableStateFlow<AcceleratorState>(AcceleratorState.Cpu("not_started"))
 
     /** The state now (also a flow to collect). */
@@ -102,11 +115,15 @@ class AcceleratorController @JvmOverloads constructor(
     @Volatile private var armed = false
     /** A stage stopped for a session: run again when sessions end. */
     @Volatile private var resumeWhenIdle = false
-    @Volatile private var deadline = Failover.DEADLINE_CAP_MS
+    /** The chunk limits from warm chunks (the golden run's, then the sessions'). */
+    @Volatile private var limits = ChunkLimits()
     private val engines = CopyOnWriteArrayList<FailoverEngine>()
 
     /** Audio replayed through the CPU before a failed chunk ([Failover.REPLAY_WINDOW_MS]; measurements vary it). */
     @Volatile internal var replayWindowMs: Int = Failover.REPLAY_WINDOW_MS
+
+    /** Energetic blank output this long is checked on the CPU ([Failover.BLANK_RUN_MS]; tests on short clips shorten it). */
+    @Volatile internal var blankRunMs: Int = Failover.BLANK_RUN_MS
 
     /** A backend forced for debugging (null: automatic). [Backend.CPU] keeps the accelerator unused; [Backend.NPU]
      *  uses it whenever it is [AcceleratorState.Ready], ignoring thermal and memory. */
@@ -142,6 +159,7 @@ class AcceleratorController @JvmOverloads constructor(
      */
     fun start() {
         startedAtMs = env.nowMs()
+        if (activationHooked.compareAndSet(false, true)) try { env.onAppActive { appActivated() } } catch (_: Exception) {}
         store.leftSentinel()?.let { (id, stage) ->
             store.clearSentinel()
             crashed(id.ifEmpty { key.id }, stage.ifEmpty { Stages.COMPILE })
@@ -152,6 +170,12 @@ class AcceleratorController @JvmOverloads constructor(
         val now = env.nowMs()
         when (r.status) {
             PromotionRecord.PROMOTED -> {
+                if (r.pausedUntilMs > now) {
+                    // a transient demotion: the same verified build serves again after the pause
+                    set(AcceleratorState.Disabled(Reasons.FAILOVER, r.pauseCause, persistent = false, retryAtMs = r.pausedUntilMs))
+                    schedule(r.pausedUntilMs - now, false)
+                    return
+                }
                 if (!programsUnchanged(r)) {
                     // the verified program is gone or another one is in place: the whole pipeline again, golden test included
                     store.put(key, r.copy(status = PromotionRecord.PENDING, stage = "", updatedAtMs = now))
@@ -186,6 +210,8 @@ class AcceleratorController @JvmOverloads constructor(
     }
 
     private fun denied() = denyReason() != null
+
+    private fun inPlaceNow(): Boolean = try { preparer.inPlace(key) } catch (_: Exception) { false }
 
     private fun programsUnchanged(r: PromotionRecord): Boolean = try {
         preparer.inPlace(key) && (r.programSha.isEmpty() || preparer.programId(key) == r.programSha)
@@ -297,6 +323,11 @@ class AcceleratorController @JvmOverloads constructor(
                 store.put(key, r)
             }
         }
+        // a resumed attempt past its download (the 2.0.1 upgrade goes back to the golden stage) whose files are gone
+        if (r.stage.isNotEmpty() && Stages.after(r.stage) != Stages.DOWNLOAD && !inPlaceNow()) {
+            r = r.copy(stage = "", updatedAtMs = now)
+            store.put(key, r)
+        }
         while (true) {
             val stage = Stages.after(r.stage)
             denyReason()?.let { return denyHit(it) }
@@ -365,8 +396,9 @@ class AcceleratorController @JvmOverloads constructor(
                 val v = SelfTestSet.judgeGolden(p.expected, g.cpu, g.accelerator, p.planted, p.tolerance, p.plantedSites)
                 SdkEvents.emit { it.onSelfTest(SelfTestResult(Backend.NPU, v.passed, "${v.reason}: ${v.detail}", env.nowMs() - t0, key.soc, key.context, key.revision)) }
                 if (!v.passed) throw StageFailure(v.reason, v.detail, null, v.clip, v.divergence)
-                val cpuMs = g.cpu.values.flatMap { it.chunkMs }
-                val accMs = g.accelerator.values.flatMap { it.chunkMs }
+                // the limits come from WARM chunks only: never a clip's first chunk or its flush
+                val cpuMs = g.cpu.values.flatMap { it.warmMs() }
+                val accMs = g.accelerator.values.flatMap { it.warmMs() }
                 r.copy(stage = stage, cpuMedianMs = SelfTestSet.percentile(cpuMs, 0.5), accMedianMs = SelfTestSet.percentile(accMs, 0.5),
                     accP90Ms = SelfTestSet.percentile(accMs, 0.9), updatedAtMs = now())
             }
@@ -474,7 +506,7 @@ class AcceleratorController @JvmOverloads constructor(
                 return fail(r, if (prepared == null) Stages.COMPILE else Stages.WARMUP, e)
             }
         }
-        deadline = Failover.deadlineMs(r.accMedianMs, r.accP90Ms)
+        limits = ChunkLimits(r.accMedianMs, r.accP90Ms)
         val rec = r.copy(stage = Stages.PROMOTE, status = PromotionRecord.PROMOTED, promotedAtMs = env.nowMs(), reason = "", detail = "",
             failedStage = "", updatedAtMs = env.nowMs(), programSha = try { preparer.programId(key) } catch (_: Exception) { "" })
         store.put(key, rec)
@@ -487,6 +519,11 @@ class AcceleratorController @JvmOverloads constructor(
     /** A key promoted in an earlier launch: load and warm up again (no golden test); sessions use the CPU until then. */
     private fun restore(r: PromotionRecord) {
         if (prepared != null && _state.value is AcceleratorState.Ready) return
+        val now = env.nowMs()
+        if (r.pausedUntilMs > now) {
+            set(AcceleratorState.Disabled(Reasons.FAILOVER, r.pauseCause, persistent = false, retryAtMs = r.pausedUntilMs))
+            return schedule(r.pausedUntilMs - now, false)
+        }
         set(AcceleratorState.Preparing(Stages.COMPILE))
         try {
             val p = prepared ?: load("load")
@@ -498,7 +535,12 @@ class AcceleratorController @JvmOverloads constructor(
         } catch (e: StageFailure) {
             return fail(r.copy(attempt = r.attempt + 1, launch = launch), if (prepared == null) Stages.COMPILE else Stages.WARMUP, e)
         }
-        deadline = Failover.deadlineMs(r.accMedianMs, r.accP90Ms)
+        limits = ChunkLimits(r.accMedianMs, r.accP90Ms)
+        synchronized(lock) {
+            store.record(key)?.takeIf { it.pausedUntilMs != 0L || it.pauseCause.isNotEmpty() }?.let {
+                store.put(key, it.copy(pausedUntilMs = 0, pauseCause = "", updatedAtMs = env.nowMs()))
+            }
+        }
         set(AcceleratorState.Ready(key.soc, env.nowMs() - startedAtMs, r.speedup))
     }
 
@@ -552,26 +594,46 @@ class AcceleratorController @JvmOverloads constructor(
         }
         if (lastCpuReason != null) return null
         val h = held ?: return null
+        // a late call of an earlier take still holds the accelerator's thread: this take on the CPU, the next may use it
+        if (engines.any { it.busy && !h.retired }) {
+            lastCpuReason = Reasons.BUSY
+            return null
+        }
         if (reuse != null && reuse.belongsTo(p!!, cpu, sampleRate) && reuse.backend == Backend.NPU) return reuse
         val me = this
-        val e = FailoverEngine(h, cpu, sampleRate, deadline, h.accelerator.range, object : FailoverListener {
+        val e = FailoverEngine(h, cpu, sampleRate, limits, h.accelerator.range, object : FailoverListener {
             override fun firstCall(done: Boolean) = me.firstCall(done)
-            override fun failingOver(cause: String) = me.failingOver(cause)
+            override fun failingOver(cause: String, take: Long): String = me.failingOver(cause, take)
             override fun failedOver(event: FailoverEvent) {
                 me.failedOver(event)
                 try { onSwitch(event) } catch (_: Exception) {}
             }
-        }, windowChunks = replayWindowMs / h.accelerator.chunkMs)
+            override fun blankChecked(check: BlankCheck) = me.blankChecked(check)
+        }, windowChunks = replayWindowMs / h.accelerator.chunkMs, blankRunMs = blankRunMs)
         engines.add(e)
         return e
+    }
+
+    /**
+     * The app became active (Android: a first activity started, [AcceleratorEnvironment.onAppActive]): every session
+     * engine over the accelerator runs a warm-up off the audio path, and its next chunk gets the first-chunk limit.
+     */
+    fun appActivated() {
+        for (e in engines) try { e.warmUp(activation = true) } catch (_: Exception) {}
     }
 
     /** Why the last [engineForNextSession] gave the CPU (null: it gave the accelerator). */
     @Volatile var lastCpuReason: String? = null
         private set
 
-    /** The deadline in force for an accelerator chunk, ms. */
-    val deadlineMs: Double get() = deadline
+    /** The limit in force for a warm accelerator chunk, ms ([ChunkLimits.warmMs]). */
+    val deadlineMs: Double get() = limits.warmMs
+
+    /** The limit of a take's first chunk and of the first chunk after the app became active, ms. */
+    val firstChunkMs: Double get() = limits.firstChunkMs
+
+    /** The chunk limits in force (the sessions add their warm chunk times to them). */
+    val chunkLimits: ChunkLimits get() = limits
 
     override fun firstCall(done: Boolean) {
         if (!done) {
@@ -581,27 +643,85 @@ class AcceleratorController @JvmOverloads constructor(
         }
     }
 
-    /** The accelerator failed in a session: demoted for this key now (a retryable `failover`, at least 24 h later). */
-    override fun failingOver(cause: String) {
-        synchronized(lock) {
-            val r = store.record(key) ?: PromotionRecord(attempt = 1)
-            val failures = r.failures + 1
-            val final = failures > MAX_RETRIES
-            val next = if (final) 0L else env.nowMs() + maxOf(timeouts.failoverRetryMs,
-                timeouts.backoffMs[(failures - 1).coerceIn(0, timeouts.backoffMs.size - 1)])
-            store.put(key, r.copy(status = if (final) PromotionRecord.FINAL else PromotionRecord.FAILED, failures = failures,
-                reason = Reasons.FAILOVER, failedStage = Stages.SESSION, detail = cause, nextAttemptAtMs = next, stage = "",
-                launch = launch, updatedAtMs = env.nowMs()))
-            // closed once its last call returns (a hung call keeps it)
-            retireAll()
-            set(AcceleratorState.Disabled(Reasons.FAILOVER, cause, persistent = final, retryAtMs = next))
+    /**
+     * The accelerator failed in take [take] with [cause] (the take switches to the CPU). Demotion by cause:
+     *
+     * - `deadline` (a missed limit, a hang included): nothing for one; misses in [PromotionTimeouts.missSessions]
+     *   different sessions within [PromotionTimeouts.missWindowMs] pause the key ([pause]); never off for good;
+     * - `blank` (the CPU confirmed a disagreement): a pause; the [PromotionTimeouts.blankDisagreementsOff]th for the key
+     *   (any sessions) turns it off for good;
+     * - `non_finite`, `out_of_range`: off for good (a numeric fault of this build on this OS);
+     * - `exception`: the 2.0.1 rule, a retryable `failover` at least 24 h later (the golden test again), the 4th off.
+     */
+    override fun failingOver(cause: String, take: Long): String = synchronized(lock) {
+        val now = env.nowMs()
+        val r = store.record(key) ?: PromotionRecord(attempt = 1)
+        when (cause) {
+            Failover.DEADLINE -> {
+                // one entry per session (a take switches once), the last 24 h
+                val misses = r.missSessionsAtMs.filter { now - it < timeouts.missWindowMs } + now
+                if (misses.size >= timeouts.missSessions) {
+                    pause(r.copy(missSessionsAtMs = emptyList()), cause, now)
+                } else {
+                    store.put(key, r.copy(missSessionsAtMs = misses, updatedAtMs = now))
+                    Demotion.NONE
+                }
+            }
+            Failover.BLANK -> {
+                val n = r.blankDisagreements + 1
+                if (n >= timeouts.blankDisagreementsOff) off(r.copy(blankDisagreements = n), cause, now)
+                else pause(r.copy(blankDisagreements = n), cause, now)
+            }
+            Failover.NON_FINITE, Failover.OUT_OF_RANGE -> off(r, cause, now)
+            else -> {
+                val failures = r.failures + 1
+                val final = failures > MAX_RETRIES
+                val next = if (final) 0L else now + maxOf(timeouts.failoverRetryMs,
+                    timeouts.backoffMs[(failures - 1).coerceIn(0, timeouts.backoffMs.size - 1)])
+                store.put(key, r.copy(status = if (final) PromotionRecord.FINAL else PromotionRecord.FAILED, failures = failures,
+                    reason = Reasons.FAILOVER, failedStage = Stages.SESSION, detail = cause, nextAttemptAtMs = next, stage = "",
+                    launch = launch, updatedAtMs = now))
+                // closed once its last call returns (a late call keeps it)
+                retireAll()
+                set(AcceleratorState.Disabled(Reasons.FAILOVER, cause, persistent = final, retryAtMs = next))
+                if (final) Demotion.OFF else Demotion.RETRY
+            }
         }
+    }
+
+    /** A transient demotion: the key stays promoted and verified, no session uses it for
+     *  [PromotionTimeouts.transientBackoffMs], then it loads and warms up again (no golden test) and serves from the
+     *  next session boundary. */
+    private fun pause(r: PromotionRecord, cause: String, now: Long): String {
+        val until = now + timeouts.transientBackoffMs
+        store.put(key, r.copy(pausedUntilMs = until, pauseCause = cause, updatedAtMs = now))
+        retireAll()
+        set(AcceleratorState.Disabled(Reasons.FAILOVER, cause, persistent = false, retryAtMs = until))
+        schedule(timeouts.transientBackoffMs, false)
+        return Demotion.PAUSED
+    }
+
+    /** Off for good for this key (a new model revision or OS build is a new key). */
+    private fun off(r: PromotionRecord, cause: String, now: Long): String {
+        store.put(key, r.copy(status = PromotionRecord.FINAL, failures = r.failures + 1, reason = Reasons.FAILOVER, failedStage = Stages.SESSION,
+            detail = cause, nextAttemptAtMs = 0, stage = "", pausedUntilMs = 0, pauseCause = "", launch = launch, updatedAtMs = now))
+        retireAll()
+        set(AcceleratorState.Disabled(Reasons.FAILOVER, cause, persistent = true))
+        return Demotion.OFF
+    }
+
+    /** A blank check finished: one the CPU confirmed (blank there too) is counted (`blank_confirmed_ok`); no failover,
+     *  no demotion, no incident. */
+    override fun blankChecked(check: BlankCheck) {
+        if (!check.agreed || check.failed) return
+        SdkEvents.emit { it.onBlankConfirmed(ai.quranlab.tajweedformer.BlankConfirmedEvent(key.build, key.revision, key.context, check)) }
     }
 
     override fun failedOver(event: FailoverEvent) {
         val r = store.record(key)
         val inc = incident(AcceleratorIncident.FAILOVER, Stages.SESSION, event.cause, event.error, chunk = event.chunk,
-            elapsedMs = event.elapsedMs, deadlineMs = event.deadlineMs, stallMs = event.stallMs, attempt = r?.attempt)
+            elapsedMs = event.elapsedMs, deadlineMs = event.deadlineMs.takeIf { it > 0 }, stallMs = event.stallMs, attempt = r?.attempt,
+            divergence = event.divergence)
         SdkEvents.emit { it.onFailover(AcceleratorFailoverEvent(key.build, key.revision, key.context, event, inc)) }
     }
 

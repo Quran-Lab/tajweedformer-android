@@ -54,8 +54,19 @@ object QuranLabAndroid {
     @Volatile var cloud: QuranLabCloud? = null
         private set
 
-    /** What the recognizer reports to (a no-op until [configure]). */
-    val observer: TajweedObserver get() = cloud ?: object : TajweedObserver {}
+    /** What the recognizer reports to: the configured cloud, else (the SDK's client installed it) the offline keeper of
+     *  accelerator incidents, sent once the app calls [configure] (an app that never does sends none). */
+    val observer: TajweedObserver get() = cloud ?: offline ?: NONE
+
+    private val NONE = object : TajweedObserver {}
+    @Volatile private var offline: TajweedObserver? = null
+
+    /** Keeps accelerator incidents on the device until [configure] (installed with the SDK's client). */
+    @JvmStatic
+    internal fun keepIncidentsOffline(context: Context) {
+        if (offline != null) return
+        offline = ai.quranlab.tajweedformer.cloud.OfflineIncidents(ai.quranlab.tajweedformer.cloud.IncidentSpool(File(storage(context.applicationContext), "cloud")))
+    }
 
     /**
      * The app's own UI for the SDK's sheets; null: the SDK shows its own over the resumed activity. A

@@ -12,6 +12,7 @@ import ai.quranlab.tajweedformer.SettingSource
 import ai.quranlab.tajweedformer.SiteClass
 import ai.quranlab.tajweedformer.SiteVerdict
 import ai.quranlab.tajweedformer.TajweedBackend
+import ai.quranlab.tajweedformer.TajweedFormer
 import ai.quranlab.tajweedformer.TajweedPreset
 import ai.quranlab.tajweedformer.TajweedResult
 import ai.quranlab.tajweedformer.TajweedSummary
@@ -70,7 +71,7 @@ class CloudTest {
         val b = regs[0].json!!
         assertEquals(setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"), b.keys)
         assertEquals("android", b["platform"])
-        assertEquals("2.0.1", b["sdk_version"])
+        assertEquals(TajweedFormer.VERSION, b["sdk_version"])
         assertEquals(true, b["new_install"])
         assertTrue(regs[0].headers["authorization"]!!.startsWith("Bearer qlt_v1."))
         // the token came from POST /v1/attest with the key, unattested (sharing is off)
@@ -105,7 +106,7 @@ class CloudTest {
         val c = cloud()
         val cfg = c.refreshConfig()
         assertNotNull(cfg)
-        assertEquals("2.0.1", stub.seen("/v1/config")[0].q("sdk"))
+        assertEquals(TajweedFormer.VERSION, stub.seen("/v1/config")[0].q("sdk"))
         assertNotNull(stub.seen("/v1/config")[0].q("bucket"))
         assertTrue(c.tajweedJson!!.contains("\"sensitive\""))
         assertEquals("v4.0+abc", cfg!!.recommendedRevision)
@@ -223,7 +224,7 @@ class CloudTest {
         val b = ev.json!!
         assertEquals(2.0, b["v"])
         assertEquals(Day.of(now), b["day"])
-        assertEquals("2.0.1", b["sdk_version"])
+        assertEquals(TajweedFormer.VERSION, b["sdk_version"])
         assertTrue(Regex("^[0-9a-f]{32}$").matches(b["report_id"] as String))
         assertTrue(sealed.name.contains(b["report_id"] as String))
         assertEquals(mapOf("class" to "Pixel8", "soc" to "tensor_g3", "os_major" to 15.0, "ram_tier" to "8_16"), b["device"])

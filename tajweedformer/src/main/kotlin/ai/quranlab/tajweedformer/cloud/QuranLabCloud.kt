@@ -118,6 +118,12 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
 
     init {
         telemetry.enabled = options.analytics == CloudOptions.Analytics.ON && config.current?.flags?.analytics != false
+        // incidents made before the app configured Quran Lab join the queue (sent with the key once online)
+        val spool = IncidentSpool(cloudDir, env.clock)
+        try {
+            if (options.issueReports && config.current?.flags?.issues != false) issues.adopt(spool, env.app, env.device) else spool.clear()
+        } catch (_: Exception) {
+        }
     }
 
     /** The bucket 0..99, drawn once per install (not an identifier). */
@@ -397,6 +403,8 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         telemetry.failover(e)
         reportIncident(e.incident)
     }
+
+    override fun onBlankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = telemetry.blankConfirmed(e)
 
     override fun onModelLoad(e: TajweedObserver.ModelLoad) = telemetry.modelLoad(e)
     override fun onSelfTest(revision: String, context: String, backend: String, passed: Boolean) {

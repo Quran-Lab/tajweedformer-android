@@ -6,6 +6,7 @@ import ai.quranlab.tajweedformer.accel.AcceleratorKey
 import ai.quranlab.tajweedformer.accel.AcceleratorPreparer
 import ai.quranlab.tajweedformer.accel.AcceleratorState
 import ai.quranlab.tajweedformer.accel.AcceleratorStore
+import ai.quranlab.tajweedformer.accel.Demotion
 import ai.quranlab.tajweedformer.accel.Failover
 import ai.quranlab.tajweedformer.accel.GoldenRun
 import ai.quranlab.tajweedformer.accel.PreparedAccelerator
@@ -23,6 +24,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.AfterClass
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Before
@@ -141,6 +143,59 @@ class FailoverEngineTest {
 
     private var nextFail: Fail? = null
 
+    /** When set, the fake accelerator replays these chunks instead of running the engine ([Replayed]). */
+    private var nextReplay: (() -> TajweedEngineStream)? = null
+
+    /** The real CPU engine's chunks of [audio] and the input samples each needed (pushed 16 samples at a time); the
+     *  chunks after the last listed sample count are the flush. */
+    private class Precomputed(val chunks: List<TajweedHeads>, val need: LongArray)
+
+    private fun precompute(audio: FloatArray): Precomputed {
+        val chunks = ArrayList<TajweedHeads>()
+        val need = ArrayList<Long>()
+        inner.createStream().use { s ->
+            var at = 0
+            while (at < audio.size) {
+                val k = minOf(16, audio.size - at)
+                val got = s.pushAudio(audio, at, k)
+                at += k
+                for (g in got) { chunks += g; need += at.toLong() }
+            }
+            chunks += s.finish()
+        }
+        return Precomputed(chunks, need.toLongArray())
+    }
+
+    /** [h] with every frame's best token the blank (log_probs only; the other heads as they were). */
+    private fun blanked(h: TajweedHeads): TajweedHeads {
+        val m = HashMap<TajweedHead, FloatArray>()
+        for (k in h.available) m[k] = h[k]!!.copyOf()
+        val lp = m.getValue(TajweedHead.LOG_PROBS)
+        val w = TajweedHead.LOG_PROBS.width
+        for (t in 0 until h.n40) for (j in 0 until w) lp[t * w + j] = if (j == TajweedModel.BLANK) -0.001f else -12f
+        return TajweedHeads(h.n40, m)
+    }
+
+    /**
+     * An accelerator that replays the real CPU engine's chunks computed beforehand ([precompute]), blank over [blank]:
+     * it holds no engine stream (a real NPU holds none), so the CPU engine can check it while it serves.
+     */
+    private class Replayed(private val p: Precomputed, private val blank: IntRange?, private val blanked: (TajweedHeads) -> TajweedHeads) : TajweedEngineStream {
+        private var got = 0L
+        private var next = 0
+        override val backend: Backend get() = Backend.NPU
+        private fun emit(i: Int) = if (blank != null && i in blank) blanked(p.chunks[i]) else p.chunks[i]
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+            got += length
+            val out = ArrayList<TajweedHeads>()
+            while (next < p.need.size && p.need[next] <= got) out += emit(next++)
+            return out
+        }
+        override fun finish(): List<TajweedHeads> = (next until p.chunks.size).map { emit(it) }.also { next = p.chunks.size }
+        override fun reset() { got = 0; next = 0 }
+        override fun close() {}
+    }
+
     private inner class FakePrepared : PreparedAccelerator {
         private val dir = File(model.dir, SelfTestSet.DIR)
         private val set = SelfTestSet.read(dir)
@@ -155,7 +210,7 @@ class FailoverEngineTest {
             return GoldenRun(acc, cpu)
         }
         override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream =
-            FakeAccStream(nextFail, CountDownLatch(1).also { latches.add(it) })
+            nextReplay?.invoke() ?: FakeAccStream(nextFail, CountDownLatch(1).also { latches.add(it) })
         override fun close() {}
     }
 
@@ -281,10 +336,16 @@ class FailoverEngineTest {
                 if (wd > 0) div.wordTakes++
                 if (f.failover.exact) assertEquals("$tag: a replay from the take's start is exact", 0, ed + sd + wd)
             }
-            // later sessions start on the CPU
-            assertEquals(Reasons.FAILOVER, (acc.state.value as AcceleratorState.Disabled).reason)
+            // later sessions: on the CPU after a demotion (an exception: retried later; NaN, out of range: off for good);
+            // a single missed limit demotes nothing, and the next take is on the CPU only while the late call runs
+            when (fail.mode) {
+                "hang" -> assertTrue(tag, acc.state.value is AcceleratorState.Ready)
+                "exception" -> assertFalse(tag, (acc.state.value as AcceleratorState.Disabled).persistent)
+                else -> assertTrue(tag, (acc.state.value as AcceleratorState.Disabled).persistent)
+            }
             val again = session(rec, c)
             assertTrue(again.chunks.all { it.backend == Backend.CPU })
+            if (fail.mode == "hang") assertEquals(Reasons.BUSY, rec.backendChoice.reason)
             assertTrue(n > 0)
             return f
         } finally {
@@ -404,6 +465,184 @@ class FailoverEngineTest {
         fun mb(b: Long) = String.format(Locale.ROOT, "%.1f", b / 1e6)
         println("process memory (${ProcessMemory.what}): engine loaded +${mb(loaded.first - base.first)} MB private, +${mb(loaded.second - base.second)} MB resident; " +
             "after release ${mb(closed.first - base.first)} MB private; a scoring-only handle +${mb(scorerOnly.first - closed.first)} MB private")
+    }
+
+    private val blanks = Collections.synchronizedList(ArrayList<BlankConfirmedEvent>())
+    private val blankObserver = object : SdkObserver {
+        override fun onBlankConfirmed(event: BlankConfirmedEvent) { blanks.add(event) }
+    }
+
+    private fun basmalaClips() = selftestClips().filter { it.surah == 1 && it.ayah == 1 }
+
+    /**
+     * The blank rule with the real CPU engine checking: the accelerator (the CPU's own chunks, replayed) writes nothing over
+     * speech from chunk 1 of each Basmala clip. The check (the real engine, its weights loaded for it) disagrees: the take
+     * continues on the check's CPU stream from the first silent chunk with energy, the chunks from there are delivered again,
+     * every word is decoded, and the transcript equals the CPU-only run (the check replayed from the take's start: exact).
+     */
+    @Test
+    fun aBlankOverSpeechIsCaughtByTheRealCpuCheckFromTheFirstSuspiciousChunk() {
+        val stalls = ArrayList<Double>()
+        val checks = ArrayList<Double>()
+        // a 1.28 s run: the Basmala clips are 2.7 to 5.1 s long, and recitation pauses (quiet audio is never suspicious)
+        // break a 4 s run of speech; the shipped 4 s run with the real CPU is the held-tone test's
+        for ((c, runMs) in basmalaClips().map { it to 1280 }) {
+            val base = cpuOnly(c)
+            val pre = precompute(c.audio)
+            nextReplay = { Replayed(pre, 1 until pre.chunks.size, ::blanked) }
+            failovers.clear()
+            val acc = promoted()
+            acc.blankRunMs = runMs
+            val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+            try {
+                val r = session(rec, c)
+                val tag = "${c.id} blank from chunk 1, run $runMs ms"
+                val f = failovers.single().failover
+                assertEquals(tag, Failover.BLANK, f.cause)
+                // the first silent chunk with energy (a quiet onset or pause is no suspicion): chunk 1, or a little later
+                assertTrue(tag + ": from chunk ${f.chunk}", f.chunk in 1..8)
+                assertEquals(tag, f.chunk, r.chunks.first { it.replaces }.index)
+                assertEquals(tag, Demotion.PAUSED, f.demotion)
+                assertTrue(tag, f.divergence!!.tokensDiffer > 0)
+                assertTrue(tag, f.exact)
+                assertTrue(tag, r.chunks.any { it.replaces })
+                assertEquals(tag, (0 until pre.chunks.size).toSet(), r.chunks.map { it.index }.toSet())
+                // every word of the ayah decoded
+                assertEquals(tag, rec.expectedWordsBlocking(c.surah, c.ayah), r.result.words.size)
+                // the check replayed from the take's first sample: the transcript is the CPU-only run's
+                assertEquals(tag, base.first.toList(), r.heads.greedy().toList())
+                stalls += f.stallMs
+                checks += f.elapsedMs
+                println(String.format(Locale.ROOT, "%s: CPU check (cold: weights loaded, %d chunks replayed) %.1f ms off the audio path; switch from chunk %d %.1f ms; " +
+                    "%d of %d tokens differed", tag, f.replayedChunks + (runMs / 320), f.elapsedMs, f.chunk, f.stallMs, f.divergence!!.tokensDiffer, f.divergence!!.tokensExpected))
+            } finally {
+                nextReplay = null
+                rec.close()
+                acc.close()
+            }
+        }
+        println("blank over speech, the real CPU check: check median ${fmt(median(checks))} ms, switch median ${fmt(median(stalls))} ms (this host, $THREADS threads)")
+    }
+
+    /**
+     * A held stretch: a Basmala clip followed by 6 s of a steady tone (energy, no speech; the self-test set has no long
+     * madd clip). The accelerator (the CPU's own chunks, replayed) writes nothing over it; the real CPU, checking the same
+     * window off the audio path, writes nothing either: no failover, no demotion, `blank_confirmed_ok`, and the CPU
+     * engine closed again. Prints the check's time and the memory it holds while it runs.
+     */
+    @Test
+    fun aHeldStretchTheRealCpuConfirmsStaysOnTheAccelerator() {
+        val c0 = selftestClips().first { it.id == "Husary_001001" }
+        val tone = FloatArray(6 * 16_000) { (0.05 * Math.sin(2 * Math.PI * 220.0 * it / 16_000)).toFloat() }
+        val c = Clip(c0.id + "+tone", c0.surah, c0.ayah, c0.audio + tone)
+        val pre = precompute(c.audio)
+        // the stretch the CPU itself writes nothing over, with energy
+        val blankRun = pre.chunks.indices.reversed().takeWhile { pre.chunks[it].greedy().isEmpty() }.size
+        println("the CPU engine writes nothing over the last $blankRun chunks of ${c.id} (${pre.chunks.size} chunks); " +
+            "the first chunk needs ${pre.need[0]} input samples, the second ${pre.need[1]}")
+        Assume.assumeTrue("the CPU writes tokens over the tone", blankRun * 320 >= Failover.BLANK_RUN_MS)
+        SdkEvents.add(blankObserver)
+        try {
+            for (warm in listOf(false, true)) {
+                blanks.clear()
+                failovers.clear()
+                nextReplay = { Replayed(pre, null, ::blanked) }
+                val acc = promoted()
+                val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+                rec.releaseCpuForAccelerator = !warm
+                try {
+                    val r = session(rec, c)
+                    assertTrue(failovers.isEmpty())
+                    assertTrue(r.chunks.all { it.backend == Backend.NPU })
+                    assertTrue(acc.state.value is AcceleratorState.Ready)
+                    val until = System.currentTimeMillis() + 10_000
+                    while (blanks.isEmpty() && System.currentTimeMillis() < until) Thread.sleep(10)
+                    val b = blanks.first().check
+                    assertTrue(b.agreed)
+                    assertEquals(!warm, !b.warm)
+                    // the CPU engine closed again after a check that agreed (as it was: released while the accelerator serves)
+                    if (!warm) assertFalse(rec.cpuStandby.warm)
+                    println(String.format(Locale.ROOT, "held tone, CPU check %s: %.1f ms off the audio path (chunks %d..%d), CPU blank too: no switch",
+                        if (warm) "warm (weights loaded)" else "cold (weights loaded for it, closed after)", b.ms, b.fromChunk, b.toChunk))
+                } finally {
+                    nextReplay = null
+                    rec.close()
+                    acc.close()
+                }
+            }
+        } finally {
+            SdkEvents.remove(blankObserver)
+        }
+    }
+
+    /**
+     * What a check holds while it runs (the CPU engine loaded and one stream, against the standby released while the
+     * accelerator serves), and the warm-up's cost through the exact engine (one prediction of silence; on a phone it is one
+     * accelerator chunk).
+     */
+    @Test
+    fun theWarmUpAndTheChecksMemoryMeasured() {
+        fun mem(): Pair<Long, Long> {
+            System.gc()
+            Thread.sleep(200)
+            return ProcessMemory.snapshot()
+        }
+        fun mb(b: Long) = String.format(Locale.ROOT, "%.1f", b / 1e6)
+        val c = selftestClips().first { it.id == "Husary_001001" }
+        val pre = precompute(c.audio)
+        // an accelerator session releases the CPU weights; then a blank over speech loads them for the check (kept: it disagreed)
+        nextReplay = { Replayed(pre, null, ::blanked) }
+        val acc = promoted()
+        acc.blankRunMs = 1280
+        val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+        try {
+            session(rec, c)
+            val released = mem()
+            assertFalse(rec.cpuStandby.warm)
+            nextReplay = { Replayed(pre, 1 until pre.chunks.size, ::blanked) }
+            session(rec, c)
+            assertTrue(rec.cpuStandby.warm)
+            val loaded = mem()
+            println("a CPU check holds (${ProcessMemory.what}): +${mb(loaded.first - released.first)} MB private, +${mb(loaded.second - released.second)} MB resident " +
+                "over the released standby (the engine's weights and one stream; the window copy is ${mb(4L * (16 + 4 + 1) * 5120)} MB)")
+        } finally {
+            nextReplay = null
+            rec.close()
+            acc.close()
+        }
+        // the warm-up through the exact engine as the accelerator (one stream opened, one chunk of silence)
+        val acc2 = promoted()
+        val rec2 = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc2, soc = "fake", threads = THREADS))
+        rec2.releaseCpuForAccelerator = false
+        try {
+            val times = ArrayList<Double>()
+            val firsts = ArrayList<Double>()
+            repeat(5) {
+                runBlocking {
+                    val s = rec2.startSession()
+                    val got = async { s.chunks.toList() }
+                    // the first chunk's audio arrives over 320 ms (and a little more: the front end's lookahead)
+                    Thread.sleep(400)
+                    times += rec2.acceleratorEngine!!.lastWarmUpMs
+                    var at = 0
+                    while (at < c.audio.size) {
+                        val k = minOf(1600, c.audio.size - at)
+                        s.append(c.audio, at, k)
+                        at += k
+                    }
+                    s.finish()
+                    firsts += 1000 * got.await().first().seconds
+                }
+            }
+            val e = rec2.acceleratorEngine!!
+            println("(${failovers.size} of the 5 takes switched: the exact engine as the accelerator, on a shared desktop)")
+            println("warm-up through the exact engine as the accelerator (a stream opened, silence until one chunk ran): median " +
+                "${fmt(median(times))} ms on the accelerator thread at take start (${e.warmUps.get()} warm-ups in 5 takes); " +
+                "the first chunk then took median ${fmt(median(firsts))} ms (it did not wait for the warm-up)")
+        } finally {
+            rec2.close()
+            acc2.close()
+        }
     }
 
     /** The divergence over the engine's parity ayahs (`TJ_FAILOVER_AUDIO`), failing at the first, a middle and the last chunk. */

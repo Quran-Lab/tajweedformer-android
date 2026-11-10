@@ -4,6 +4,9 @@ import ai.quranlab.tajweedformer.AcceleratorFailoverEvent
 import ai.quranlab.tajweedformer.AcceleratorIncident
 import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.PromotionEvent
+import ai.quranlab.tajweedformer.BlankConfirmedEvent
+import ai.quranlab.tajweedformer.accel.BlankCheck
+import ai.quranlab.tajweedformer.accel.Demotion
 import ai.quranlab.tajweedformer.accel.Divergence
 import ai.quranlab.tajweedformer.accel.FailoverEvent
 import org.junit.After
@@ -85,10 +88,13 @@ class PromotionReportsTest {
         }
     }
 
+    /** Every switch counts in `failovers` and its cause (a single missed limit too), `demoted` and `reasons.failover`
+     *  only the switches that demoted the key. */
     @Test fun failoversCountTheirCausesAndStalls() {
         val t = Telemetry(File(dir, "t"), clock)
-        for ((cause, stall) in listOf("deadline" to 40.0, "deadline" to 180.0, "non_finite" to 260.0, "blank" to 1400.0)) {
-            val ev = FailoverEvent(cause, 3, stall, 10.0, 120.0, null, warm = false, replayedChunks = 3, exact = true)
+        for ((cause, stall, demotion) in listOf(Triple("deadline", 40.0, Demotion.NONE), Triple("deadline", 180.0, Demotion.PAUSED),
+            Triple("non_finite", 260.0, Demotion.OFF), Triple("blank", 1400.0, Demotion.PAUSED))) {
+            val ev = FailoverEvent(cause, 3, stall, 10.0, 120.0, null, warm = false, replayedChunks = 3, exact = true, demotion = demotion)
             t.failover(AcceleratorFailoverEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", ev,
                 incident(AcceleratorIncident.FAILOVER, "session", AcceleratorIncident.cause(cause), chunk = 3, stall = stall)))
         }
@@ -96,8 +102,80 @@ class PromotionReportsTest {
         assertEquals(4.0, p["failovers"])
         assertEquals(mapOf("deadline" to 2.0, "non_finite" to 1.0, "blank" to 1.0), p["failover_causes"])
         assertEquals(mapOf("le_50" to 1.0, "le_200" to 1.0, "le_300" to 1.0, "gt_1000" to 1.0), p["failover_stall_ms"])
-        assertEquals(mapOf("failover" to 4.0), p["reasons"])
+        assertEquals(mapOf("failover" to 3.0), p["reasons"])
+        assertEquals(3.0, p["demoted"])
         assertFalse("no attempt ended", p.containsKey("attempts"))
+    }
+
+    /** A blank the CPU confirmed: `blank_confirmed_ok`, and nothing else in the entry. */
+    @Test fun blanksTheCpuConfirmedCountInBlankConfirmedOk() {
+        val t = Telemetry(File(dir, "t"), clock)
+        repeat(3) { t.blankConfirmed(BlankConfirmedEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", BlankCheck(4, 16, true, 0, 0, 120.0, false))) }
+        assertEquals(mapOf("backend" to "npu:tensor_g5", "revision" to "v4.0-2026-11-09", "context" to "c16_l64", "blank_confirmed_ok" to 3.0),
+            promotions(t).single())
+    }
+
+    /**
+     * The developer who ran offline and never called configure got no report: before 2.0.2 the observer was a no-op
+     * until configure. Now incidents are kept on the device (7 days, at most 32) and sent once the app configures with
+     * its key and the network is there.
+     */
+    @Suppress("UNCHECKED_CAST")
+    @Test fun incidentsMadeBeforeConfigureAreKeptAndSentAfterItWhenOnline() {
+        stub.incidentsAccepted = true
+        val spool = IncidentSpool(File(dir, "cloud"), clock)
+        val offline = OfflineIncidents(spool)
+        val ev = FailoverEvent("blank", 4, 90.0, 140.0, 0.0, null, warm = false, replayedChunks = 4, exact = true, demotion = Demotion.PAUSED,
+            divergence = Divergence(5, 5, 0, 0))
+        offline.onFailover(AcceleratorFailoverEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", ev,
+            incident(AcceleratorIncident.FAILOVER, "session", "blank", chunk = 4, stall = 90.0, divergence = Divergence(5, 5, 0, 0), error = thrower())))
+        offline.onPromotion(promotion(false, "golden", "golden_mismatch"))
+        offline.onPromotion(promotion(true, "promote", null))
+        assertEquals(2, spool.pending().size)
+        // kept on the device as the report may carry it: the message already path-stripped
+        assertTrue(File(dir, "cloud/incidents-offline.json").readText().let { !it.contains("/data/user") && !it.contains("https://") })
+        // a day later the app configures Quran Lab, still offline: queued, not sent
+        now += 86_400_000L
+        stub.down = true
+        val c = cloud()
+        assertTrue(spool.pending().isEmpty())
+        assertEquals(listOf("session:blank", "golden:golden_mismatch"), c.issues.pending().map { it["code"] })
+        assertEquals(0, c.deliver().second)
+        assertEquals(2, c.issues.pending().size)
+        // online: sent, each with the day it happened
+        stub.down = false
+        assertEquals(2, c.deliver().second)
+        val sent = stub.seen("/v1/issues").map { it.json!! }
+        sent.forEach { validate(it) }
+        assertEquals(listOf("2025-11-09", "2025-11-09"), sent.map { it["day"] })
+        assertEquals(mapOf("tokens_expected" to 5.0, "tokens_differ" to 5.0, "sites_differ" to 0.0, "words_differ" to 0.0),
+            (sent[0]["detail"] as Map<String, Any?>)["divergence"])
+        assertTrue(c.issues.pending().isEmpty())
+    }
+
+    @Test fun incidentsAreKeptSevenDaysAtMost() {
+        val spool = IncidentSpool(File(dir, "cloud"), clock)
+        repeat(40) { spool.add(incident(AcceleratorIncident.FAILOVER, "session", "timeout", chunk = it), emptyList()) }
+        assertEquals("at most 32 kept, the newest", 32, spool.pending().size)
+        assertEquals(39.0, (spool.pending().last()["detail"] as Map<*, *>)["chunk"])
+        now += 8 * 86_400_000L
+        assertTrue("a week old: dropped", spool.pending().isEmpty())
+        // in the issue queue too: an incident report waiting more than 7 days is dropped
+        val c = cloud()
+        c.reportIncident(incident(AcceleratorIncident.FAILOVER, "session", "nan", chunk = 3))
+        assertEquals(1, c.issues.pending().size)
+        now += 8 * 86_400_000L
+        assertTrue(c.issues.pending().isEmpty())
+        assertEquals(null, c.issues.firstToSend())
+    }
+
+    @Test fun anAppWithIssueReportsOffDropsTheKeptIncidents() {
+        val spool = IncidentSpool(File(dir, "cloud"), clock)
+        spool.add(incident(AcceleratorIncident.FAILOVER, "session", "timeout", chunk = 1), emptyList())
+        val c = QuranLabCloud(CloudOptions(stub.key, issueReports = false, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
+            stub.environment(dir, clock = clock))
+        assertTrue(c.issues.pending().isEmpty())
+        assertTrue(spool.pending().isEmpty())
     }
 
     @Test fun atMostEightEntriesAndNothingWhenNothingHappened() {

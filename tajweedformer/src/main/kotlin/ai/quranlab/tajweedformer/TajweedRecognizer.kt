@@ -84,6 +84,10 @@ interface TajweedEngineStream : AutoCloseable {
 
     /** Every chunk of the take when the stream replaced earlier chunks (a fallback replay), else null. */
     fun takeHeads(): List<TajweedHeads>? = null
+
+    /** After a [pushAudio] or [finish]: the take's chunk index its chunks start at when they REDO chunks already
+     *  delivered (a confirmed accelerator disagreement: the CPU's chunks from the first suspicious one), else -1. */
+    fun takeRedo(): Int = -1
 }
 
 /** Makes the CPU engine for a model and context. */
@@ -125,9 +129,11 @@ fun interface TajweedEngineFactory {
  * Backends: the exact CPU engine serves from the first session. With an [Options.accelerator] the NPU
  * is promoted in the background (download, compile, warm-up, the golden test against the CPU engine) and a
  * NEW session runs on it once it is ready (never a session in progress). While it serves, the CPU engine's
- * weights are released ([CpuSlot]); a chunk the NPU fails (an exception, NaN or inf, values out of range,
- * blank output over audio, a missed deadline) switches the take to the CPU within that call
- * ([FailoverEngine]: the recent audio replayed, the failed chunk redone), and later sessions start on the CPU.
+ * weights are released ([CpuSlot]); a chunk the NPU fails (an exception, NaN or inf, values out of range, a
+ * missed limit) switches the take to the CPU within that call ([FailoverEngine]: the recent audio replayed, the
+ * failed chunk redone). Blank output over audio is checked on the CPU off the audio path and switches the take
+ * only when the CPU writes tokens there (the chunks from that point are delivered again, [TajweedChunk.replaces]).
+ * What a failure does to later sessions depends on its cause ([ai.quranlab.tajweedformer.accel.AcceleratorController]).
  * [backendChoice] says which backend the last session got and why; every choice and switch goes to
  * [SdkObserver.onBackendSelected].
  *
@@ -211,6 +217,12 @@ class TajweedRecognizer private constructor(
     /** The accelerator's session engine, kept while the same accelerator stays promoted. */
     @Volatile private var accEngine: FailoverEngine? = null
 
+    /** The accelerator's session engine of the last accelerator session (measurements). */
+    internal val acceleratorEngine: FailoverEngine? get() = accEngine
+
+    /** The CPU standby (tests look at its weights being loaded or released). */
+    internal val cpuStandby: CpuSlot get() = engine
+
     /** Release the CPU weights while the accelerator serves (tests keep them to measure the warm switch). */
     @Volatile internal var releaseCpuForAccelerator = true
 
@@ -222,6 +234,9 @@ class TajweedRecognizer private constructor(
         val e = acc.engineForNextSession(engine, options.sampleRate, accEngine) { ev -> switched(ev) }
         if (e != null) {
             accEngine = e
+            // the warm-up at take start: one prediction of silence on the accelerator's thread while the first
+            // chunk's audio arrives (a powered-down accelerator wakes up before the first real chunk)
+            e.warmUp()
             choose(BackendChoice(Backend.NPU, "npu", "", acc.key.soc, context, model.manifest.revision))
             // no second resident copy of the weights while the accelerator serves: a failover loads them again
             if (releaseCpuForAccelerator) executor.execute { try { engine.release() } catch (_: Exception) {} }
@@ -544,13 +559,15 @@ class TajweedSession internal constructor(
             val s = stream ?: engine.createStream(select).also { stream = it }
             if (prof) StageClock.lap(StageClock.STREAM_OPEN_CLOSE, b0)
             val t0 = System.nanoTime()
-            var out: List<TajweedHeads> = if (buffered > 0) s.pushAudio(pending, 0, buffered) else emptyList()
-            if (length > 0) out = out + s.pushAudio(samples!!, offset, length)
+            // each call's chunks with where they start when they redo delivered ones (takeRedo)
+            val parts = ArrayList<Pair<List<TajweedHeads>, Int>>(3)
+            if (buffered > 0) parts += s.pushAudio(pending, 0, buffered) to s.takeRedo()
+            if (length > 0) parts += s.pushAudio(samples!!, offset, length) to s.takeRedo()
             this.samples += buffered + length
             var take: Pair<TajweedHeads, Backend>? = null
             if (finish) {
-                out = out + s.finish()
-                deliver(out, (System.nanoTime() - t0) / 1e9, s.backend)
+                parts += s.finish() to s.takeRedo()
+                deliver(parts, (System.nanoTime() - t0) / 1e9, s.backend)
                 val heads = s.takeHeads() ?: kept
                 val b = s.backend
                 scoring = recognizer.scoringOf(engine, s, heads.size)
@@ -560,7 +577,7 @@ class TajweedSession internal constructor(
                 if (prof) StageClock.lap(StageClock.STREAM_OPEN_CLOSE, c0)
                 take = TajweedHeads.concat(heads) to b
             } else {
-                deliver(out, (System.nanoTime() - t0) / 1e9, s.backend)
+                deliver(parts, (System.nanoTime() - t0) / 1e9, s.backend)
             }
             if (prof) body = System.nanoTime() - b0
             take
@@ -624,15 +641,34 @@ class TajweedSession internal constructor(
         }
     }
 
-    private fun deliver(heads: List<TajweedHeads>, seconds: Double, backend: Backend) {
+    /** The chunks of one hop's calls; a call whose chunks redo delivered ones (from index `redo`) rewinds to it. */
+    private fun deliver(parts: List<Pair<List<TajweedHeads>, Int>>, seconds: Double, backend: Backend) {
+        val n = parts.sumOf { it.first.size }
         compute += seconds
         lastBackend = backend
+        for ((heads, redo) in parts) {
+            if (redo in 0 until index) {
+                while (kept.size > redo) kept.removeAt(kept.size - 1)
+                index = redo
+                frame = kept.sumOf { it.n40 }
+            }
+            deliver(heads, if (n > 0) seconds / n else 0.0)
+        }
+    }
+
+    /** The highest chunk index delivered so far plus one (a redone chunk below it replaces one). */
+    private var highWater = 0
+
+    private fun deliver(heads: List<TajweedHeads>, perChunk: Double) {
+        val backend = lastBackend
         val observe = SdkEvents.active
         val prof = StageClock.on
         for (h in heads) {
             var tp = if (prof) System.nanoTime() else 0L
             kept.add(h)
-            val chunk = TajweedChunk(index++, h.only(select), seconds / heads.size, backend, frame)
+            val i = index++
+            val chunk = TajweedChunk(i, h.only(select), perChunk, backend, frame, replaces = i < highWater)
+            highWater = maxOf(highWater, index)
             events.trySend(chunk)
             if (prof) tp = StageClock.lap(StageClock.DELIVER_OTHER, tp)
             if (observe) {

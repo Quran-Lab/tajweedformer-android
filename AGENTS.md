@@ -82,7 +82,7 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.1` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.2` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+ | SwiftPM, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node | npm `@quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake (`add_subdirectory`) |
@@ -299,8 +299,9 @@ after every stage; a restart resumes at the next stage):
    run. The CPU must equal the shipped expected file; the accelerator must decide as the CPU did: the same tokens on
    the clean clips and the same flagged sites and words on every clip (an extra flag and a missed one both count),
    within the build's signed `golden_tolerance` (exact without it), and the planted mistake always flagged.
-5. `measure`: the speedup (the CPU's median chunk time over the accelerator's) and the accelerator's median and p90,
-   which set its deadline. Telemetry only: a build that passes the golden test is promoted whatever its speed.
+5. `measure`: the speedup (the CPU's median chunk time over the accelerator's) and the accelerator's median and p90
+   of WARM chunks (not a clip's first chunk, not its flush), which set its chunk limit. Telemetry only: a build that
+   passes the golden test is promoted whatever its speed.
 6. `promote`: the accelerator stays loaded and warm; the next session uses it.
 
 Warm-up, golden and measure run only while no session is active (a session that starts stops them without a
@@ -320,14 +321,48 @@ CPU mismatch, NaN or a crash is never retried for the key (a new model revision 
 sentinel is written before every compile, load, warm-up, golden run and a session's first accelerator call; a
 process that died there leaves it, and the next launch records a crash.
 
-During a session every accelerator call runs on its own thread against a deadline (min(300 ms, max(4 x p90,
-2 x median)) of this device's measured chunk times, at least 50 ms; a stream's first call gets four times that).
-A call that throws, returns NaN, inf or values outside what the build can produce, returns blank chunks over
-speech for 4 s, or misses its deadline is abandoned and the take switches to the CPU within that call: the last
-5.12 s of audio (a ring buffer) are replayed through a CPU stream to rebuild its state, the failed chunk is redone,
-and the take continues on the CPU. The chunks the app already got stay. The accelerator is set aside for that
-model revision and OS build (retried by the pipeline at least 24 h later) and later sessions start on the CPU. The
-app sees no error, only `backendChoice` changing to `failover_<cause>`.
+**During a session.** Every accelerator call runs on its own thread against a time limit. A call that throws,
+returns NaN, inf or values outside what the build can produce, or misses its limit is abandoned and the take
+switches to the CPU within that call: the last 5.12 s of audio (a ring buffer) are replayed through a CPU stream to
+rebuild its state, the failed chunk is redone, and the take continues on the CPU. The chunks the app already got
+stay. The app sees no error, only `backendChoice` changing to `failover_<cause>`. Since 2.0.2 two things are no
+longer faults by themselves:
+
+- **Silence is not a fault.** CTC writes blanks through a held vowel or a long madd, so an accelerator writing
+  nothing for 4 s of audio with sound is only a suspicion. The SDK replays the same window through the CPU engine on
+  a background thread while the accelerator keeps serving the take (no stall; at most one check at a time and at
+  most one per 10 s of a take's audio). If the CPU writes nothing there either (within the build's `golden_tolerance`
+  token count), nothing happens: no switch, no demotion, no incident, the CPU engine is closed again, and the
+  `promotions` telemetry counts `blank_confirmed_ok`. If the CPU writes tokens there, the take continues on the CPU
+  stream the check already rebuilt, and the chunks from the first silent one are delivered again: a chunk with
+  `replaces = true` replaces the chunk of the same index the app got before (drop what you drew from that index on).
+  The incident (`accelerator_failover`, cause `blank`) carries how far the two differed. The check compares tokens
+  only: a take is scored at its end, so there are no flags to compare mid-take.
+- **A cold start is not a fault.** The accelerator may power down while the app sits idle, and its first prediction
+  after that is slow. The SDK runs a warm-up (one prediction of silence on the accelerator's thread) when a take
+  starts and when the app becomes active again (the first activity started; `TajweedFormerClient.appActivated()` for
+  a host without activities); the first chunk needs a chunk of audio first, so the warm-up has that long and does
+  not delay it. The first chunk of a take and the first after the app became active get
+  max(1000 ms, 10 x p90); later chunks get min(300 ms, max(4 x p90, 2 x median, 50 ms)), with p90 and median taken
+  from warm chunks only (the golden run's, then the latest 256 of this device's sessions; 300 ms before any). A
+  chunk past its limit is served by the CPU for the rest of that take and demotes nothing by itself. While its
+  abandoned call has not returned, a new take starts on the CPU (`accelerator_busy`).
+
+**What a failure does to later sessions** (per model revision, context, build, OS build and device):
+
+| Cause | Effect |
+| - | - |
+| A late chunk (a hang included) | Nothing; late chunks in 3 different sessions within 24 h pause the build for 6 h |
+| The CPU wrote tokens where the accelerator wrote none | A 6 h pause; the second time for the build, off for good |
+| NaN, inf or out-of-range values | Off for good |
+| An exception from the accelerator | As in 2.0.1: set aside, tested again (golden test included) no sooner than 24 h later within the 1 h, 6 h, 24 h retry budget, off for good once it is used up |
+| A crash at a session's first accelerator call | Off for good |
+
+A paused build stays verified: after the pause it is loaded and warmed up again and serves from the next session
+start, with no new golden test. "Off for good" holds until a new model revision or OS build (a new key). On the
+first launch of 2.0.2, a build that 2.0.1 had set aside or turned off for blank output or a late chunk is cleared
+and goes back to the golden stage (the golden test runs again in the background, then it is promoted as usual);
+every other record stays. That upgrade runs once.
 
 The CPU standby costs no resident memory: the engine maps its weights, but on every CPU with the dot-product
 instructions (every NPU phone) it rewrites the 63 MB of int8 linears into that layout in place at load, which makes
@@ -357,6 +392,21 @@ and int8 rounding flips carry): measured on a 47 s session, the replayed chunks'
 uninterrupted run's by about 10 at the first replayed chunk, 0.5 after 12 chunks and stay near 0.1 after that. The
 decisions did not change in any take from 2.56 s up; 5.12 s keeps a margin for longer ayahs.
 
+Measured for 2.0.2 (`FailoverEngineTest` with the real exact engine on the same kind of Windows x86-64 desktop, 4
+engine threads, this build's CPU chunk 12 to 13 ms; the accelerator a fake that replays the CPU engine's own chunks
+and writes nothing where told, so the real CPU can check it): a blank check of the shipped 4 s run (a Basmala clip
+followed by 6 s of a steady tone: 28 chunks replayed) takes 420 to 460 ms on its own thread, with the weights loaded
+for it (cold) or already loaded (warm), and the CPU writes nothing there either (no switch); with a 1.28 s run over
+speech on the three Basmala clips the check takes 96 to 124 ms, it disagrees, and the switch from the first silent
+chunk takes 78 to 210 ms, with the transcript equal to a CPU-only run. A check holds the CPU engine (its weights and
+one stream) while it runs: +36 to +67 MB private over the released standby here (Windows private bytes; on an ARM
+phone the weights' layout pass makes about 63 MB private, so about that, an estimate), released again when it agrees.
+The warm-up (the exact engine standing in for the accelerator: a stream opened and one chunk of silence) takes about
+40 ms on the accelerator's thread at take start and the first chunk does not wait for it: the first chunk needs 7328
+input samples (458 ms of audio at 16 kHz), so a warm-up shorter than that costs the learner nothing. Phone estimates
+(not measured on a phone): a check of the 4 s run replays 28 or 29 chunks at a phone's CPU chunk time, about 0.5 to
+1 s off the audio path; a warm-up is one accelerator chunk plus whatever wake-up the accelerator needs.
+
 `client.accelerator(model)` gives the state (`cpu`, `preparing(stage, waitingFor)`, `ready(speedup)`,
 `disabled(reason, retryAt)`) as a `StateFlow`, listeners, `awaitReady()` and `forced` for debugging; nothing is
 needed by default. **The NPU path has not run inside an app on an NPU phone yet** (its native runner, through
@@ -365,9 +415,17 @@ bench runner).
 
 **Telemetry.** The `promotions` entry of the telemetry delta (per accelerator, revision and context: attempts,
 promoted, the stage and reason of each failure, compile time and speedup histograms, failovers by cause with their
-stall, demotions) and an issue report for every incident (`promotion_failed`, `accelerator_failover`: stage,
-cause, the error's class and path-stripped message, chunk and deadline, the self-test clip and how far it diverged,
-device model, OS build, chip, delegate, thermal state; never audio, text or ids). See `docs/platform-client.md`.
+stall, demotions, `blank_confirmed_ok`) and an issue report for every incident (`promotion_failed`,
+`accelerator_failover`: stage, cause, the error's class and path-stripped message, chunk and limit, the self-test
+clip or the blank window and how far it diverged, device model, OS build, chip, delegate, thermal state; never
+audio, text or ids). Every switch to the CPU counts in `failovers` and `failover_causes` and sends an incident (a
+single late chunk too, cause `timeout`); `demoted` counts only the switches that set the build aside. See
+`docs/platform-client.md`.
+
+**Incident reports offline.** Incident reports are kept on the device (at most 32, each at most 7 days) whether or
+not the app has configured Quran Lab, and sent once the app has called `QuranLabAndroid.configure` with its key and
+the network is there. An app that never configures Quran Lab sends none: there is no key to send them with.
+Before 2.0.2 an app that had not configured Quran Lab dropped them at once.
 
 ### The Quran Lab platform link
 
@@ -487,7 +545,8 @@ GCC and Ninja on `PATH`) named by `TAJWEEDFORMER_LIBRARY`, the staged model fold
 `BackendFallbackTest` (an in-session failover with the real front end and the staged NPU
 tables), `FailoverEngineTest` (with `TJ_FAILOVER_MODEL`, a decoded V4 folder with `selftest/`: the golden stage
 with the real self-test clips, failovers at the first, a middle and the last chunk of every clip through the real
-engine, the stall warm and cold, the standby's memory; with `TJ_FAILOVER_AUDIO` the divergence over the parity
+engine, the stall warm and cold, the standby's memory, blank checks by the real CPU (a held tone it confirms, blank
+output over the Basmala clips it contradicts), the check's time and memory, the warm-up; with `TJ_FAILOVER_AUDIO` the divergence over the parity
 ayahs), `ProgramDeltaTest` (with `TJ_PROGDELTA_STAGED` and `TJ_PROGDELTA_CPU`, every staged NPU delta rebuilt), `ScorerVectorsTest` (with `TJ_SCORER_TABLE`) and `EngineSettingsTest`. The rest needs no
 engine: format 3 manifests and signatures, profiles, SoC ids, downloads against a local Range / ETag
 server, the NPU host loop, the decoded layer, word scores and the settings vectors.

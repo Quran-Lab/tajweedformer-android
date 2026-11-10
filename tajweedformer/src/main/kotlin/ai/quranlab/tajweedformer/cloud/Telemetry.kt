@@ -165,14 +165,23 @@ class Telemetry(
         persist(force = true)
     }
 
-    /** A session switched from the accelerator to the CPU (the key was demoted: `reasons.failover` too). */
+    /** A session switched from the accelerator to the CPU: `failovers` and its cause and stall always (a single missed
+     *  limit too: it is still a switch for that session); `demoted` and `reasons.failover` only when it demoted the key. */
     fun failover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = rec { a ->
         val p = a.promotion(PromoKey(e.backend, e.revision, e.context))
         p.failovers++
-        p.demoted++
         inc(p.causes, e.failover.cause.takeIf { it in Promo.CAUSES } ?: "exception")
         Hist.stall(p.stall, e.failover.stallMs)
-        inc(p.reasons, "failover")
+        if (e.failover.demoted) {
+            p.demoted++
+            inc(p.reasons, "failover")
+        }
+        persist(force = true)
+    }
+
+    /** A blank stretch the CPU confirmed (no switch): `blank_confirmed_ok`. */
+    fun blankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = rec { a ->
+        a.promotion(PromoKey(e.backend, e.revision, e.context)).blankConfirmedOk++
         persist(force = true)
     }
 
@@ -364,6 +373,8 @@ internal class PromoCounts {
     var failovers = 0
     /** Promoted builds taken back to the CPU after an in-session failure. */
     var demoted = 0
+    /** Blank suspicions the CPU confirmed as correct (no failover). */
+    var blankConfirmedOk = 0
     val causes = LinkedHashMap<String, Int>()
     val stall = LinkedHashMap<String, Int>()
 }
@@ -395,6 +406,7 @@ internal object Promo {
         hist(c.causes, CAUSES)?.let { o["failover_causes"] = it }
         hist(c.stall, Hist.STALL)?.let { o["failover_stall_ms"] = it }
         if (c.demoted > 0 || store) o["demoted"] = cap(c.demoted)
+        if (c.blankConfirmedOk > 0 || store) o["blank_confirmed_ok"] = cap(c.blankConfirmedOk)
         return o
     }
 
@@ -404,6 +416,7 @@ internal object Promo {
         fun n(v: Any?) = (v as? Double)?.toInt() ?: 0
         fun h(key: String, dst: MutableMap<String, Int>) { (o[key] as? Map<String, Any?>)?.forEach { (b, v) -> dst[b] = n(v) } }
         c.attempts = n(o["attempts"]); c.promoted = n(o["promoted"]); c.failovers = n(o["failovers"]); c.demoted = n(o["demoted"])
+        c.blankConfirmedOk = n(o["blank_confirmed_ok"])
         h("failed_at", c.failedAt); h("reasons", c.reasons); h("compile_ms", c.compileMs); h("speedup", c.speedup)
         h("failover_causes", c.causes); h("failover_stall_ms", c.stall)
         return PromoKey(o["backend"] as String, o["revision"] as String, o["context"] as String) to c
@@ -682,7 +695,7 @@ internal object TelemetryPayload {
         if (a.shareYes > 0) b["share_yes"] = cap(a.shareYes)
         if (a.shareNo > 0) b["share_no"] = cap(a.shareNo)
         // the accelerator's promotions and failovers: at most 8 entries, the busiest kept
-        val promos = a.promotions.entries.sortedByDescending { it.value.attempts + it.value.failovers }.take(Promo.MAX)
+        val promos = a.promotions.entries.sortedByDescending { it.value.attempts + it.value.failovers + it.value.blankConfirmedOk }.take(Promo.MAX)
             .map { (k, c) -> Promo.json(k, c) }.filter { it.size > 3 }
         if (promos.isNotEmpty()) b["promotions"] = promos
         var bytes = Json.write(b).toByteArray(Charsets.UTF_8)

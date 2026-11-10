@@ -30,6 +30,19 @@ data class PromotionEvent(
     val incident: AcceleratorIncident? = null,
 )
 
+/**
+ * The CPU checked a blank stretch of an accelerator take and wrote nothing there either ([SdkObserver.onBlankConfirmed]):
+ * a held vowel or a long madd, not a fault. No switch, no demotion, no incident: the `promotions` telemetry's
+ * `blank_confirmed_ok` counts it.
+ */
+data class BlankConfirmedEvent(
+    /** `npu:<soc>`. */
+    val backend: String,
+    val revision: String,
+    val context: String,
+    val check: ai.quranlab.tajweedformer.accel.BlankCheck,
+)
+
 /** A session switched from the accelerator to the CPU ([SdkObserver.onFailover]). */
 data class AcceleratorFailoverEvent(
     val backend: String,

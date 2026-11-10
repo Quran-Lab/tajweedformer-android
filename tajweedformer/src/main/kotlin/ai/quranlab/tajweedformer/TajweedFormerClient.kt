@@ -106,6 +106,16 @@ class TajweedFormerClient(
     }
 
     /**
+     * The app became active (Android does this by itself through the accelerator environment; a host without activities
+     * calls it when it comes to the foreground): every accelerator runs a warm-up off the audio path, and the next chunk
+     * gets the first-chunk limit.
+     */
+    @Synchronized
+    fun appActivated() {
+        for (c in accelerators.values) try { c.appActivated() } catch (_: Exception) {}
+    }
+
+    /**
      * Resumes, blocking, every accelerator promotion this device has a record of (the Android worker calls this in a fresh
      * process): for each context of the stored manifest whose CPU files are in place and whose key has a record, the
      * controller is started and its pipeline run to its next wait. Returns the keys run.

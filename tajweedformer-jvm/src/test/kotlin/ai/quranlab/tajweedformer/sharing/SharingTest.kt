@@ -648,7 +648,7 @@ class SharingTest {
             "2026-11-09", "Pixel8", 15, 44_100, "bluetooth"))
         assertEquals("{\"audio\":{\"channels\":1,\"codec\":\"opus\",\"container\":\"ogg\",\"input_route\":\"bluetooth\",\"input_sample_rate\":44100,\"sample_rate\":48000}," +
             "\"consent_version\":\"share-2026-11-09\",\"contributor\":\"00000000000000000000000000000000\",\"contributor_key\":\"K\"," +
-            "\"day\":\"2026-11-09\",\"decode\":{\"backend\":\"exact\",\"model_revision\":\"v4.0+abc\",\"sdk_version\":\"2.0.1\",\"weights_sha256\":\"${"a".repeat(64)}\"}," +
+            "\"day\":\"2026-11-09\",\"decode\":{\"backend\":\"exact\",\"model_revision\":\"v4.0+abc\",\"sdk_version\":\"${ai.quranlab.tajweedformer.TajweedFormer.VERSION}\",\"weights_sha256\":\"${"a".repeat(64)}\"}," +
             "\"device_class\":\"Pixel8\",\"format\":1,\"os_major\":15,\"recovery_hash\":\"${"h".repeat(64)}\"}", j)
         // under the app's own wording: the hash next to the version, in key order
         val custom = String(ShareCapture.sessionJson(null, "exact", null, "custom-df8c4e50965be0005aaca5d6", "0".repeat(32), null, null,

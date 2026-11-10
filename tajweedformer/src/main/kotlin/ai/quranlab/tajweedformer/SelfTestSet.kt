@@ -51,7 +51,12 @@ class SelfTestSet(val clips: List<Clip>, val rules: Map<String, Any?>) {
         val finite: Boolean,
         /** Compute time of each chunk, ms. */
         val chunkMs: List<Double>,
-    )
+        /** The WARM chunks' times (not the clip's first chunk, not the flush); null: [chunkMs] without its first. */
+        val warmChunkMs: List<Double>? = null,
+    ) {
+        /** The chunk times the limits are computed from (warm chunks only). */
+        fun warmMs(): List<Double> = warmChunkMs ?: chunkMs.drop(1)
+    }
 
     /** The pass rule's verdict: [passed], and the first reason it failed (a stable code + detail). */
     data class Verdict(val passed: Boolean, val reason: String, val detail: String, val p90Ms: Double, val medianMs: Double, val cpuMedianMs: Double)
@@ -267,6 +272,7 @@ object SelfTestRunner {
         for (c in set.clips) {
             val samples = SelfTestSet.samples(File(dir, c.file))
             val times = ArrayList<Double>()
+            val warm = ArrayList<Double>()
             val chunks = ArrayList<TajweedHeads>()
             if (abort()) throw ai.quranlab.tajweedformer.accel.StageAborted()
             open().use { s ->
@@ -277,7 +283,12 @@ object SelfTestRunner {
                     val t0 = System.nanoTime()
                     val got = s.pushAudio(samples, at, k)
                     val dt = (System.nanoTime() - t0) / 1e6
-                    for (g in got) times.add(dt / got.size)
+                    // a call that ran the clip's first chunk is cold (the stream's first network call)
+                    val firstCall = chunks.isEmpty()
+                    for (g in got) {
+                        times.add(dt / got.size)
+                        if (!firstCall) warm.add(dt / got.size)
+                    }
                     chunks += got
                     at += k
                 }
@@ -298,7 +309,7 @@ object SelfTestRunner {
             val finite = SelfTest.allFinite(heads)
             out[c.id] = SelfTestSet.ClipObserved(chunks.size, heads.greedy().toList(),
                 r.sites.filter { it.flagged }.map { it.position to it.siteClass.key }.toSet(),
-                r.words.filter { it.flagged }.map { it.word }.toSet(), finite, times)
+                r.words.filter { it.flagged }.map { it.word }.toSet(), finite, times, warm)
         }
         return out
     }

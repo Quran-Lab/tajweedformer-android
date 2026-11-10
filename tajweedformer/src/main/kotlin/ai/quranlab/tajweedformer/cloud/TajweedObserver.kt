@@ -61,6 +61,9 @@ interface TajweedObserver {
      *  (`accelerator_failover`). */
     fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) {}
 
+    /** The CPU confirmed a blank stretch of an accelerator take: `promotions[].blank_confirmed_ok`, nothing else. */
+    fun onBlankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) {}
+
     data class ModelLoad(val revision: String, val context: String, val backend: String, val ms: Double, val cold: Boolean)
 
     data class Download(val revision: String, val profile: String, val bytes: Long, val success: Boolean, val resumed: Boolean)

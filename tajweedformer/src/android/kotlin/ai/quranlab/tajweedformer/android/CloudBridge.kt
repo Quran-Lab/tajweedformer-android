@@ -31,7 +31,8 @@ import android.os.PowerManager
  *   failure, a hang or crash = model_load, thermal, memory, a failover past its deadline = deadline, a failover on
  *   NaN or out-of-range values = non_finite, denylist = other, the rest = npu_unavailable); the NPU's time to ready
  *   is an `onModelLoad` of `npu:<soc>`;
- * - promotions and failovers: one to one (`promotions` telemetry and the incident reports);
+ * - promotions, failovers and blanks the CPU confirmed: one to one (`promotions` telemetry and the incident reports;
+ *   before `QuranLabAndroid.configure` the incidents are kept on the device and sent after it);
  * - session start: the settings in force, the input route, `QuranLabAndroid.sessionOpen(true)`;
  * - every chunk: compute and audio ms, and the tokens' margins and conf-head confidences;
  * - a scored take: per-class sites scored and flagged, madd counts, words scored and flagged, and per rule
@@ -76,6 +77,9 @@ internal class CloudBridge private constructor(private val app: Context) : SdkOb
 
     /** A session switched to the CPU (the `promotions` failovers; an incident report). */
     override fun onFailover(event: AcceleratorFailoverEvent) = cloud.onFailover(event)
+
+    /** A blank stretch the CPU confirmed (`promotions[].blank_confirmed_ok`). */
+    override fun onBlankConfirmed(event: ai.quranlab.tajweedformer.BlankConfirmedEvent) = cloud.onBlankConfirmed(event)
 
     override fun onDownloadFinished(result: DownloadResult) {
         if (result.ok && result.networkBytes == 0L) return
@@ -125,6 +129,8 @@ internal class CloudBridge private constructor(private val app: Context) : SdkOb
             if (installed != null) return
             val b = CloudBridge(context.applicationContext)
             installed = b
+            // accelerator incidents are kept on the device until the app configures Quran Lab (then sent with its key)
+            QuranLabAndroid.keepIncidentsOffline(context)
             SdkEvents.add(b)
             if (Build.VERSION.SDK_INT >= 29) {
                 try {

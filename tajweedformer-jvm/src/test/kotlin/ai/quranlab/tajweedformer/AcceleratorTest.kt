@@ -6,8 +6,15 @@ import ai.quranlab.tajweedformer.accel.AcceleratorKey
 import ai.quranlab.tajweedformer.accel.AcceleratorPreparer
 import ai.quranlab.tajweedformer.accel.AcceleratorState
 import ai.quranlab.tajweedformer.accel.AcceleratorStore
+import ai.quranlab.tajweedformer.accel.ChunkLimits
 import ai.quranlab.tajweedformer.accel.Conditions
+import ai.quranlab.tajweedformer.accel.CpuStandby
+import ai.quranlab.tajweedformer.accel.Demotion
 import ai.quranlab.tajweedformer.accel.Failover
+import ai.quranlab.tajweedformer.cloud.AppIdentity
+import ai.quranlab.tajweedformer.cloud.DeviceProfile
+import ai.quranlab.tajweedformer.cloud.Telemetry
+import ai.quranlab.tajweedformer.cloud.TelemetryContext
 import ai.quranlab.tajweedformer.accel.GoldenRun
 import ai.quranlab.tajweedformer.accel.PreparedAccelerator
 import ai.quranlab.tajweedformer.accel.PromotionRecord
@@ -33,6 +40,7 @@ import java.nio.file.Files
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The promotion state machine and the in-session failover with fakes for the network, the files, the compiler, the
@@ -126,8 +134,11 @@ class AcceleratorTest {
         return TajweedHeads(8, m)
     }
 
-    /** A stream that makes a chunk per 5120 samples with [tok] on even chunks; [fail] injects a failure at its chunk. */
-    private inner class FakeStream(val backendKind: Backend, val tok: Int, val fail: Fail? = null, val hang: CountDownLatch? = null) : TajweedEngineStream {
+    /** A stream that makes a chunk per 5120 samples with [tok] on even chunks; [fail] injects a failure at its chunk;
+     *  [delay] is how long its chunk i takes; [b] (the accelerator's) adds its cold start to the first prediction after
+     *  [Behaviour.cold] was set. */
+    private inner class FakeStream(val backendKind: Backend, val tok: Int, val fail: Fail? = null, val hang: CountDownLatch? = null,
+                                   val delay: (Int) -> Long = { 0L }, val b: Behaviour? = null) : TajweedEngineStream {
         var pending = 0
         var made = 0
         override val backend: Backend get() = backendKind
@@ -142,6 +153,9 @@ class AcceleratorTest {
         }
         private fun next(): TajweedHeads {
             val i = made++
+            b?.let { if (it.cold.getAndSet(false)) Thread.sleep(it.coldMs) }
+            delay(i).takeIf { it > 0 }?.let { Thread.sleep(it) }
+            b?.predictions?.incrementAndGet()
             val f = fail
             if (f != null && i >= f.at && (i == f.at || f.mode == "blank")) {
                 when (f.mode) {
@@ -191,6 +205,13 @@ class AcceleratorTest {
         val hang = CountDownLatch(1).also { latches.add(it) }
         val calls = Collections.synchronizedList(ArrayList<String>())
         var closes = 0
+        /** How long chunk i of every accelerator stream takes (the warm-up's scratch streams too). */
+        var delay: (Int) -> Long = { 0L }
+        /** The accelerator powered down: its next prediction takes [coldMs]. */
+        val cold = java.util.concurrent.atomic.AtomicBoolean(false)
+        var coldMs = 0L
+        val predictions = java.util.concurrent.atomic.AtomicInteger(0)
+        val streams = java.util.concurrent.atomic.AtomicInteger(0)
     }
 
     private inner class FakePreparer(val b: Behaviour = Behaviour(), var unavailable: String? = null) : AcceleratorPreparer {
@@ -205,7 +226,10 @@ class AcceleratorTest {
                 override val planted = setOf(SelfTestSet.PLANTED_CLIP)
                 override fun warmup() { b.calls.add(Stages.WARMUP); b.warmup() }
                 override fun golden(abort: () -> Boolean): GoldenRun { b.calls.add(Stages.GOLDEN); return b.golden(abort) }
-                override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream = FakeStream(Backend.NPU, 31, b.fail, b.hang)
+                override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream {
+                    b.streams.incrementAndGet()
+                    return FakeStream(Backend.NPU, 31, b.fail, b.hang, b.delay, b)
+                }
                 override fun close() { b.closes++ }
             }
         }
@@ -775,24 +799,65 @@ class AcceleratorTest {
             assertEquals(at, f.incident.chunk)
             // the app saw the backend change, no error
             assertEquals("failover_$cause", rec.backendChoice.reason)
-            // demoted for this key: a retryable failover at least 24 h later, and the next session starts on the CPU
-            val d = acc.state.value as AcceleratorState.Disabled
-            assertEquals(Reasons.FAILOVER, d.reason)
-            assertFalse(d.persistent)
-            assertEquals(env.now + 24 * 3_600_000L, d.retryAtMs)
-            assertEquals(Reasons.FAILOVER, record(store)!!.reason)
-            assertTrue(take(rec).first.all { it.backend == Backend.CPU })
-            assertEquals(Reasons.FAILOVER, rec.backendChoice.reason)
-            rec.close()
+            when (mode) {
+                "exception" -> {
+                    // the 2.0.1 rule: a retryable failover at least 24 h later, the next session on the CPU
+                    val d = acc.state.value as AcceleratorState.Disabled
+                    assertEquals(Reasons.FAILOVER, d.reason)
+                    assertFalse(d.persistent)
+                    assertEquals(env.now + 24 * 3_600_000L, d.retryAtMs)
+                    assertEquals(Demotion.RETRY, f.failover.demotion)
+                    assertEquals(PromotionRecord.FAILED, record(store)!!.status)
+                }
+                "nan", "range" -> {
+                    // a numeric fault: off for good for this key
+                    val d = acc.state.value as AcceleratorState.Disabled
+                    assertTrue(tag, d.persistent)
+                    assertEquals(Demotion.OFF, f.failover.demotion)
+                    assertEquals(PromotionRecord.FINAL, record(store)!!.status)
+                    assertEquals(cause, record(store)!!.detail)
+                }
+                "hang" -> {
+                    // one missed limit demotes nothing: still promoted, one session counted
+                    assertTrue(tag, acc.state.value is AcceleratorState.Ready)
+                    assertEquals(Demotion.NONE, f.failover.demotion)
+                    assertEquals(PromotionRecord.PROMOTED, record(store)!!.status)
+                    assertEquals(1, record(store)!!.missSessionsAtMs.size)
+                }
+            }
             if (mode == "hang") {
-                // the hung call is abandoned: the accelerator is closed only after it returns
+                // the abandoned call still holds the accelerator's thread: the next take runs on the CPU, nothing closed
+                assertTrue(take(rec).first.all { it.backend == Backend.CPU })
+                assertEquals(Reasons.BUSY, rec.backendChoice.reason)
                 assertEquals(0, b.closes)
                 b.hang.countDown()
-                val until = System.currentTimeMillis() + 5_000
-                while (b.closes == 0 && System.currentTimeMillis() < until) Thread.sleep(5)
-                assertEquals(1, b.closes)
+                Thread.sleep(100)
+                // it returned: the accelerator serves the next take again
+                assertTrue(tag, take(rec).first.all { it.backend == Backend.NPU })
+            } else {
+                assertTrue(take(rec).first.all { it.backend == Backend.CPU })
+                assertEquals(Reasons.FAILOVER, rec.backendChoice.reason)
             }
+            rec.close()
         }
+    }
+
+    /** A late call is abandoned: the accelerator is closed only after the call returns. */
+    @Test
+    fun aLateCallKeepsTheAcceleratorOpenUntilItReturns() {
+        val (acc, b) = promoted(null)
+        b.delay = { i -> if (i == 3) 400L else 0L }
+        val rec = recognizer(acc)
+        // chunk 3 misses (a single miss: served by the CPU, nothing demoted)
+        take(rec, chunks = 6, amp = 0.1f)
+        assertTrue(acc.state.value is AcceleratorState.Ready)
+        // the controller closed while the late call runs: closed once it returned
+        acc.close()
+        assertEquals(0, b.closes)
+        val until = System.currentTimeMillis() + 5_000
+        while (b.closes == 0 && System.currentTimeMillis() < until) Thread.sleep(5)
+        assertEquals(1, b.closes)
+        rec.close()
     }
 
     /** The failover's replay keeps the accelerator's chunks before the failed one and the CPU's from it, for scoring. */
@@ -811,30 +876,444 @@ class AcceleratorTest {
         rec.close()
     }
 
-    @Test
-    fun blankOutputOverAudioForFourSecondsFailsOverFromTheFirstBlankChunk() {
-        val (acc, _) = promoted(Fail("blank", 2))
-        val rec = recognizer(acc)
-        val s = rec.startSession()
-        val got = runBlocking {
-            val g = async { s.chunks.toList() }
-            repeat(20) { s.append(FloatArray(5120) { if (it % 2 == 0) 0.1f else -0.1f }) }
-            s.finish()
-            g.await()
+    // ------------------------------------------------------------------------------------------------- 2.0.2: blank
+
+    private fun loud(n: Int = 5120) = FloatArray(n) { if (it % 2 == 0) 0.1f else -0.1f }
+
+    /** The CPU standby as the recognizer's slot is: its weights released while the accelerator serves, loaded by a
+     *  stream, released again on request. Its streams write [tok] on even chunks and nothing from chunk [blankFrom]
+     *  (relative to the stream's start); [pushMs] is how long a push takes. */
+    private inner class Standby(val tok: Int = 32, val blankFrom: Int = Int.MAX_VALUE, val pushMs: Long = 0) : CpuStandby {
+        override val chunkMs = 320
+        @Volatile override var warm = false
+        val streams = AtomicInteger(0)
+        val releases = AtomicInteger(0)
+        val threads: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+        override fun createStream(): TajweedEngineStream = createStream(TajweedHead.SCORER_HEADS)
+        override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream {
+            warm = true
+            streams.incrementAndGet()
+            val inner = FakeStream(Backend.CPU, tok, if (blankFrom == Int.MAX_VALUE) null else Fail("blank", blankFrom))
+            return object : TajweedEngineStream by inner {
+                override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+                    threads.add(Thread.currentThread().name)
+                    if (pushMs > 0) Thread.sleep(pushMs)
+                    return inner.pushAudio(samples, offset, length)
+                }
+            }
         }
+        override fun release(): Boolean { releases.incrementAndGet(); warm = false; return true }
+        override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int) =
+            CpuFake().score(heads, config, settings, surah, ayah)
+        override fun expectedTokens(surah: Int, ayah: Int) = intArrayOf(31)
+        override fun close() {}
+    }
+
+    private val blanks = Collections.synchronizedList(ArrayList<BlankConfirmedEvent>())
+    private val blankObserver = object : SdkObserver {
+        override fun onBlankConfirmed(event: BlankConfirmedEvent) { blanks.add(event) }
+    }
+
+    /**
+     * A held vowel or a long madd: the accelerator writes nothing over 4 s of audio with energy and the CPU, checking the
+     * same window off the audio path, writes nothing either. No failover, no demotion, no incident; `blank_confirmed_ok`
+     * counted; the CPU engine closed again; the take never waited for the check; at most one check per 10 s of audio.
+     */
+    @Test
+    fun aBlankStretchTheCpuConfirmsIsNoFailure() {
+        SdkEvents.add(blankObserver)
+        val telemetry = Telemetry(dir())
+        val feed = object : SdkObserver {
+            override fun onBlankConfirmed(event: BlankConfirmedEvent) = telemetry.blankConfirmed(event)
+            override fun onFailover(event: AcceleratorFailoverEvent) = telemetry.failover(event)
+        }
+        SdkEvents.add(feed)
+        try {
+            val store = dir()
+            val (acc, _) = promoted(Fail("blank", 2), store)
+            // the CPU is blank there too (its replay starts at chunk 0: blank from chunk 2), and slow: 250 ms a push
+            val cpu = Standby(blankFrom = 2, pushMs = 250)
+            val e = acc.engineForNextSession(cpu, 16_000)!!
+            val s = e.createStream()
+            val times = ArrayList<Double>()
+            var chunks = 0
+            repeat(60) {
+                val t0 = System.nanoTime()
+                chunks += s.pushAudio(loud(), 0, 5120).size
+                times += (System.nanoTime() - t0) / 1e6
+                // audio arrives over time (here 16 x faster than real time): the first check is done before the second run
+                Thread.sleep(20)
+            }
+            chunks += s.finish().size
+            assertEquals(60, chunks)
+            assertEquals(Backend.NPU, s.backend)
+            assertTrue(failovers.isEmpty())
+            // the check ran on its own thread: no push waited for the CPU's 250 ms
+            assertTrue("the slowest push took ${times.max()} ms", times.max() < 200)
+            assertEquals(setOf("tajweedformer-blank-check"), cpu.threads.toSet())
+            // two checks in 60 chunks (19.2 s): the runs at chunks 1..13 and 40..52; the run at 27..39 came under 10 s after the first
+            val until = System.currentTimeMillis() + 5_000
+            while (blanks.size < 2 && System.currentTimeMillis() < until) Thread.sleep(5)
+            assertEquals(2, blanks.size)
+            assertEquals(listOf(1, 40), blanks.map { it.check.fromChunk })
+            assertTrue(blanks.all { it.check.agreed && it.check.tokenDiffs == 0 })
+            assertEquals("npu:tensor_g5", blanks[0].backend)
+            // the CPU engine opened for each check and closed again after it
+            assertEquals(2, cpu.streams.get())
+            assertEquals(2, cpu.releases.get())
+            assertFalse(cpu.warm)
+            // no demotion: still promoted, nothing recorded against the key
+            assertTrue(acc.state.value is AcceleratorState.Ready)
+            val r = record(store)!!
+            assertEquals(PromotionRecord.PROMOTED, r.status)
+            assertEquals(0, r.blankDisagreements)
+            assertEquals(0L, r.pausedUntilMs)
+            // the telemetry: blank_confirmed_ok 2, no failover, no demotion
+            telemetry.seal(TelemetryContext(AppIdentity("app.test", "1.0"), DeviceProfile("Pixel10", "tensor_g5", 16, "16")))
+            @Suppress("UNCHECKED_CAST")
+            val p = ((Json.parse(telemetry.pendingReports().single().readText()) as Map<String, Any?>)["promotions"] as List<Map<String, Any?>>).single()
+            assertEquals(2.0, p["blank_confirmed_ok"])
+            assertFalse(p.containsKey("failovers"))
+            assertFalse(p.containsKey("demoted"))
+            s.close()
+        } finally {
+            SdkEvents.remove(blankObserver)
+            SdkEvents.remove(feed)
+        }
+    }
+
+    /**
+     * The accelerator writes nothing where the CPU writes tokens: a confirmed disagreement. The take continues on the CPU
+     * stream the check rebuilt, the chunks from the first suspicious one are delivered again (nothing lost), the incident
+     * has cause `blank` and the divergence, the key pauses 6 h (then serves again without a golden test); a second
+     * confirmed disagreement for the key turns it off for good.
+     */
+    @Test
+    fun aBlankTheCpuContradictsSwitchesFromTheFirstSuspiciousChunkAndTwiceIsOffForGood() {
+        val env = FakeEnv()
+        val store = dir()
+        val (acc, b) = promoted(Fail("blank", 2), store, env)
+        val rec = recognizer(acc)
+        fun blankTake(): Pair<List<TajweedChunk>, TajweedHeads> {
+            val s = rec.startSession()
+            return runBlocking {
+                val g = async { s.chunks.toList() }
+                repeat(20) { s.append(loud()) }
+                val h = s.finish()
+                g.await() to h
+            }
+        }
+        val (got, heads) = blankTake()
         val f = failovers.single()
         assertEquals(Failover.BLANK, f.failover.cause)
-        // the fake's odd chunks carry no token: the energetic blank run starts at chunk 1 (and the CPU redoes it from there)
+        // the fake's odd chunks carry no token: the energetic blank run starts at chunk 1, and the CPU takes over from it
         assertEquals(1, f.failover.chunk)
-        assertEquals((0 until 20).toList(), got.map { it.index })
-        // silence never counts as blank output
-        val (acc2, _) = promoted(Fail("blank", 2))
+        assertEquals(Demotion.PAUSED, f.failover.demotion)
+        val div = f.failover.divergence!!
+        assertTrue("${div.tokensDiffer} of ${div.tokensExpected}", div.tokensDiffer > 0 && div.tokensExpected > 0)
+        assertEquals("session:blank", f.incident.code)
+        assertEquals(div, f.incident.divergence)
+        // nothing lost: every chunk index delivered, the redone ones flagged as replacements from chunk 1, from the CPU
+        assertEquals((0 until 20).toSet(), got.map { it.index }.toSet())
+        val redo = got.indexOfFirst { it.replaces }
+        assertTrue(redo > 0)
+        assertEquals(1, got[redo].index)
+        assertTrue(got.drop(redo).all { it.backend == Backend.CPU })
+        assertEquals((1 until 20).toList(), got.drop(redo).map { it.index })
+        // the take's heads: the accelerator's chunk 0 (token 31), then the CPU's tokens (32 on even chunks 2..18)
+        assertEquals(listOf(31) + List(9) { 32 }, heads.greedy().toList())
+        assertEquals(160, heads.n40)
+        // a transient demotion: 6 h, not off; the build stays verified
+        val d = acc.state.value as AcceleratorState.Disabled
+        assertFalse(d.persistent)
+        assertEquals(env.now + 6 * 3_600_000L, d.retryAtMs)
+        val r = record(store)!!
+        assertEquals(PromotionRecord.PROMOTED, r.status)
+        assertEquals(1, r.blankDisagreements)
+        assertTrue(take(rec).first.all { it.backend == Backend.CPU })
+        // after the pause: loaded and warmed again, no golden test
+        b.calls.clear()
+        env.now += 6 * 3_600_000L
+        env.runDue()
+        assertEquals(listOf(Stages.COMPILE, Stages.WARMUP), b.calls.toList())
+        assertTrue(acc.state.value is AcceleratorState.Ready)
+        assertEquals(0L, record(store)!!.pausedUntilMs)
+        // the second confirmed disagreement for the key: off for good
         failovers.clear()
-        val rec2 = recognizer(acc2)
-        val (quiet, _, _) = take(rec2, chunks = 20)
+        blankTake()
+        assertEquals(Demotion.OFF, failovers.single().failover.demotion)
+        assertTrue((acc.state.value as AcceleratorState.Disabled).persistent)
+        assertEquals(PromotionRecord.FINAL, record(store)!!.status)
+        assertEquals(2, record(store)!!.blankDisagreements)
+        rec.close()
+    }
+
+    @Test
+    fun silenceIsNeverBlankOutput() {
+        val (acc, _) = promoted(Fail("blank", 2))
+        val rec = recognizer(acc)
+        val (quiet, _, _) = take(rec, chunks = 20)
         assertTrue(quiet.all { it.backend == Backend.NPU })
         assertTrue(failovers.isEmpty())
         rec.close()
-        rec2.close()
+    }
+
+    // ------------------------------------------------------------------------------------------------- 2.0.2: limits
+
+    /** The golden run measures 10 ms a warm chunk: warm limit max(4 x 10, 2 x 10, 50) = 50 ms, first chunk 1000 ms. */
+    @Test
+    fun aColdFirstChunkWithinTheFirstChunkLimitIsServedByTheAccelerator() {
+        val store = dir()
+        val (acc, b) = promoted(null, store)
+        assertEquals(50.0, acc.deadlineMs, 0.0)
+        assertEquals(1000.0, acc.firstChunkMs, 0.0)
+        // every stream's first chunk takes 150 ms: 3 x the warm limit
+        b.delay = { i -> if (i == 0) 150L else 0L }
+        val rec = recognizer(acc)
+        val (chunks, _, _) = take(rec, chunks = 5, amp = 0.1f)
+        assertTrue(chunks.all { it.backend == Backend.NPU })
+        assertTrue(failovers.isEmpty())
+        assertTrue(record(store)!!.missSessionsAtMs.isEmpty())
+        rec.close()
+    }
+
+    @Test
+    fun aFirstChunkPastTheFirstChunkLimitIsServedByTheCpuWithoutADemotion() {
+        val store = dir()
+        val (acc, b) = promoted(null, store)
+        b.delay = { i -> if (i == 0) 1200L else 0L }
+        val rec = recognizer(acc)
+        val (chunks, _, _) = take(rec, chunks = 5, amp = 0.1f)
+        assertTrue(chunks.all { it.backend == Backend.CPU })
+        val f = failovers.single().failover
+        assertEquals(Failover.DEADLINE, f.cause)
+        assertEquals(0, f.chunk)
+        assertEquals(1000.0, f.deadlineMs, 0.0)
+        assertEquals(Demotion.NONE, f.demotion)
+        assertTrue(acc.state.value is AcceleratorState.Ready)
+        assertEquals(PromotionRecord.PROMOTED, record(store)!!.status)
+        assertEquals(1, record(store)!!.missSessionsAtMs.size)
+        rec.close()
+    }
+
+    /** One miss per session: three sessions within 24 h pause the key 6 h (never off for good); two, or three spread
+     *  over more than 24 h, demote nothing. */
+    @Test
+    fun missesInThreeSessionsWithinADayPauseTheKeyNeverOffForGood() {
+        fun missingTake(rec: TajweedRecognizer) {
+            failovers.clear()
+            val (chunks, _, _) = take(rec, chunks = 6, amp = 0.1f)
+            assertEquals(Failover.DEADLINE, failovers.single().failover.cause)
+            assertTrue(chunks.drop(3).all { it.backend == Backend.CPU })
+            // the late call returns before the next session starts
+            Thread.sleep(250)
+        }
+        // two sessions: nothing
+        run {
+            val env = FakeEnv()
+            val (acc, b) = promoted(null, dir(), env)
+            b.delay = { i -> if (i == 3) 150L else 0L }
+            val rec = recognizer(acc)
+            missingTake(rec)
+            env.now += 3_600_000L
+            missingTake(rec)
+            assertTrue(acc.state.value is AcceleratorState.Ready)
+            assertEquals(Demotion.NONE, failovers.single().failover.demotion)
+            rec.close()
+        }
+        // three over more than 24 h: nothing
+        run {
+            val env = FakeEnv()
+            val store = dir()
+            val (acc, b) = promoted(null, store, env)
+            b.delay = { i -> if (i == 3) 150L else 0L }
+            val rec = recognizer(acc)
+            missingTake(rec)
+            env.now += 13 * 3_600_000L
+            missingTake(rec)
+            env.now += 12 * 3_600_000L
+            missingTake(rec)
+            assertTrue(acc.state.value is AcceleratorState.Ready)
+            assertEquals(Demotion.NONE, failovers.single().failover.demotion)
+            assertEquals(2, record(store)!!.missSessionsAtMs.size)
+            rec.close()
+        }
+        // three within 24 h: paused 6 h, then the same build again; round after round never turns it off
+        run {
+            val env = FakeEnv()
+            val store = dir()
+            val (acc, b) = promoted(null, store, env)
+            b.delay = { i -> if (i == 3) 150L else 0L }
+            val rec = recognizer(acc)
+            repeat(4) { round ->
+                missingTake(rec)
+                env.now += 3_600_000L
+                missingTake(rec)
+                env.now += 3_600_000L
+                missingTake(rec)
+                assertEquals(Demotion.PAUSED, failovers.single().failover.demotion)
+                val d = acc.state.value as AcceleratorState.Disabled
+                assertFalse("round $round", d.persistent)
+                assertEquals(env.now + 6 * 3_600_000L, d.retryAtMs)
+                assertTrue(take(rec).first.all { it.backend == Backend.CPU })
+                b.calls.clear()
+                env.now += 6 * 3_600_000L
+                env.runDue()
+                assertEquals(listOf(Stages.COMPILE, Stages.WARMUP), b.calls.toList())
+                assertTrue(acc.state.value is AcceleratorState.Ready)
+            }
+            assertEquals(PromotionRecord.PROMOTED, record(store)!!.status)
+            rec.close()
+        }
+    }
+
+    private fun obsTimes(ms: List<Double>) = clips.associateWith {
+        SelfTestSet.ClipObserved(4, listOf(3, 32, 13), expected.clips.getValue(it).flaggedSites, expected.clips.getValue(it).flaggedWords, true, ms)
+    }
+
+    /** The limits come from warm chunks only: neither the golden run's first chunks nor a slow first chunk of a take
+     *  raise the later limit. */
+    @Test
+    fun theLimitsComeFromWarmChunksOnly() {
+        // the golden run's first chunk of every clip took 500 ms, the others 10 ms: warm limit 50 ms, not 300
+        val env = FakeEnv()
+        val p = FakePreparer().also { it.b.golden = { GoldenRun(obsTimes(listOf(500.0, 10.0, 10.0, 10.0)), obsTimes(listOf(900.0, 40.0, 40.0, 40.0))) } }
+        val acc = controller(env, p, dir())
+        acc.start()
+        env.runDue()
+        assertEquals(50.0, acc.deadlineMs, 0.0)
+        assertEquals(1000.0, acc.firstChunkMs, 0.0)
+        assertEquals(4.0, (acc.state.value as AcceleratorState.Ready).speedup, 1e-9)
+        // takes whose first chunk takes 400 ms (within its limit): only the warm chunks are measured
+        p.b.delay = { i -> if (i == 0) 400L else 0L }
+        val rec = recognizer(acc)
+        repeat(2) { take(rec, chunks = 10, amp = 0.1f) }
+        assertTrue(failovers.isEmpty())
+        // 2 takes x 9 warm chunks (the first of each and the flush never counted)
+        assertEquals(18, acc.chunkLimits.samples)
+        assertTrue("p90 ${acc.chunkLimits.stats().second}", acc.chunkLimits.stats().second < 100)
+        assertEquals(50.0, acc.deadlineMs, 0.0)
+        rec.close()
+        // the limits themselves
+        val l = ChunkLimits(Double.NaN, Double.NaN)
+        assertEquals(300.0, l.warmMs, 0.0)
+        assertEquals(1000.0, l.firstChunkMs, 0.0)
+        repeat(20) { l.add(30.0) }
+        assertEquals(120.0, l.warmMs, 0.0)
+        assertEquals(1000.0, l.firstChunkMs, 0.0)
+        repeat(256) { l.add(150.0) }
+        assertEquals(300.0, l.warmMs, 0.0)
+        assertEquals(1500.0, l.firstChunkMs, 0.0)
+    }
+
+    /**
+     * The warm-up: one prediction of silence on the accelerator's thread when a take starts and when the app becomes
+     * active; it does not delay the session start or the first chunk (which needs a chunk of audio first), and it
+     * absorbs the accelerator's cold start (the first prediction after idle, here 600 ms).
+     */
+    @Test
+    fun theWarmUpRunsAtTakeStartAndOnActivationOffTheAudioPath() {
+        val (acc, b) = promoted(null)
+        val rec = recognizer(acc)
+        b.coldMs = 600
+        b.cold.set(true)
+        val before = b.predictions.get()
+        val t0 = System.nanoTime()
+        val s = rec.startSession()
+        val startMs = (System.nanoTime() - t0) / 1e6
+        assertTrue("session start $startMs ms", startMs < 100)
+        val got = runBlocking {
+            val g = async { s.chunks.toList() }
+            // the first chunk's audio takes 320 ms to arrive; the warm-up wakes the accelerator meanwhile (600 ms)
+            Thread.sleep(700)
+            assertEquals("the warm-up ran before any audio", before + 1, b.predictions.get())
+            val c0 = System.nanoTime()
+            s.append(loud())
+            val firstMs = (System.nanoTime() - c0) / 1e6
+            assertTrue("the first chunk took $firstMs ms", firstMs < 100)
+            repeat(3) { s.append(loud()) }
+            s.finish()
+            g.await()
+        }
+        assertTrue(got.all { it.backend == Backend.NPU })
+        assertTrue(failovers.isEmpty())
+        // the app comes back from the background during a take: a warm-up, and the next chunk gets the first-chunk limit
+        val s2 = rec.startSession()
+        runBlocking {
+            val g = async { s2.chunks.toList() }
+            repeat(2) { s2.append(loud()) }
+            b.cold.set(true)
+            b.coldMs = 300
+            val n = b.predictions.get()
+            acc.appActivated()
+            // the warm-up runs on the accelerator's thread; the next chunk waits behind it, under the first-chunk limit
+            s2.append(loud())
+            assertTrue(b.predictions.get() >= n + 2)
+            repeat(2) { s2.append(loud()) }
+            s2.finish()
+            assertTrue(g.await().all { it.backend == Backend.NPU })
+        }
+        assertTrue("a 300 ms wake-up after activation is no miss", failovers.isEmpty())
+        rec.close()
+    }
+
+    // ------------------------------------------------------------------------------------------------- 2.0.2: upgrade
+
+    /**
+     * The first launch of 2.0.2 over 2.0.1's records: a key demoted for blank output and one off for good after 4
+     * deadline failovers go back to the golden stage (tested again in the background, then promoted); one off for good
+     * for NaN stays off. It runs once: a record written afterwards is left alone.
+     */
+    @Test
+    fun theUpgradeFrom201ClearsBlankAndDeadlineDemotionsOnce() {
+        val store = dir()
+        val now = 1_000_000_000L
+        val blank = key(rev = "r-blank")
+        val deadline = key(rev = "r-deadline")
+        val nan = key(rev = "r-nan")
+        fun rec(status: String, failures: Int, reason: String, detail: String) = PromotionRecord(status = status,
+            attempt = failures, failures = failures, reason = reason, failedStage = "session", detail = detail, nextAttemptAtMs = now + 86_400_000L,
+            launch = "old", accMedianMs = 10.0, accP90Ms = 12.0, cpuMedianMs = 40.0)
+        val old = linkedMapOf(
+            blank.id to rec(PromotionRecord.FAILED, 1, Reasons.FAILOVER, Failover.BLANK),
+            deadline.id to rec(PromotionRecord.FINAL, 4, Reasons.FAILOVER, Failover.DEADLINE).copy(nextAttemptAtMs = 0),
+            nan.id to rec(PromotionRecord.FINAL, 4, Reasons.FAILOVER, Failover.NON_FINITE).copy(nextAttemptAtMs = 0),
+        )
+        // the 2.0.1 file: no upgrades mark
+        File(store, "accelerator.json").writeText(Json.write(linkedMapOf("format" to AcceleratorStore.FORMAT, "install" to mapOf("session_started" to true),
+            "keys" to old.mapValues { it.value.toJson() })))
+        val s = AcceleratorStore(store)
+        for (k in listOf(blank, deadline)) {
+            val r = s.record(k)!!
+            assertEquals(PromotionRecord.PENDING, r.status)
+            assertEquals(Stages.WARMUP, r.stage)
+            assertEquals(0, r.failures)
+            assertEquals("", r.reason)
+        }
+        assertEquals(PromotionRecord.FINAL, s.record(nan)!!.status)
+        assertEquals(Failover.NON_FINITE, s.record(nan)!!.detail)
+        // the cleared keys run the golden test again in the background, then promote as usual
+        for (k in listOf(blank, deadline)) {
+            promotions.clear()
+            val env = FakeEnv()
+            val p = FakePreparer()
+            val acc = AcceleratorController(env, AcceleratorStore(store), p, k, fast, "new")
+            acc.start()
+            assertEquals(AcceleratorState.Preparing(Stages.GOLDEN), acc.state.value)
+            env.runDue()
+            assertEquals(listOf(Stages.COMPILE, Stages.WARMUP, Stages.GOLDEN), p.b.calls.toList())
+            assertTrue(acc.state.value is AcceleratorState.Ready)
+            assertTrue(promotions.single().promoted)
+            acc.close()
+        }
+        val off = AcceleratorController(FakeEnv(), AcceleratorStore(store), FakePreparer(), nan, fast, "new").also { it.start() }
+        assertTrue((off.state.value as AcceleratorState.Disabled).persistent)
+        // once: a 2.0.2 record of the same kind stays as it is
+        AcceleratorStore(store).put(blank, rec(PromotionRecord.FINAL, 2, Reasons.FAILOVER, Failover.BLANK))
+        assertEquals(PromotionRecord.FINAL, AcceleratorStore(store).record(blank)!!.status)
+        // a fresh install's file carries the mark from its first write
+        val fresh = dir()
+        AcceleratorStore(fresh).put(blank, rec(PromotionRecord.FAILED, 1, Reasons.FAILOVER, Failover.BLANK))
+        assertEquals(PromotionRecord.FAILED, AcceleratorStore(fresh).record(blank)!!.status)
     }
 }

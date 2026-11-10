@@ -33,7 +33,9 @@ import java.util.concurrent.TimeUnit
  * - scheduling: work with no delay and no network need runs at once on a low-priority thread; a delayed or
  *   unmetered-only run goes through WorkManager (with that delay, and `NetworkType.UNMETERED` when asked).
  * - incident reports: `Build.MODEL` (a model code, never a name), `<release>/<Build.ID>/<incremental>`, the dispatch
- *   library of the SoC.
+ *   library of the SoC;
+ * - the app becoming active ([onAppActive]): the process's first started activity (a rotation is not one), so the
+ *   accelerator is warmed up before the first chunk after the app sat in the background.
  */
 class AndroidAccelerator internal constructor(
     context: Context,
@@ -49,6 +51,43 @@ class AndroidAccelerator internal constructor(
 
     init {
         app.registerComponentCallbacks(this)
+    }
+
+    private val activeListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    override fun onAppActive(listener: () -> Unit) { activeListeners.add(listener) }
+
+    /** The foreground as ProcessLifecycleOwner sees it, without its dependency: the first activity started; a
+     *  configuration change (a rotation) is not a new activation. */
+    private val Activity = object : android.app.Application.ActivityLifecycleCallbacks {
+        private var started = 0
+        private var changing = false
+
+        override fun onActivityStarted(a: android.app.Activity) {
+            val first = synchronized(this) { started++ == 0 }
+            if (!first) return
+            val reopened = !changing
+            changing = false
+            if (reopened) for (l in activeListeners) try { l() } catch (_: Exception) {}
+        }
+
+        override fun onActivityStopped(a: android.app.Activity) {
+            val last = synchronized(this) { --started <= 0 }
+            if (last) {
+                started = 0
+                changing = a.isChangingConfigurations
+            }
+        }
+
+        override fun onActivityCreated(a: android.app.Activity, b: android.os.Bundle?) {}
+        override fun onActivityResumed(a: android.app.Activity) {}
+        override fun onActivityPaused(a: android.app.Activity) {}
+        override fun onActivitySaveInstanceState(a: android.app.Activity, b: android.os.Bundle) {}
+        override fun onActivityDestroyed(a: android.app.Activity) {}
+    }
+
+    init {
+        try { (app as? android.app.Application)?.registerActivityLifecycleCallbacks(Activity) } catch (_: Exception) {}
     }
 
     override val osBuild: String = Build.FINGERPRINT ?: "${Build.ID} ${Build.VERSION.INCREMENTAL}"

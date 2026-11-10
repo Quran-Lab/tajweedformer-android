@@ -162,6 +162,12 @@ class TajweedChunk(
     val backend: Backend = Backend.CPU,
     /** Its first 40 ms frame within the take (its audio starts at `firstFrame * 40` ms). */
     val firstFrame: Int = 0,
+    /**
+     * It replaces the chunk of the same [index] delivered before, and so do the chunks after it (the accelerator wrote
+     * nothing over audio and the CPU, checking it, wrote tokens there: the take continues on the CPU from that chunk).
+     * Drop what you drew from [index] on and draw these instead. Rare; false for every other chunk.
+     */
+    val replaces: Boolean = false,
 ) {
     /** The chunk's decoded layer (top-1, runner-up, margin per CTC frame, and [topK] ranked entries per
      *  head), timed within the take. */
