@@ -23,6 +23,8 @@ jobs:
         run: ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
       - name: Compile the Android library's Kotlin
         run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin
+      - name: Compile the README's quick start (samples/quickstart; QuickStartDocTest above keeps the README equal to it)
+        run: ./gradlew --no-daemon :samples:quickstart:compileDebugKotlin
 
   engine:
     name: Engine through JNI, and the AAR

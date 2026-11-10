@@ -8,12 +8,12 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 <tr>
 <td width="33%" valign="top">
 
-**Hears every word**<br>Streaming recognition of Quranic recitation while the learner recites. Results arrive as often as every 160 ms on the CPU engine (320 ms by default, including on the NPU; 480 ms for longer context).
+**Hears the recitation**<br>Streaming recognition of Quranic recitation: audio in, and what the model heard comes out as often as every 160 ms on the CPU engine (320 ms by default, including on the NPU; 480 ms for longer context).
 
 </td>
 <td width="33%" valign="top">
 
-**Points to the word to fix**<br>Wrong letters and vowels, madd held too short or too long, and a score for every word. Qalqalah checks are experimental.
+**Every output of the model**<br>The sounds it heard with confidence and timing, and every head of the network per chunk (lengthening, gemination, ghunna, qalqalah and more): yours to build on.
 
 </td>
 <td width="33%" valign="top">
@@ -30,25 +30,25 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the right model for each device (about 57 MB) from our CDN in six regions, verifies it and keeps it up to date.
+**Nothing to host**<br>The SDK downloads the right model for each device (56.5 MB) from our CDN in six regions, verifies it and keeps it up to date.
 
 </td>
 <td valign="top">
 
-**Tuned in the portal**<br>Four presets and three word levels. Change them at any time; your app picks them up without a new build.
+**Tajweed scoring in SDK 2.x**<br>For a known ayah, SDK 2.x also scores the take: letters and vowels, madd held too short or too long, a score for every word. Qalqalah checks are experimental.
 
 </td>
 </tr>
 </table>
 
-### Strict or gentle: you choose
+### Tajweed scoring in SDK 2.x
 
-**Strict** almost never flags a correct recitation. **Balanced** is the default. **Sensitive** catches more, and **Very sensitive** catches the most, for a teacher who reviews every flag first. The word level follows your learners: **strict** for huffaz and advanced students, **general** for most apps, **beginner** for children and classes.
+Scoring has four presets. **Strict** almost never flags a correct recitation. **Balanced** is the default. **Sensitive** catches more, and **Very sensitive** catches the most, for a teacher who reviews every flag first. The word level follows your learners: **strict** for huffaz and advanced students, **general** for most apps, **beginner** for children and classes. You set them in the portal and your app picks them up without a new build. Scoring is part of SDK 2.x; SDK 3.0 is inference only, so build new judging on the model's output.
 
 ## Why TajweedFormer
 
-- **Made for the Quran.** Your app names the ayah; TajweedFormer checks the recitation against it, sound by sound, and gives every word its own verdict.
-- **Feedback in the moment.** Results stream while the learner recites, so your app can respond on the word itself, not after the take.
+- **Made for the Quran.** Trained on Quranic recitation, with its own sound units and heads for what tajweed is about.
+- **Feedback in the moment.** Output streams while the learner recites, so your app can respond on the word itself, not after the take.
 - **One engine on every platform.** The same engine runs the [Android](https://github.com/Quran-Lab/tajweedformer-android), [iOS and macOS](https://github.com/Quran-Lab/tajweedformer-apple), [web](https://github.com/Quran-Lab/tajweedformer-web) and [Windows and Linux](https://github.com/Quran-Lab/tajweedformer-c) SDKs, all set from one portal.
 - **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, asks three things: no paywall on model features, no results presented as rulings, and show the notice.
 
@@ -58,13 +58,15 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 
 ## At a glance
 
-- **What it is:** the Kotlin SDK 2.0.1 for the Quran Lab TajweedFormer engine (Maven
-  `ai.quranlab:tajweedformer`, package `ai.quranlab.tajweedformer`): a JNI bridge over
+- **What it is:** the Kotlin SDK for the Quran Lab TajweedFormer engine (Maven
+  `ai.quranlab:tajweedformer`, package `ai.quranlab.tajweedformer`): audio in, the model's output out,
+  through a JNI bridge over
   [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) (pinned as the `engine/`
   submodule) and an API that mirrors the Swift SDK. For the V4 model (`sdk/v4.0`): signed model
   folders downloaded by profile, a `TajweedRecognizer` that streams every head of the network on the
-  CPU (or the NPU), the decoded transcript with confidences, and tajweed verdicts per site and per
-  word under calibrated presets that the app and the portal can tune. V4 only; v3.2 stays on 1.x.
+  CPU (or the NPU), and the decoded transcript with confidences. In SDK 2.x also tajweed verdicts per
+  site and per word for a known ayah, under calibrated presets that the app and the portal can tune.
+  V4 only; v3.2 stays on 1.x.
 - **Who it is for:** Android apps (AAR, minSdk 26, arm64-v8a and armeabi-v7a); the same Kotlin
   sources also run on the desktop JVM.
 - **Status:** preview. V4 streams through the exact engine (tajweedformer-engine b6436d7,
@@ -82,54 +84,117 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+ | SwiftPM, product `TajweedFormer` |
-| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node | npm `@quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake (`add_subdirectory`) |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:2.0.1` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.2"`, product `TajweedFormer` |
+| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | Build tag 2.0.2 with CMake |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, tajweed scorer, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
-`cdn.quranlab.ai/models` to approved app keys (request access at
-[portal.quranlab.ai/access](https://portal.quranlab.ai/access)). SDK 2.0.0 runs V4 only.
-Every release's binaries (the AAR and POM, the XCFramework zips, the npm package, the native archives) are
-also on `https://cdn.quranlab.ai/sdk/<product>/<version>/`, with a `SHA256SUMS` file, served from six regions.
+`cdn.quranlab.ai/models` to app keys from [portal.quranlab.ai](https://portal.quranlab.ai).
+SDK 2.x runs V4 only.
 [portal.quranlab.ai](https://portal.quranlab.ai) is where you create an app, get its developer key,
-choose which model revision your users get, and set the tajweed checks (presets, per-class
-thresholds) your users see, without shipping a new build.
+choose which model revision your users get, and, for SDK 2.x scoring, set the tajweed checks (presets,
+per-class thresholds) your users see, without shipping a new build.
+
+## Install
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+
+// app/build.gradle.kts
+dependencies { implementation("ai.quranlab:tajweedformer:2.0.1") }
+```
+
+Maven Central serves 2.0.1 today. 2.0.2 is tagged in this repository and follows there; the quick start below is the same for both.
+
+## Before you start
+
+| | |
+| - | - |
+| **Key** | An Android key from [portal.quranlab.ai](https://portal.quranlab.ai), for your app's package name. |
+| **Devices** | Android 8.0 (API 26) and later, on `arm64-v8a` and `armeabi-v7a`. There is no x86_64 library: run it on a phone or an ARM emulator image, not on an x86_64 emulator. |
+| **Permissions** | `RECORD_AUDIO`: declare it in your manifest and ask for it at run time (the quick start does both). The SDK's own manifest brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
+| **Download** | The first run downloads the model: 56.5 MB, once (73.5 MB on disk), on any network. A phone with a supported NPU fetches its build later, on an unmetered network only. |
+| **Sharing** | Recognition needs nothing more. If your app offers recording sharing, uploads need Play Integrity: add `com.google.android.play:integrity` and pass Quran Lab's project number in `CloudOptions`. |
+| **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
+| **Takes** | A recognizer runs one take at a time. |
 
 ## Quick start
 
-```sh
-git clone --recurse-submodules https://github.com/Quran-Lab/tajweedformer-android
-cd tajweedformer-android
-./gradlew :tajweedformer:assembleRelease     # tajweedformer/build/outputs/aar/tajweedformer-release.aar
-```
-
-Depend on `ai.quranlab:tajweedformer:2.0.1` (the AAR, or the `:tajweedformer` project).
-
-### Ten lines
+From your key to what the model hears from the microphone, as one screen. The manifest needs
+`<uses-permission android:name="android.permission.RECORD_AUDIO" />`.
 
 ```kotlin
-import ai.quranlab.tajweedformer.*
+import ai.quranlab.tajweedformer.TajweedHeads
+import ai.quranlab.tajweedformer.TajweedRecognizer
+import ai.quranlab.tajweedformer.android.Microphone
 import ai.quranlab.tajweedformer.android.TajweedFormerAndroid
+import ai.quranlab.tajweedformer.cloud.CloudOptions
+import ai.quranlab.tajweedformer.cloud.android.QuranLabAndroid
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.widget.TextView
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
-val tf = TajweedFormerAndroid.client(context, headers = { mapOf("x-qlab-key" to BuildConfig.QLAB_KEY) })
-val tj = tf.recognizer(TajweedRecognizer.Options(word = WordOption.level(WordLevel.GENERAL)))  // 56.5 MB once, self-test, CPU or NPU
-tj.remoteConfig = portalConfig.tajweedJson                  // optional: the portal's tajweed block
-val session = tj.startSession()
-launch { session.chunks.collect { c -> draw(c.heads, c.decode(tj.model.vocabulary)) } }  // raw + decoded, per 320 ms
-session.append(samples)                                     // 16 kHz mono float, as it arrives
-val result = session.finishAndScore(surah = 1, ayah = 2)    // tajweed layer: sites, madd, words
-result.flaggedWords.forEach { w -> show(w.word, w.score, w.best?.expected, w.best?.alternative) }
+class QuickStartActivity : Activity() {
+    private val scope = MainScope()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val heard = TextView(this).also { setContentView(it) }
+        QuranLabAndroid.configure(this, CloudOptions(key = "qlk_v1_..."))   // your key from portal.quranlab.ai
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            return
+        }
+        scope.launch {
+            // the first run downloads and verifies the model; the microphone and the recognizer both run at 48 kHz
+            val recognizer = TajweedFormerAndroid.client(this@QuickStartActivity)
+                .recognizer(TajweedRecognizer.Options(sampleRate = 48_000))
+            val take = recognizer.startSession()
+            val chunks = mutableListOf<TajweedHeads>()
+            launch {   // every 320 ms: what the model heard so far
+                take.chunks.collect { chunk ->
+                    if (chunk.index < chunks.size) chunks.subList(chunk.index, chunks.size).clear()   // a chunk sent again
+                    chunks += chunk.heads
+                    heard.text = recognizer.decode(TajweedHeads.concat(chunks)).text
+                }
+            }
+            Microphone.samples(48_000).collect { samples -> take.append(samples) }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) recreate()
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+}
 ```
 
-`tf.recognizer()` downloads the CPU profile on the first call (any network), verifies it, runs the
-CPU self-test, and serves on the exact CPU engine. The NPU is promoted in the background after the first
-session (download on an unmetered network, load, warm-up, the golden test against the CPU engine) and used
-from the next session once it is ready and warm ("CPU first, then the accelerator" below).
-`tj.backendChoice` says which backend runs and why.
+This is the app in [`samples/quickstart`](samples/quickstart), which CI compiles. `tf.recognizer()` downloads the
+CPU profile on the first call (any network), verifies it, runs the CPU self-test, and serves on the exact CPU
+engine; the NPU is promoted in the background after the first session and used from the next one once it is ready
+and warm ("CPU first, then the accelerator" below). `recognizer.decode(...)` is what the model heard: each token
+with its confidence, runner-up and times; each chunk carries every head of the network you selected. To end the
+take, stop collecting the microphone and call `take.finish()`.
 
-### The three layers (one concept set with the Swift, web and native SDKs)
+In SDK 2.x a take of a known ayah can also be scored: `take.finishAndScore(surah = 1, ayah = 2)` gives verdicts per
+site and per word. In a real app call `QuranLabAndroid.configure` once, in `Application.onCreate`.
+
+## The three layers
+
+One concept set with the Swift, web and native SDKs.
 
 - **Raw** (`TajweedChunk.heads`, `TajweedHeads`): every head per chunk as float arrays,
   `[frames, width]` row major, each typed (`TajweedHead.frameMs` 40 or 20, `width`, `kind`
@@ -149,7 +214,7 @@ from the next session once it is ready and warm ("CPU first, then the accelerato
   is used only without a block, and a site-based approximation only with an engine before API 3.
   Precedence everywhere: app code > portal > calibration.
 
-### Observing the SDK
+## Observing the SDK
 
 `TajweedFormer.events.add(observer)` with an `SdkObserver`: session start and end (audio seconds,
 compute seconds, RTF, chunks, backend), the audio exactly as pushed (`onAudio`, for opt-in recording
@@ -162,21 +227,21 @@ sends to Quran Lab is described in [docs/platform-client.md](docs/platform-clien
 
 ```mermaid
 flowchart LR
-  hf[("cdn.quranlab.ai/models<br/>zipformer_p-arabic-v3")] -- model files --> assets["App assets<br/>or a directory"]
-  cdn[("cdn.quranlab.ai")] -. not yet .-> assets
+  portal[("portal.quranlab.ai<br/>signed config")] -- model revision --> store["ModelStore<br/>verified, in app storage"]
+  cdn[("cdn.quranlab.ai/models<br/>tajweedformer-v4")] -- this device's profile --> store
   mic(["Audio, 8 to 48 kHz"]) --> kotlin["tajweedformer-android<br/>Kotlin API"]
-  assets --> kotlin
+  store --> kotlin
   kotlin -- JNI --> engine["tajweedformer-engine<br/>exact C engine"]
-  engine --> out(["Phonemes as<br/>a Flow of events"])
+  engine --> out(["Every head per chunk<br/>as a Flow"])
   classDef here fill:#2a3b8f,stroke:#2a3b8f,color:#ffffff
   class kotlin here
 ```
 
 Each recognizer owns one thread; every engine call it makes runs there, in order. Audio goes to the
-engine unchanged through `native/zf_jni.c`, and the engine resamples, computes the fbank, runs the
-model one 480 ms chunk at a time and decodes the phonemes. The model download and update services
-of the Swift SDK (CDN, signed manifests, staged rollouts from `portal.quranlab.ai`) are not in the
-Android SDK yet; apps ship the model files themselves.
+engine unchanged through `native/tj_jni.c`, and the engine resamples, computes the fbank and runs the
+model one chunk at a time (320 ms by default). The model comes from Quran Lab's CDN: `ModelStore` downloads
+this device's profile of the signed folder, verifies every file and keeps it up to date ("Model download and
+verification" below).
 
 <!-- exactness:begin -->
 ## Exactness
@@ -250,11 +315,11 @@ context); nothing in the SDK assumes a fixed set.
 3, Ed25519 over the same text as every 2.0.0 SDK and the publisher's `make_manifest3.py`, checked
 against Quran Lab's key) and downloads only the profile in use: the android CPU profile (shared
 weights, front end, tokens, calibration, expected table, and the chosen context's graph, data and
-frames: 56.5 MB of gzip for c16_l64, about 0.9 MB more per extra context), and for the NPU only the
+frames: 56.5 MB of gzip for c16_l64, 0.65 to 0.86 MB more per extra context), and for the NPU only the
 files of this SoC and context (model, I/O contract, mask table; a chained build such as the Exynos
 2500's has its parts, role `npu-part`, in place of the one model). NPU builds ship at c16_l64 only;
-`c8_l64` (160 ms chunks, 64 left frames) has none, runs on the exact CPU engine and ships in the next V4.0
-revision (about 0.65 MB more). Downloads resume with HTTP Range into `<path>.part` (If-Range
+`c8_l64` (160 ms chunks, 64 left frames) has none and runs on the exact CPU engine
+(0.65 MB more). Downloads resume with HTTP Range into `<path>.part` (If-Range
 with the server's ETag); the stored bytes' size and SHA-256 are checked, gzip files are inflated and
 the decoded file's size and SHA-256 checked, then moved into place atomically; any mismatch deletes
 both. The app key and other headers come from a `HeaderProvider`; an `HttpTransport` replaces
@@ -589,13 +654,17 @@ engine/                     tajweedformer-engine, pinned
 
 ## Status and roadmap
 
-Done (2.0.1, unreleased): recitation sharing decided by Quran Lab's signed config, with the SDK's
+Done in 2.0.2: silence and a cold start on the NPU are no longer faults by themselves (a blank stretch is
+checked against the CPU engine in the background; chunks can be delivered again with `replaces`); incident
+reports are kept while the app is offline or not configured.
+
+Done in 2.0.1: recitation sharing decided by Quran Lab's signed config, with the SDK's
 sheet (themed or not), the app's own UI or the app's own wording; the adaptive Opus bitrate; copy deck
 2026-11-09.1; telemetry deltas with the new counters; registration once a day; CPU first, then a verified,
 persisted promotion to the NPU (program deltas, the golden test both ways with a signed tolerance, no speed
 gate) with in-session failover to the CPU, the `promotions` telemetry and incident reports.
 
-Done (2.0.0, unreleased): V4 only; manifest format 3 with download profiles, resumable verified
+Done in 2.0.0: V4 only; manifest format 3 with download profiles, resumable verified
 downloads and the unmetered-only NPU policy; the exact CPU engine and the NPU backend with
 self-tests and fallback; the raw, decoded and tajweed layers with per-word scores; observer hooks for
 the cloud module; V4 bit-exact through the SDK on the desktop JVM and on the Alcatel 1.
@@ -606,15 +675,16 @@ from CAL; latency through the SDK on more devices; CI for the engine tests.
 ## Download size
 
 The SDK downloads only its device's profile of the model folder (`sdk/v4.0`, manifest format 3), gzip on the
-wire, resumable, every file checked against the signed manifest. Default context `c16_l64`:
+wire, resumable, every file checked against the signed manifest. Sizes are those of model revision
+v4.0-2026-11-10, default context `c16_l64`:
 
-| Profile | What is downloaded | Size (gzip) [on disk] |
+| Profile | What is downloaded | Size |
 | - | - | - |
-| Any Android phone (CPU, always) | tokens, calibration, expected table, the shared `layers.zfw` and `frontend.zfw`, the c16_l64 graph and its frames | **56.5 MB** [73.5 MB] |
-| + Exynos 2500 NPU (lazy, Wi-Fi, after the CPU self-test) | `npu/exynos2500/c16_l64` (9 chained parts) | +61.5 MB |
-| + Exynos 2600 NPU (lazy, Wi-Fi, after the CPU self-test) | `npu/exynos2600/c16_l64` | +61.7 MB |
-| + Google Tensor G3 / G4 / G5 NPU (lazy, Wi-Fi) | `npu/tensor_gN/c16_l64` | +120.8 / 120.8 / 121.0 MB |
-| Another context later (CPU) | `c24_l72` or `c24_l256` graph and frames | +0.85 MB each |
+| Any Android phone (CPU, always, first) | tokens, calibration, expected table, the shared `layers.zfw` and `frontend.zfw`, the c16_l64 graph and its frames | **56.5 MB** (73.5 MB on disk) |
+| + Exynos 2500 NPU (later, unmetered network) | `npu/exynos2500/c16_l64` (9 chained parts) | +18.8 MB as a delta against the CPU weights, else +61.4 MB |
+| + Exynos 2600 NPU (later, unmetered network) | `npu/exynos2600/c16_l64` | +18.1 MB as a delta, else +61.7 MB |
+| + Google Tensor G3, G4, G5 NPU (later, unmetered network) | `npu/tensor_gN/c16_l64` | +84.6, 84.6, 86.0 MB as a delta, else +120.8, 120.8, 121.0 MB |
+| Another context later (CPU) | that context's graph and frames | +0.65 to 0.86 MB each |
 
 NPU builds ship only for chips checked on real hardware, and only for the default context `c16_l64`; every
 other phone and context runs the CPU engine, which is always there: any NPU load or self-test failure falls
@@ -628,7 +698,7 @@ The source code in this repository and the TajweedFormer model weights are relea
 Quran-Lab No-Profit License 1.2 ([NPL-1.2](LICENSE)): use, copy, modify and build on them freely,
 but never charge for them, for access to them, or for any feature they power. The weights are not
 stored in this repository; Quran Lab hosts them itself and serves them to apps by
-`cdn.quranlab.ai/models` under the same licence. Request access at
-[portal.quranlab.ai/access](https://portal.quranlab.ai/access).
+`cdn.quranlab.ai/models` under the same licence. Get access at
+[portal.quranlab.ai](https://portal.quranlab.ai).
 
 Third-party components keep their own licences, listed in their folders under `third_party/`.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The one permission an app adds for the microphone (asked at run time too). The SDK's own manifest
+         brings INTERNET and ACCESS_NETWORK_STATE for the model download and the portal link. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <application android:label="TajweedFormer quick start">
+        <activity
+            android:name=".QuickStartActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -18,3 +18,5 @@ rootProject.name = "tajweedformer-sdk-android"
 include(":tajweedformer", ":tajweedformer-jvm")
 // the recitation-sharing sheet and settings in Jetpack Compose (optional; the core has the Views ones)
 include(":tajweedformer-compose")
+// the README's quick start as an app, compiled in CI so the README's code always builds
+include(":samples:quickstart")
