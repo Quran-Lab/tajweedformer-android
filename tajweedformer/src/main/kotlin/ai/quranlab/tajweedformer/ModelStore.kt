@@ -7,7 +7,7 @@ import java.nio.file.StandardCopyOption
 
 /**
  * The model on this device: fetches the signed format 3 manifest, downloads only the profile in use
- * ([ModelProfile]), and opens the verified folder as a [TajweedModel].
+ * ([ModelProfile]), and opens the verified folder as a [ModelFolder].
  *
  * ```
  * val store = ModelStore(File(context.noBackupFilesDir, "tajweedformer"), headers = { mapOf("x-qlab-key" to key) })
@@ -16,9 +16,9 @@ import java.nio.file.StandardCopyOption
  *
  * Network policy (LAYOUT.md): the CPU profile downloads on any network; NPU files ([ensureNpu]) only
  * on an unmetered network and only after the CPU path passed its self-test. All calls block: run
- * them off the main thread (the [TajweedFormerClient] façade does).
+ * them off the main thread (the [ModelClient] façade does).
  */
-class ModelStore @JvmOverloads constructor(
+internal class ModelStore @JvmOverloads constructor(
     /** Where the model is kept (app-private storage; the engine maps these files). */
     val root: File,
     /** The model folder's URL, ending in `/`. */
@@ -26,6 +26,10 @@ class ModelStore @JvmOverloads constructor(
     private val transport: HttpTransport = UrlConnectionTransport(),
     private val headers: HeaderProvider? = null,
     val verifier: ManifestVerifier = ManifestVerifier(),
+    /** The build the signed config named (40 hex, the start of the SHA-256 of the manifest's bytes); null: any. */
+    private val expectBuild: String? = null,
+    /** The model version the signed config named; null: any. */
+    private val expectVersion: String? = null,
 ) {
     val downloader = ModelDownloader(root, baseUrl, transport, headers)
 
@@ -42,12 +46,11 @@ class ModelStore @JvmOverloads constructor(
         val local = File(root, ModelManifest.FILE_NAME)
         if (refresh || !local.isFile) {
             try {
-                val text = fetchText(ModelManifest.FILE_NAME)
-                val m = ModelManifest.parse(text)
-                verifier.verify(m)
+                val bytes = fetchBytes(ModelManifest.FILE_NAME)
+                val m = ModelManifest.accept(bytes, verifier, expectBuild, expectVersion)
                 root.mkdirs()
                 val tmp = File(root, ModelManifest.FILE_NAME + ".tmp")
-                tmp.writeText(text, Charsets.UTF_8)
+                tmp.writeBytes(bytes)
                 Files.move(tmp.toPath(), local.toPath(), StandardCopyOption.REPLACE_EXISTING)
                 cached = m
                 return m
@@ -56,22 +59,22 @@ class ModelStore @JvmOverloads constructor(
                 SdkEvents.emit { it.onError("manifest", e) }
             }
         }
-        val m = ModelManifest.read(root)
-        verifier.verify(m)
+        if (!local.isFile) throw RecognizerException.ModelMissing("no ${ModelManifest.FILE_NAME} in ${root.path}")
+        val m = ModelManifest.accept(local.readBytes(), verifier, expectBuild, expectVersion)
         cached = m
         return m
     }
 
-    private fun fetchText(path: String): String {
+    private fun fetchBytes(path: String): ByteArray {
         val h = HashMap<String, String>()
         headers?.headers(baseUrl + path)?.let { h.putAll(it) }
         h["Accept-Encoding"] = "identity"
         try {
-            transport.get(baseUrl + path, h).use { r ->
+            permitted { transport.get(baseUrl + path, h) }.use { r ->
                 if (r.code != 200) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}")
                 val bytes = r.body.readBytes()
                 if (bytes.size > MAX_MANIFEST_BYTES) throw RecognizerException.DownloadFailed(path, "too large")
-                return String(bytes, Charsets.UTF_8)
+                return bytes
             }
         } catch (e: IOException) {
             throw RecognizerException.DownloadFailed(path, "network: ${e.message}", e)
@@ -97,20 +100,20 @@ class ModelStore @JvmOverloads constructor(
         context: String? = null,
         cancel: Cancellation? = null,
         onProgress: ((ProfileProgress) -> Unit)? = null,
-    ): TajweedModel {
+    ): ModelFolder {
         val m = manifest()
         val c = ctx(context, m)
-        fetchAll(ModelProfile.cpu(m, c), cancel, onProgress, m.revision)
-        return TajweedModel.open(root, verifier, m, listOf(c))
+        fetchAll(ModelProfile.cpu(m, c), cancel, onProgress, m.build)
+        return ModelFolder.open(root, verifier, m, listOf(c))
     }
 
     /** Opens what is on disk without downloading (null when the profile of [context] is incomplete). */
     @JvmOverloads
-    fun openIfReady(context: String? = null): TajweedModel? {
+    fun openIfReady(context: String? = null): ModelFolder? {
         val m = try { manifest() } catch (e: RecognizerException) { return null }
         val c = ctx(context, m)
         if (ModelProfile.cpu(m, c).any { !downloader.isInPlace(it) }) return null
-        return TajweedModel.open(root, verifier, m, listOf(c))
+        return ModelFolder.open(root, verifier, m, listOf(c))
     }
 
     /** The NPU files of [soc] and [context] in the manifest (empty: no NPU build for them). */
@@ -184,7 +187,7 @@ class ModelStore @JvmOverloads constructor(
         if (npuInPlace(files)) return NpuDownload(npuLocal(files), "ready")
         if (!cpuSelfTestPassed) return NpuDownload(null, "cpu_self_test_pending")
         if (!network.isUnmetered()) return NpuDownload(null, "metered_network")
-        val revision = manifest().revision
+        val revision = manifest().build
         // the I/O contract and the masks first (small), then each program: by delta when there is one
         fetchAll(files.filter { it.role == "npu-io" || it.role == "npu-masks" }, cancel, onProgress, revision)
         for (p in ModelProfile.npuPrograms(files)) fetchProgram(p, context, cancel, revision)
@@ -264,7 +267,7 @@ class ModelStore @JvmOverloads constructor(
 }
 
 /** Bytes of a profile so far ([path] = the file in progress). */
-data class ProfileProgress(val path: String, val bytes: Long, val total: Long) {
+internal data class ProfileProgress(val path: String, val bytes: Long, val total: Long) {
     val fraction: Double get() = if (total > 0) bytes.toDouble() / total else 1.0
 }
 
@@ -273,8 +276,8 @@ data class ProfileProgress(val path: String, val bytes: Long, val total: Long) {
  * run order is io.json's `parts`, matched by file name) and [model] is the first of them; for a one-model build
  * [parts] is empty.
  */
-data class NpuFiles @JvmOverloads constructor(val model: File, val io: File, val masks: File, val parts: List<File> = emptyList())
+internal data class NpuFiles @JvmOverloads constructor(val model: File, val io: File, val masks: File, val parts: List<File> = emptyList())
 
 /** [ModelStore.ensureNpu]'s answer: the files when in place, and why (`ready`, `downloaded`,
  *  `soc_unknown`, `no_npu_build`, `cpu_self_test_pending`, `metered_network`). */
-data class NpuDownload(val files: NpuFiles?, val reason: String)
+internal data class NpuDownload(val files: NpuFiles?, val reason: String)

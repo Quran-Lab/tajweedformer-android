@@ -1,7 +1,6 @@
 package ai.quranlab.tajweedformer
 
 import ai.quranlab.tajweedformer.android.DeviceSoc
-import ai.quranlab.tajweedformer.android.TajweedFormerAndroid
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -32,11 +31,14 @@ import java.util.Collections
  *    SHA-256 of the stored and the inflated bytes);
  * 2. the recognizer self-tests the CPU engine (exact tokens of the built-in clip), finds no NPU build
  *    for this SoC and says why;
- * 3. the 35 parity clips stream through TajweedRecognizer and every chunk output is compared with the
+ * 3. the 35 parity clips stream through Recognizer and every chunk output is compared with the
  *    engine's conformance file (FNV-1a of all 12 heads, greedy tokens, chunk count).
  *
  * Instrumentation arguments: `host` (default http://127.0.0.1:8765), `key` (the manifest test key
  * hex), `clips` (how many of the 35, default all).
+ *
+ * On an x86_64 emulator this is the proof the library's `x86_64` ABI rests on (scripts/emulator_proof.py runs it
+ * there, with the emulator as the only device): 35 of 35 clips, all 12 heads, on API 33.
  */
 @RunWith(AndroidJUnit4::class)
 class DeviceEndToEndTest {
@@ -97,8 +99,9 @@ class DeviceEndToEndTest {
             override fun onSelfTest(result: SelfTestResult) { selfTests.add(result) }
         })
         val transport = CuttingTransport("layers.zfw.gz", 20L shl 20)
-        val client = TajweedFormerAndroid.client(ctx, baseUrl = "$host/m/", transport = transport,
-            verifier = ManifestVerifier(listOf(hex(key))), dir = dir)
+        // the model layer alone, with no Client and no key: the folder the PC serves, verified with the test key
+        val client = ModelClient(ModelStore(dir, "$host/m/", transport, verifier = ManifestVerifier(listOf(hex(key)))),
+            ModelClient.Platform(soc = DeviceSoc.id))
 
         // 1. download, cut, resume
         val t0 = System.nanoTime()
@@ -126,11 +129,13 @@ class DeviceEndToEndTest {
         // allHeads=false: only the scorer's heads (and conf), as an app by default; the comparison then covers those
         val allHeads = args.getString("allHeads") != "false"
         log("threads: default ${CoreTopology.resolve(0)} from core speeds ${CoreTopology.readSpeeds()}; heads: ${if (allHeads) "all 12" else "default"}")
-        val tj = client.recognizer(TajweedRecognizer.Options(allHeads = allHeads))
+        val tj = client.recognizer(Recognizer.Options(allHeads = allHeads))
         log("backend ${tj.backendChoice}; CPU self-test ${tj.cpuSelfTest}")
         assertEquals(Backend.CPU, tj.backend)
         assertTrue(tj.cpuSelfTest!!.passed)
-        assertTrue(tj.backendChoice.reason in setOf("soc_unknown", "no_npu_build", "runtime_missing", "npu_not_downloaded"))
+        // the model layer of this test has no accelerator environment (`no_accelerator`); with one, a phone without
+        // an NPU build says which of the other reasons applies
+        assertTrue(tj.backendChoice.reason, tj.backendChoice.reason in setOf("no_accelerator", "soc_unknown", "no_npu_build", "runtime_missing", "npu_not_downloaded"))
 
         // 3. the parity clips through the SDK, compared with the engine's conformance
         @Suppress("UNCHECKED_CAST")
@@ -161,8 +166,8 @@ class DeviceEndToEndTest {
             var logp = FNV0
             val out = HashMap<String, ArrayList<String>>()
             for (c in got) {
-                for (h in TajweedHead.entries) c.heads[h]?.let { out.getOrPut(h.key) { ArrayList() }.add(hex(fnv(FNV0, it))) }
-                logp = fnv(logp, c.heads[TajweedHead.LOG_PROBS]!!)
+                for (h in HeadId.entries) c.heads[h]?.let { out.getOrPut(h.key) { ArrayList() }.add(hex(fnv(FNV0, it))) }
+                logp = fnv(logp, c.heads[HeadId.LOG_PROBS]!!)
             }
             @Suppress("UNCHECKED_CAST")
             val why = when {
@@ -174,7 +179,7 @@ class DeviceEndToEndTest {
             if (why != null) bad.add("$clip ($why)")
         }
         tj.close()
-        log("V4 c16_l64 on device through TajweedRecognizer (${out0(allHeads)}): ${n - bad.size}/$n clips bit-identical to the engine conformance; " +
+        log("V4 c16_l64 on device through Recognizer (${out0(allHeads)}): ${n - bad.size}/$n clips bit-identical to the engine conformance; " +
             "audio ${String.format(java.util.Locale.ROOT, "%.1f", audioSec)} s, compute ${String.format(java.util.Locale.ROOT, "%.1f", computeSec)} s, RTF ${String.format(java.util.Locale.ROOT, "%.3f", computeSec / audioSec)}" +
             if (bad.isEmpty()) "" else "; differ: ${bad.joinToString()}")
         log("self-tests: ${selfTests.joinToString()}; backend choices: ${choices.joinToString()}")

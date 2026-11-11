@@ -8,7 +8,7 @@ import ai.quranlab.tajweedformer.accel.Reasons
  * One promotion attempt that ended ([SdkObserver.onPromotion]): promoted, or failed at [stage] with [reason]. The
  * `promotions` telemetry counts it; a failure is also an incident report ([incident]).
  */
-data class PromotionEvent(
+internal data class PromotionEvent(
     /** `npu:<soc>`. */
     val backend: String,
     val revision: String,
@@ -35,7 +35,7 @@ data class PromotionEvent(
  * a held vowel or a long madd, not a fault. No switch, no demotion, no incident: the `promotions` telemetry's
  * `blank_confirmed_ok` counts it.
  */
-data class BlankConfirmedEvent(
+internal data class BlankConfirmedEvent(
     /** `npu:<soc>`. */
     val backend: String,
     val revision: String,
@@ -44,7 +44,7 @@ data class BlankConfirmedEvent(
 )
 
 /** A session switched from the accelerator to the CPU ([SdkObserver.onFailover]). */
-data class AcceleratorFailoverEvent(
+internal data class AcceleratorFailoverEvent(
     val backend: String,
     val revision: String,
     val context: String,
@@ -57,7 +57,7 @@ data class AcceleratorFailoverEvent(
  * class and message (the message is path-stripped before it leaves the device), where it failed, and the device,
  * accelerator and conditions. Never audio, transcript or token text, or any id.
  */
-data class AcceleratorIncident(
+internal data class AcceleratorIncident(
     /** [FAILOVER] or [PROMOTION_FAILED]. */
     val kind: String,
     /** `download`, `compile`, `warmup`, `golden` or `session`. */

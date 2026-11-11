@@ -9,7 +9,7 @@ import java.security.MessageDigest
  * verifies model manifests once per load, so it favours being short and obviously the RFC's
  * reference arithmetic over speed.
  */
-object Ed25519 {
+internal object Ed25519 {
     private val TWO: BigInteger = BigInteger.valueOf(2) // BigInteger.TWO is Java 9, Android API 33
     private val P: BigInteger = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19))
     private val L: BigInteger = BigInteger.ONE.shiftLeft(252).add(BigInteger("27742317777372353535851937790883648493"))

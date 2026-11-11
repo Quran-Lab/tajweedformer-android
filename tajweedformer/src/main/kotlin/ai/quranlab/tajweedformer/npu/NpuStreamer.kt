@@ -1,7 +1,7 @@
 package ai.quranlab.tajweedformer.npu
 
-import ai.quranlab.tajweedformer.TajweedHead
-import ai.quranlab.tajweedformer.TajweedHeads
+import ai.quranlab.tajweedformer.HeadId
+import ai.quranlab.tajweedformer.HeadValues
 import kotlin.math.exp
 import kotlin.math.ln
 
@@ -9,12 +9,12 @@ import kotlin.math.ln
  * Runs one chunk of the NPU model: every input by name as int16 codes in, every output by name out.
  * [ai.quranlab.tajweedformer.android.LiteRtNpuRunner] is the device one; tests use fakes.
  */
-interface NpuRunner : AutoCloseable {
+internal interface NpuRunner : AutoCloseable {
     fun run(inputs: Map<String, ShortArray>): Map<String, ShortArray>
 }
 
 /** The integer arithmetic of the host contract, exactly as the device runner was fed. */
-object NpuQuant {
+internal object NpuQuant {
     /** `clamp(rint(v / scale) + zeroPoint)` in double, int16 (numpy's round is half to even, as rint). */
     @JvmStatic
     fun quantize(v: Float, t: NpuTensor): Short = clamp16(Math.rint(v.toDouble() / t.scale) + t.zeroPoint)
@@ -66,9 +66,9 @@ object NpuQuant {
 /**
  * The host side of the NPU stream: fbank frames in (from the exact engine's own front end), the
  * contract's window / shift, the mask table, the state feedback, and each chunk's heads out, finished
- * by their host ops so they mean what the CPU engine's heads mean (same layouts as [TajweedHeads]).
+ * by their host ops so they mean what the CPU engine's heads mean (same layouts as [HeadValues]).
  */
-class NpuStreamer(
+internal class NpuStreamer(
     val contract: NpuContract,
     private val masks: NpuMasks,
     private val runner: NpuRunner,
@@ -105,14 +105,14 @@ class NpuStreamer(
     }
 
     /** [n] more fbank frames (`[n, bins]`, row major); the heads of every chunk they complete. */
-    fun push(fbank: FloatArray, n: Int = fbank.size / bins): List<TajweedHeads> {
+    fun push(fbank: FloatArray, n: Int = fbank.size / bins): List<HeadValues> {
         require(fbank.size >= n * bins)
         if (n > 0) {
             if (frames.size < (nFrames + n) * bins) frames = frames.copyOf(maxOf((nFrames + n) * bins, frames.size * 2))
             System.arraycopy(fbank, 0, frames, nFrames * bins, n * bins)
             nFrames += n
         }
-        val out = ArrayList<TajweedHeads>()
+        val out = ArrayList<HeadValues>()
         while (chunk * contract.shiftFrames - base + contract.windowFrames <= nFrames) {
             out.add(runChunk(chunk * contract.shiftFrames - base))
             chunk++
@@ -130,7 +130,7 @@ class NpuStreamer(
     /** The absolute fbank frame of frames[0]. */
     private var base = 0
 
-    private fun runChunk(at: Int): TajweedHeads {
+    private fun runChunk(at: Int): HeadValues {
         val inputs = HashMap<String, ShortArray>(contract.inputs.size)
         val x = ShortArray(contract.x.size)
         for (i in 0 until contract.windowFrames * bins) x[i] = NpuQuant.quantize(frames[at * bins + i], contract.x)
@@ -147,8 +147,8 @@ class NpuStreamer(
     }
 
     /** The heads of one chunk's outputs. */
-    fun heads(outs: Map<String, ShortArray>): TajweedHeads {
-        val values = HashMap<TajweedHead, FloatArray>()
+    fun heads(outs: Map<String, ShortArray>): HeadValues {
+        val values = HashMap<HeadId, FloatArray>()
         var n40 = -1
         for (h in contract.heads) {
             val q = outs[h.output] ?: continue
@@ -159,6 +159,6 @@ class NpuStreamer(
             if (n40 < 0) n40 = k else check(n40 == k) { "${h.output} has $frames frames, $n40 40 ms frames expected" }
             values[h.head] = v
         }
-        return TajweedHeads(maxOf(n40, 0), values)
+        return HeadValues(maxOf(n40, 0), values)
     }
 }

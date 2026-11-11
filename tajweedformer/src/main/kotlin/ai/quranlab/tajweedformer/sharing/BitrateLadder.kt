@@ -19,7 +19,7 @@ package ai.quranlab.tajweedformer.sharing
  * 32 kbit/s (the log-mel features the model reads differ by 1.17 dB at 32k, 1.60 at 24k, 2.48 at 16k, against
  * 0.22 at 192k, for about 0.07 MB a minute saved per step).
  */
-class BitrateLadder {
+internal class BitrateLadder {
     private var rung = 0
     private var streak = 0
 

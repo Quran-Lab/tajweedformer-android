@@ -6,7 +6,7 @@ import java.io.File
 import java.nio.file.Files
 
 /** Reading Ogg pages back, decoding with libopus, test signals. */
-object OggTestKit {
+internal object OggTestKit {
     class Page(val flags: Int, val granule: Long, val serial: Int, val sequence: Int, val packets: List<ByteArray>)
 
     /** Every Ogg page of [d], checking the capture pattern and each page's CRC. */

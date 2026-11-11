@@ -13,7 +13,7 @@ import java.io.File
  * fixes the team at that size. The sysfs topology does not depend on the cpuset; the engine's pool still
  * follows the cpuset at run time (fewer active threads while it is reduced, all of them in front).
  */
-object CoreTopology {
+internal object CoreTopology {
     /** The cap: more threads than 4 do not pay on the measured phones. */
     const val CAP = 4
 

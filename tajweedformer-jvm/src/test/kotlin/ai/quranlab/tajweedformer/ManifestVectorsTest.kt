@@ -14,7 +14,7 @@ import org.junit.Test
  * line, sorted by the build key's UTF-8 bytes). No engine needed: the public CI runs it, so an SDK whose signed text
  * drifts from the publisher's never ships.
  */
-class ManifestVectorsTest {
+class ManifestVectorsTest : OpenChecked() {
     private fun text(name: String): String =
         javaClass.getResourceAsStream("/manifest_vectors/$name")!!.use { it.readBytes().toString(Charsets.UTF_8) }
 
@@ -43,14 +43,24 @@ class ManifestVectorsTest {
 
     @Test
     fun bothRealManifestsVerifyWithThePinnedKey() {
+        // the two production builds are 2.x builds: their signatures verify with the pinned key, and SDK 3.0 refuses
+        // both as builds for another SDK generation (no `version`)
         val a = ModelManifest.parse(text(withTolerance))
-        verifier.verify(a)
+        verifier.verifySignature(a)
+        for (name in listOf(withTolerance, without)) {
+            try {
+                verifier.verify(ModelManifest.parse(text(name)))
+                fail("$name: a 2.x build verified for SDK 3.0")
+            } catch (e: RecognizerException.ModelIncompatible) {
+                assertEquals("model_incompatible", e.code)
+            }
+        }
         assertEquals("v4.0-2026-11-10", a.revision)
         // signed with its golden_tolerance lines: the tolerance is in force
         assertTrue(a.toleranceSigned)
         assertEquals(ModelManifest.GoldenTolerance(0, 1, 1), a.toleranceFor("npu:tensor_g5:c16_l64"))
         val b = ModelManifest.parse(text(without))
-        verifier.verify(b)
+        verifier.verifySignature(b)
         assertEquals("v4.0-2026-11-09", b.revision)
         assertEquals(ModelManifest.GoldenTolerance.EXACT, b.toleranceFor("npu:tensor_g5:c16_l64"))
     }

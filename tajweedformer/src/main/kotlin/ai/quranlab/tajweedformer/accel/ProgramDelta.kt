@@ -39,7 +39,7 @@ import java.util.zip.GZIPInputStream
  * the memory-mapped CPU files and added over the span of the file it covers; the result's size and SHA-256 must equal
  * the header's target (and [expectSha256] when the manifest lists the program) before it is moved into place.
  */
-object ProgramDelta {
+internal object ProgramDelta {
     private val MAGIC = "QLPD1\n".toByteArray(Charsets.US_ASCII)
 
     /** The rebuilt program differs from what the delta promises, or the CPU files are not the ones it was made from. */

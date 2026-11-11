@@ -38,7 +38,7 @@ import java.util.Base64
  * which only the vendor dispatch library on an Exynos 2500 executes; there is no host LiteRT in this repository
  * either. So the golden test checks the WIRING: every byte each part is fed, on every chunk.
  */
-class NpuChainTest {
+class NpuChainTest : OpenChecked() {
     private val dirs = ArrayList<File>()
     private fun dir() = Files.createTempDirectory("tj-chain-").toFile().also { dirs.add(it) }
 
@@ -148,7 +148,7 @@ class NpuChainTest {
         val n0 = (0 + parts[1].feeds[0].getValue("mid")[0] + 0).toDouble()
         assertEquals(Math.rint(n0 * 0.5).toInt().toShort(), parts[1].feeds[1].getValue("s0")[0])
         // the head: logits from P2, finished by log-softmax, token 7 on top
-        val lp = heads[0][TajweedHead.LOG_PROBS]!!
+        val lp = heads[0][HeadId.LOG_PROBS]!!
         assertEquals(7, lp.indices.maxByOrNull { lp[it] })
         chain.close()
         assertTrue(parts.all { it.closed })
@@ -316,7 +316,7 @@ class NpuChainTest {
         val root = dir()
         TestKit.writeDecoded(root, files, m)
         val store = ModelStore(root, "http://127.0.0.1:9/never/", verifier = TestKit.verifier)
-        val model = TajweedModel.open(root, TestKit.verifier)
+        val model = ModelFolder.open(root, TestKit.verifier)
         val factory: (File, NpuContract) -> NpuRunner = { _, _ -> error("no runner may load without a build") }
         val prep = NpuPreparer(store, model, NetworkPolicy.ALWAYS_UNMETERED, factory)
         fun key(ctx: String) = AcceleratorKey("r", "b", "Galaxy Z Flip7", "exynos2500", ctx)
@@ -411,7 +411,7 @@ class NpuChainTest {
         val fb = ByteBuffer.wrap(feats.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         val f = FloatArray(fb.remaining()).also { fb.get(it) }
         val s = NpuStreamer(c, masks, recorder)
-        val heads = ArrayList<TajweedHeads>()
+        val heads = ArrayList<HeadValues>()
         var at = 0
         while (at < f.size) {   // pushed in uneven pieces, as audio arrives
             val n = minOf(80 * 37, f.size - at)
@@ -430,7 +430,7 @@ class NpuChainTest {
             assertArrayEquals("head $n: chain output vs the board", shorts(boardFile), all)
         }
         // every head finished on the host (log-softmax rows sum to 1)
-        val lp = heads[3][TajweedHead.LOG_PROBS]!!
+        val lp = heads[3][HeadId.LOG_PROBS]!!
         assertEquals(1.0, (0 until 38).sumOf { Math.exp(lp[it].toDouble()) }, 1e-4)
         println("exynos2500 chain: 15 chunks x 9 parts, ${15 * 298} part inputs identical to the board loop's; 12 heads = board")
     }

@@ -1,5 +1,6 @@
 package ai.quranlab.tajweedformer.sharing
 
+import ai.quranlab.tajweedformer.OpenChecked
 import ai.quranlab.tajweedformer.sharing.OggTestKit.decode
 import ai.quranlab.tajweedformer.sharing.OggTestKit.feed
 import ai.quranlab.tajweedformer.sharing.OggTestKit.noise
@@ -16,7 +17,7 @@ import org.junit.Test
 import java.io.File
 
 /** The Swift SDK's SharingCodecTests and the Ogg tests of SharingTests, on the JVM with the host libopus build. */
-class SharingCodecTest {
+class SharingCodecTest : OpenChecked() {
     @Before fun opus() = OggTestKit.requireOpus()
 
     /** The defaults are the measured choice, and libopus reads every one of them back. */

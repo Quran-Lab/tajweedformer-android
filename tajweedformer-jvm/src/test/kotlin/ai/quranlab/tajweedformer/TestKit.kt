@@ -9,7 +9,7 @@ import java.util.Base64
 import java.util.zip.GZIPOutputStream
 
 /** Builds format 3 model folders (transport and decoded) for the tests, signed with a JDK Ed25519 key. */
-object TestKit {
+internal object TestKit {
     fun hex(s: String) = ByteArray(s.length / 2) { s.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
 
     fun sha(b: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
@@ -50,7 +50,8 @@ object TestKit {
         val out = arrayListOf(
             F("tokens.txt", tj3Tokens().toByteArray(), "tokens", gz = false),
             F("calibration.json", resource("calibration_fixture.json"), "calibration"),
-            F(TajweedModel.EXPECTED_TABLE, ByteArray(4000) { (it % 7).toByte() }, "expected"),
+            // a 3.0 build: the expected units are reference data, optional and outside the CPU set
+            F(REFERENCE_TABLE, ByteArray(4000) { (it % 7).toByte() }, "reference", need = "optional"),
             F("layers.zfw", ByteArray(300_000).also { java.util.Random(1).nextBytes(it) }, "weights"),
             F("frontend.zfw", "frontend".toByteArray(), "frontend"),
         )
@@ -77,13 +78,36 @@ object TestKit {
         return out
     }
 
+    const val REFERENCE_TABLE = "expected_tj3.zfx"
+
+    /**
+     * Heads of a clip whose greedy tokens of `log_probs` are [tokens]: per token one frame where it is the best, then
+     * a blank frame; the other base heads are zeros. With [finite] false one value is NaN.
+     */
+    fun headsOf(tokens: List<Int>, finite: Boolean = true, frames: Int = 16): HeadValues {
+        // a fixed frame count, so two runs with other tokens still have the same shape
+        val n = maxOf(2 * tokens.size, frames)
+        val lp = FloatArray(n * 38) { -10f }
+        for (f in 0 until n) lp[f * 38] = 0f
+        for ((i, t) in tokens.withIndex()) {
+            lp[2 * i * 38] = -10f
+            lp[2 * i * 38 + t] = 0f
+        }
+        if (!finite && lp.isNotEmpty()) lp[0] = Float.NaN
+        val m = HashMap<HeadId, FloatArray>()
+        for (h in HeadId.BASE_HEADS) m[h] = FloatArray((if (h.frameMs == 40) n else 2 * n) * h.width)
+        m[HeadId.LOG_PROBS] = lp
+        return HeadValues(n, m)
+    }
+
+    /** A 3.0 build's manifest (version 4.0.0 by default; null: a 2.x build's, which 3.0 refuses). */
     fun manifest(
-        files: List<F>, contexts: List<String> = listOf("c16_l64", "c24_l72"), minSdk: String = "2.0.0",
-        engineFormat: Int = 3, revision: String = "v4.0-test.1",
+        files: List<F>, contexts: List<String> = listOf("c16_l64", "c24_l72"), minSdk: String = "3.0.0",
+        engineFormat: Int = 3, revision: String = "v4.0-test.1", version: String? = "4.0.0",
     ): ModelManifest {
         val tokens = files.first { it.path == "tokens.txt" }
         return ModelManifest(3, "v4.0", "tajweedformer", revision, minSdk, engineFormat, 9, "tokens.txt", sha(tokens.bytes),
-            contexts.first(), contexts, files.map { it.entry() })
+            contexts.first(), contexts, files.map { it.entry() }, version = version)
     }
 
     /** A key pair: raw 32-byte public key and a signer. */

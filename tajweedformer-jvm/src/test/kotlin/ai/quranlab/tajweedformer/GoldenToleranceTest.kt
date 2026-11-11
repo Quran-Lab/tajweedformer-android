@@ -1,6 +1,5 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.accel.Reasons
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -10,13 +9,13 @@ import org.junit.Test
 import java.util.Base64
 
 /**
- * `golden_tolerance` in the signed manifest (SPEC section 11): the signed text gains one line per build after the header
- * lines; a manifest signed with them has its tolerance in force; one signed without them (the field present) still
- * verifies, its tolerance ignored; a tampered tolerance is ignored the same way; a malformed entry is exact; without the
- * field the signed text is 2.0.0's byte for byte. And the golden rule with a tolerance: totals over the set against the
- * CPU run, both directions, and the planted site always.
+ * The 2.x `golden_tolerance` in the signed manifest, which a 3.0 manifest may still carry and sign (3.0 never applies
+ * it: its golden test is on raw outputs, GoldenRawTest): the signed text gains one line per well-formed build after
+ * the header lines; a manifest signed with them has its tolerance signed; one signed without them (the field present)
+ * still verifies, its tolerance ignored; a tampered tolerance refuses the manifest; a malformed entry has no line and
+ * is exact; without the field the signed text is 2.0.0's byte for byte.
  */
-class GoldenToleranceTest {
+class GoldenToleranceTest : OpenChecked() {
     private val files = TestKit.v4Files()
     private val base = TestKit.manifest(files)
     private val tol = linkedMapOf<String, Any?>(
@@ -34,8 +33,8 @@ class GoldenToleranceTest {
         val m = reparse(base.withTolerance(tol))
         val text = String(m.signedMessage(true))
         val lines = text.lines().filter { it.startsWith("golden_tolerance ") }
-        assertEquals(listOf("golden_tolerance coreml 0 2 1", "golden_tolerance npu:exynos2500:c16_l64 0 1 1",
-            "golden_tolerance npu:tensor_g5:c16_l64 -1 1 1"), lines)
+        // one line per WELL-FORMED entry (SDK 3.0, the rule the four SDKs share): the entry with a negative value has none
+        assertEquals(listOf("golden_tolerance coreml 0 2 1", "golden_tolerance npu:exynos2500:c16_l64 0 1 1"), lines)
         // after the header lines, before the first file line
         assertTrue(text.indexOf("contexts ") < text.indexOf("golden_tolerance ") && text.indexOf("golden_tolerance ") < text.indexOf("\nfile "))
         // without the field: the 2.0.0 text byte for byte
@@ -93,68 +92,5 @@ class GoldenToleranceTest {
         ManifestVerifier(listOf(TestKit.key.first), requireSignature = false).verify(unsigned)
         assertEquals(ModelManifest.GoldenTolerance.EXACT, unsigned.toleranceFor("npu:exynos2500:c16_l64"))
         assertNull(base.goldenTolerance)
-    }
-
-    // ----------------------------------------------------------------------------------------- the golden rule
-
-    private val ids = SelfTestSet.REQUIRED
-    private val planted = setOf(SelfTestSet.PLANTED_CLIP)
-    private val plantedSite = 5 to "vowel_sub"
-    private val expected = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", ids.associateWith {
-        if (it == SelfTestSet.PLANTED_CLIP) SelfTestSet.ClipExpected(4, listOf(3, 32, 13), setOf(plantedSite, 6 to "cons_sub"), setOf(1), listOf(1.0))
-        else SelfTestSet.ClipExpected(4, listOf(3, 32, 13), emptySet(), emptySet(), listOf(1.0))
-    })
-
-    private fun obs(change: Map<String, (SelfTestSet.ClipObserved) -> SelfTestSet.ClipObserved> = emptyMap()) = ids.associateWith { id ->
-        val e = expected.clips.getValue(id)
-        val o = SelfTestSet.ClipObserved(4, e.tokens, e.flaggedSites, e.flaggedWords, true, listOf(10.0))
-        change[id]?.invoke(o) ?: o
-    }
-
-    private val sites = mapOf(SelfTestSet.PLANTED_CLIP to setOf(plantedSite))
-
-    @Test fun aBuildWithinItsToleranceIsPromotedBeyondItIsNot() {
-        val one = ModelManifest.GoldenTolerance(0, 1, 1)
-        // one extra site flag on a clean clip and one extra word flag: within 0 / 1 / 1
-        val acc = obs(mapOf(ids[0] to { o -> o.copy(flaggedSites = setOf(2 to "madd_short")) }, ids[1] to { o -> o.copy(flaggedWords = setOf(0)) }))
-        val ok = SelfTestSet.judgeGolden(expected, obs(), acc, planted, one, sites)
-        assertTrue(ok.detail, ok.passed)
-        assertEquals(1, ok.divergence!!.sitesDiffer)
-        assertEquals(1, ok.divergence!!.wordsDiffer)
-        // the same is a mismatch for an exact build
-        val exact = SelfTestSet.judgeGolden(expected, obs(), acc, planted, ModelManifest.GoldenTolerance.EXACT, sites)
-        assertEquals(Reasons.GOLDEN_MISMATCH, exact.reason)
-        assertEquals(ids[0], exact.clip)
-        // a missed flag counts as much as an extra one (both directions), and totals add over the clips
-        val two = obs(mapOf(ids[0] to { o -> o.copy(flaggedSites = setOf(2 to "madd_short")) },
-            SelfTestSet.PLANTED_CLIP to { o -> o.copy(flaggedSites = setOf(plantedSite)) }))
-        assertEquals(Reasons.GOLDEN_MISMATCH, SelfTestSet.judgeGolden(expected, obs(), two, planted, one, sites).reason)
-        // a token difference on a clean clip is not allowed at 0
-        val tok = obs(mapOf(ids[2] to { o -> o.copy(tokens = listOf(3, 32)) }))
-        assertEquals(Reasons.GOLDEN_MISMATCH, SelfTestSet.judgeGolden(expected, obs(), tok, planted, one, sites).reason)
-        // the planted clip's tokens are never counted
-        val ptok = obs(mapOf(SelfTestSet.PLANTED_CLIP to { o -> o.copy(tokens = listOf(3, 32, 13, 7)) }))
-        assertTrue(SelfTestSet.judgeGolden(expected, obs(), ptok, planted, ModelManifest.GoldenTolerance.EXACT, sites).passed)
-    }
-
-    @Test fun aMissedPlantedSiteAlwaysFails() {
-        val huge = ModelManifest.GoldenTolerance(100, 100, 100)
-        val missed = obs(mapOf(SelfTestSet.PLANTED_CLIP to { o -> o.copy(flaggedSites = setOf(6 to "cons_sub")) }))
-        val v = SelfTestSet.judgeGolden(expected, obs(), missed, planted, huge, sites)
-        assertFalse(v.passed)
-        assertEquals(Reasons.GOLDEN_MISMATCH, v.reason)
-        assertEquals(SelfTestSet.PLANTED_CLIP, v.clip)
-        assertTrue(v.detail, v.detail.contains("planted"))
-        // the CPU itself must equal the shipped expected file (cpu_mismatch), whatever the tolerance
-        val cpuOff = obs(mapOf(ids[0] to { o -> o.copy(flaggedWords = setOf(3)) }))
-        assertEquals(Reasons.CPU_MISMATCH, SelfTestSet.judgeGolden(expected, cpuOff, obs(), planted, huge, sites).reason)
-    }
-
-    @Test fun thePlantedSiteComesFromSelftestJsonPos() {
-        val set = SelfTestSet(ids.map { SelfTestSet.Clip(it, 1, 1, "$it.s16", 1, 16000, false,
-            if (it == SelfTestSet.PLANTED_CLIP) SelfTestSet.PLANTED else SelfTestSet.CLEAN, if (it == SelfTestSet.PLANTED_CLIP) 5 else null) }, emptyMap())
-        assertEquals(mapOf(SelfTestSet.PLANTED_CLIP to setOf(plantedSite)), SelfTestSet.plantedSites(set, expected))
-        val noPos = SelfTestSet(set.clips.map { it.copy(plantedPos = null) }, emptyMap())
-        assertEquals(mapOf(SelfTestSet.PLANTED_CLIP to setOf(plantedSite, 6 to "cons_sub")), SelfTestSet.plantedSites(noPos, expected))
     }
 }

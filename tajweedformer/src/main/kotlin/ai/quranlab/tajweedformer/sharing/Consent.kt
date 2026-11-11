@@ -19,7 +19,7 @@ import java.util.concurrent.ConcurrentHashMap
  * The 2.0.0 file is the same without `consentTextSha256` and with `updateAsked` (read and dropped); its
  * `asks` carries over, and a 2.0.0 grant without a version reads as [LEGACY_CONSENT_VERSION].
  */
-class ConsentState internal constructor(private val file: File, private val clock: () -> Long = System::currentTimeMillis) {
+internal class ConsentState internal constructor(private val file: File, private val clock: () -> Long = System::currentTimeMillis) {
     enum class Consent(val key: String) { UNKNOWN("unknown"), GRANTED("granted"), DECLINED("declined"), FINAL("final") }
 
     /** Which sheet to show: the first ask, or a re-ask after "Not now". */
@@ -189,7 +189,7 @@ class ConsentState internal constructor(private val file: File, private val cloc
  * [consentVersion] is `custom-<24 hex>`, derived from the wording ([ConsentWording]); [consentTextSha256]
  * and [consentText] are its hash and canonical text.
  */
-class SharingCopy private constructor(
+internal class SharingCopy private constructor(
     val lang: String,
     val version: String,
     /** The version the learner agrees to: the deck's, or `custom-<24 hex>` under the app's own wording. */
@@ -354,7 +354,7 @@ class SharingCopy private constructor(
  * wording stayed the same (a learner who agreed earlier keeps the version recorded then). Tried and rejected: hashing the whole merged deck (a string the app never shows would change its
  * version); the language in the text (the deck's translations are one meaning).
  */
-object ConsentWording {
+internal object ConsentWording {
     const val HEADER = "quranlab.consent-text/1\n"
     const val PREFIX = "custom-"
     /** A plural line of `impact.minutes` is replaced by category: `impact.minutes.one`, `impact.minutes.other`, ... */

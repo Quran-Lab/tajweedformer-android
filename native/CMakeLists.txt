@@ -1,7 +1,7 @@
 # libtajweedformer_jni: the JNI bridge over the engine's zf_tajweed.h (TajweedFormer V4), linked with
 # the engine (the submodule at ../engine) built in its exact release configuration. The same file
 # builds the Android library (from Gradle, per ABI) and the host library the JVM tests load
-# (scripts/build_host.sh). SDK 2.0.0 hosts V4 only: the 1.x zf_stream bridge (zf_jni.c) is gone.
+# (scripts/build_host.sh). SDK 3.0.0 links the engine's inference-only target: there is no scorer.
 cmake_minimum_required(VERSION 3.24)
 project(tajweedformer_jni C)
 
@@ -29,14 +29,14 @@ add_subdirectory("${ZF_ENGINE_DIR}" engine EXCLUDE_FROM_ALL)
 # libtajweedformer_opus, recitation sharing's Ogg Opus encoder (a library of its own)
 add_subdirectory(opus)
 
-if(NOT TARGET zf_tajweed_engine)
-  message(FATAL_ERROR "the engine in ${ZF_ENGINE_DIR} has no zf_tajweed_engine target (TajweedFormer V4)")
+if(NOT TARGET zf_tajweed_inference)
+  message(FATAL_ERROR "the engine in ${ZF_ENGINE_DIR} has no zf_tajweed_inference target (the 3.0 engine, inference only)")
 endif()
 add_library(tajweedformer_jni SHARED tj_jni.c litert_npu.c)
 target_compile_options(tajweedformer_jni PRIVATE -O2 -Wall -Wextra -Werror -ffp-contract=off)
 # the engine's resampler and fbank for the NPU backend's host side (tj_jni.c "frontend")
 target_compile_definitions(tajweedformer_jni PRIVATE TJ_WITH_FRONTEND=1)
-target_link_libraries(tajweedformer_jni PRIVATE zf_tajweed_engine)
+target_link_libraries(tajweedformer_jni PRIVATE zf_tajweed_inference)
 if(WIN32)
   # tajweedformer_jni.dll, the name System.loadLibrary("tajweedformer_jni") looks for on Windows
   set_target_properties(tajweedformer_jni PROPERTIES PREFIX "")

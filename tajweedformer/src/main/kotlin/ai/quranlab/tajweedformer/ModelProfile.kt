@@ -14,7 +14,7 @@ package ai.quranlab.tajweedformer
  * NPU builds ship at c16_l64 only (LAYOUT.md "NPU builds"); another context has no `npu-*` files, so [npu]
  * is empty for it and the recognizer stays on the CPU engine (reason `no_npu_build`).
  */
-object ModelProfile {
+internal object ModelProfile {
     /** The roles of a one-model NPU build, all three needed for the NPU backend. */
     @JvmField val NPU_ROLES = listOf("npu-model", "npu-io", "npu-masks")
 
@@ -27,6 +27,9 @@ object ModelProfile {
     const val NPU_DELTA_ROLE = "npu-delta"
 
     private val ALL_NPU_ROLES = NPU_ROLES + NPU_PART_ROLE + NPU_DELTA_ROLE
+
+    /** The reference data's role (SDK 3.0): signed and verified like every file, never in the CPU set. */
+    const val REFERENCE_ROLE = "reference"
 
     /** The program a delta stands for: its decoded path without `.qlpd`. */
     @JvmStatic
@@ -60,21 +63,37 @@ object ModelProfile {
     @JvmField val ACCELERATOR_ROLES = ALL_NPU_ROLES.toSet() + setOf("selftest", "coreml", "coreml-keeps", "coreml-compact", "correction",
         "correction-compact")
 
-    /** The CPU profile of [context] for [platform]: the `required` files of that context and of every context, never
-     *  an accelerator file (a first install downloads only these). */
+    /** Roles that are data an app may ask for, or that only SDK 2.x reads: the 2.x expected table (`expected`, never
+     *  downloaded or read by 3.0) and the reference data (`reference`, downloaded only when the app fetches it). */
+    @JvmField val DATA_ROLES = setOf("expected", REFERENCE_ROLE)
+
+    /** The reference data of [m] (role `reference`: the expected units of each ayah), empty when the build has none. */
     @JvmStatic
     @JvmOverloads
-    fun cpu(m: ModelManifest, context: String, platform: String = TajweedFormer.PLATFORM): List<ModelManifest.FileEntry> {
+    fun reference(m: ModelManifest, platform: String = SdkInfo.PLATFORM): List<ModelManifest.FileEntry> =
+        m.files.filter { it.role == REFERENCE_ROLE && it.forPlatform(platform) }
+
+    /** The self-test set of [context] (role `selftest`: the sample clips and the context's expected tokens). */
+    @JvmStatic
+    @JvmOverloads
+    fun selfTest(m: ModelManifest, context: String, platform: String = SdkInfo.PLATFORM): List<ModelManifest.FileEntry> =
+        m.files.filter { it.role == "selftest" && it.forPlatform(platform) && (it.context == "*" || it.context == context) }
+
+    /** The CPU profile of [context] for [platform]: the `required` files of that context and of every context, never
+     *  an accelerator file, the 2.x expected table or the reference data (a first install downloads only these). */
+    @JvmStatic
+    @JvmOverloads
+    fun cpu(m: ModelManifest, context: String, platform: String = SdkInfo.PLATFORM): List<ModelManifest.FileEntry> {
         if (context !in m.contexts) throw RecognizerException.InvalidAppOption("context", "$context is not shipped (${m.contexts})")
         return m.files.filter {
-            it.need == ModelManifest.Need.REQUIRED && it.role !in ACCELERATOR_ROLES && it.forPlatform(platform) &&
+            it.need == ModelManifest.Need.REQUIRED && it.role !in ACCELERATOR_ROLES && it.role !in DATA_ROLES && it.forPlatform(platform) &&
                 (it.context == "*" || it.context == context)
         }
     }
 
     /** Every context's required files beyond [context]'s (another context later is about 0.9 MB). */
     @JvmStatic
-    fun contextOnly(m: ModelManifest, context: String, platform: String = TajweedFormer.PLATFORM): List<ModelManifest.FileEntry> =
+    fun contextOnly(m: ModelManifest, context: String, platform: String = SdkInfo.PLATFORM): List<ModelManifest.FileEntry> =
         cpu(m, context, platform).filter { it.context == context }
 
     /**
@@ -84,7 +103,7 @@ object ModelProfile {
      */
     @JvmStatic
     @JvmOverloads
-    fun npu(m: ModelManifest, soc: String?, context: String, platform: String = TajweedFormer.PLATFORM): List<ModelManifest.FileEntry> {
+    fun npu(m: ModelManifest, soc: String?, context: String, platform: String = SdkInfo.PLATFORM): List<ModelManifest.FileEntry> {
         if (soc == null || context in CPU_ONLY_CONTEXTS) return emptyList()
         val files = m.files.filter {
             it.need == ModelManifest.Need.OPTIONAL && it.role in ALL_NPU_ROLES && it.forPlatform(platform) &&
@@ -135,7 +154,7 @@ object ModelProfile {
  * Tensor G3 or later device exists (they ship with API 34 or later), so that path is a safety net.
  * Hardware codenames are used only as a fallback for Pixels whose SoC fields are empty.
  */
-object SocIds {
+internal object SocIds {
     private val PIXEL_CODENAMES = mapOf(
         // Tensor G3: Pixel 8, 8 Pro, 8a
         "shiba" to "tensor_g3", "husky" to "tensor_g3", "akita" to "tensor_g3",
@@ -173,4 +192,19 @@ object SocIds {
         PIXEL_CODENAMES[norm(hardware)]?.let { return it }
         return BOARDS[norm(hardware)]
     }
+
+    /** Whether [arch] (`os.arch` of the process) is an x86 CPU: `x86_64`, `amd64`, `x86`, `i686`. */
+    @JvmStatic
+    fun isX86(arch: String?): Boolean {
+        val a = arch?.trim()?.lowercase() ?: return false
+        return a.startsWith("x86") || a == "amd64" || a.matches(Regex("i[3-6]86"))
+    }
+
+    /**
+     * The SoC id [id] for a process of CPU architecture [arch]. An x86 process (the Android emulator on an Intel or
+     * AMD PC, an x86 Chromebook) has none, whatever the device's fields say: no accelerator build exists for it, so
+     * none is looked for, downloaded or promoted, and the SDK runs its CPU engine only.
+     */
+    @JvmStatic
+    fun onArch(id: String?, arch: String?): String? = if (isX86(arch)) null else id
 }

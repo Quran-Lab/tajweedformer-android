@@ -15,17 +15,32 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPInputStream
 
 /**
+ * The system does not let this app use the network (Android: the INTERNET permission, which the SDK's manifest
+ * declares, was taken out of the app's manifest). An IOException, so everything that waits for a connection treats it
+ * as having none; the calls that need the network name it (`network_not_permitted`).
+ */
+internal class NetworkNotPermitted(cause: SecurityException) :
+    IOException("the system does not let this app use the network: ${cause.message}", cause)
+
+/** [request], where a request to a server is made: the system's refusal of the network leaves as [NetworkNotPermitted]. */
+internal fun <T> permitted(request: () -> T): T = try {
+    request()
+} catch (e: SecurityException) {
+    throw NetworkNotPermitted(e)
+}
+
+/**
  * The HTTP the model downloader uses: one GET with headers. The default is [UrlConnectionTransport]
  * (`HttpURLConnection`, no dependency); an app that has OkHttp or Cronet can pass its own.
  */
-fun interface HttpTransport {
+internal fun interface HttpTransport {
     /** A GET of [url] with [headers]. Throws IOException for a network failure. */
     @Throws(IOException::class)
     fun get(url: String, headers: Map<String, String>): HttpResponse
 }
 
 /** An HTTP answer: status, headers (names lower case), the body. Close it when done. */
-class HttpResponse(
+internal class HttpResponse(
     val code: Int,
     /** Header names in lower case. */
     val headers: Map<String, String>,
@@ -43,22 +58,35 @@ class HttpResponse(
  * Headers added to every model request (the app key `x-qlab-key`, and anything the portal client
  * adds). The SDK's cloud module provides it; null means none.
  */
-fun interface HeaderProvider {
+internal fun interface HeaderProvider {
     fun headers(url: String): Map<String, String>
 }
 
 /** Whether the device is on an unmetered network now. Android: [ai.quranlab.tajweedformer.android.AndroidNetwork]. */
-fun interface NetworkPolicy {
+internal fun interface NetworkPolicy {
     fun isUnmetered(): Boolean
 
+    /**
+     * The connection as `diagnose()` reports it: `unmetered` (Wi-Fi, Ethernet), `metered` (cellular, or marked
+     * metered or data saver by the system), `none` (no network), or `unknown` where the platform cannot tell.
+     * `prefetch(unmeteredOnly = true)` downloads on `unmetered` and `unknown` and waits on `metered` and `none`.
+     */
+    fun connection(): String = if (isUnmetered()) "unmetered" else "metered"
+
     companion object {
-        /** Treats every network as unmetered (desktop JVM, tests). */
+        /** Treats every network as unmetered (tests). */
         @JvmField val ALWAYS_UNMETERED = NetworkPolicy { true }
+
+        /** A platform that cannot tell what its network is (the desktop JVM): nothing waits for an unmetered one. */
+        @JvmField val UNKNOWN: NetworkPolicy = object : NetworkPolicy {
+            override fun isUnmetered(): Boolean = true
+            override fun connection(): String = "unknown"
+        }
     }
 }
 
 /** `HttpURLConnection`, no redirects across protocols, 15 s connect and 30 s read timeouts. */
-class UrlConnectionTransport @JvmOverloads constructor(
+internal class UrlConnectionTransport @JvmOverloads constructor(
     private val connectTimeoutMs: Int = 15_000,
     private val readTimeoutMs: Int = 30_000,
 ) : HttpTransport {
@@ -77,7 +105,7 @@ class UrlConnectionTransport @JvmOverloads constructor(
 }
 
 /** Stops a download from another thread. */
-class Cancellation {
+internal class Cancellation {
     private val flag = AtomicBoolean(false)
     val isCancelled: Boolean get() = flag.get()
     fun cancel() = flag.set(true)
@@ -100,7 +128,7 @@ class Cancellation {
  * place); different files can download in parallel. Requests ask for `Accept-Encoding: identity`
  * so the transport never re-encodes the bytes whose hash is checked.
  */
-class ModelDownloader @JvmOverloads constructor(
+internal class ModelDownloader @JvmOverloads constructor(
     val root: File,
     /** The folder URL the manifest's paths are relative to, ending in `/`. */
     val baseUrl: String,
@@ -190,7 +218,7 @@ class ModelDownloader @JvmOverloads constructor(
                 h["If-Range"] = validator.readText().trim()
             }
             val r = try {
-                transport.get(baseUrl + e.path, h)
+                permitted { transport.get(baseUrl + e.path, h) }
             } catch (x: IOException) {
                 fail(e, "network: ${x.message}", x)
             }

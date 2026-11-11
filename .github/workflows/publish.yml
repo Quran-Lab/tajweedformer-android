@@ -31,24 +31,33 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools
-        run: sudo apt-get install -y ninja-build
-      - name: JVM tests (no engine)
-        run: ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
-      - name: JVM tests with the engine (V4; the model-dependent ones skip without the model)
+      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
+        run: |
+          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
+      # the same tests as the CI workflow, in the same way (the 2.x list named test classes that 3.0 does not have)
+      - name: libopus for the sharing tests (built first, so no sharing test ever skips)
+        run: bash scripts/opus/build_opus_host.sh
+      - name: JVM tests (no engine; libopus required)
+        run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
+      - name: JVM tests with the engine (the host JNI library is built; the model-dependent ones skip without the model)
         run: |
           ./gradlew --no-daemon :tajweedformer-jvm:cleanTest :tajweedformer-jvm:test -Pnative \
-            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.EngineSettingsTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedApiTest' --tests 'ai.quranlab.tajweedformer.TajweedModelTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedSettingsTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
-            --tests 'ai.quranlab.tajweedformer.LayersTest'
-      - name: Signed bundle (AAR with arm64-v8a and armeabi-v7a, sources, javadoc, POM, signatures, checksums)
+            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
+            --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
+            --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
+      - name: Signed bundle (AAR with arm64-v8a, armeabi-v7a and x86_64, sources, javadoc, POM, signatures, checksums)
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
         run: |
           [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
           ./gradlew --no-daemon :tajweedformer:centralBundle
           unzip -l tajweedformer/build/distributions/central-bundle-*.zip
+      - name: Android's verifier rule on monitors, on the AAR inside the bundle (nothing is uploaded when a class would be rejected on a phone)
+        run: |
+          python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
+          rm -rf build/monitor-check && mkdir -p build/monitor-check
+          unzip -o -q tajweedformer/build/distributions/central-bundle-*.zip '*.aar' -d build/monitor-check
+          python3 scripts/check_monitor_handlers.py build/monitor-check
       - name: Upload to the Central Portal (USER_MANAGED) and wait for validation
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}

@@ -1,6 +1,6 @@
 package ai.quranlab.tajweedformer.sharing
 
-import ai.quranlab.tajweedformer.TajweedFormer
+import ai.quranlab.tajweedformer.SdkInfo
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -11,7 +11,7 @@ import kotlin.random.Random
  * cut at Ogg page boundaries. Short first segments reach R2 within seconds; a long session makes
  * one upload a minute.
  */
-object SegmentPlan {
+internal object SegmentPlan {
     @JvmField val SECONDS = listOf(10, 20, 40, 60)
 
     /** Seconds in segment [n] (1-based). */
@@ -22,7 +22,7 @@ object SegmentPlan {
  * A closed segment of an [OggOpusWriter]: its number, file, last granule position, whether it ends the
  * stream, and the bit rate (bit/s) every packet of it was encoded at.
  */
-data class OggSegment(val n: Int, val file: File, val granule: Long, val last: Boolean, val bitrate: Int = 0)
+internal data class OggSegment(val n: Int, val file: File, val granule: Long, val last: Boolean, val bitrate: Int = 0)
 
 /**
  * Writes one session's audio as Ogg Opus while the session runs, byte for byte as the Swift SDK's
@@ -43,7 +43,7 @@ data class OggSegment(val n: Int, val file: File, val granule: Long, val last: B
  * segment n - 1 closed (packet by packet around the boundary, so the closing is seen first). Opus takes a
  * new bitrate on any packet: no new headers, one stream.
  */
-class OggOpusWriter @JvmOverloads constructor(
+internal class OggOpusWriter @JvmOverloads constructor(
     private val segmentFile: (Int) -> File,
     private val plan: List<Int>,
     val inputRate: Int,
@@ -288,9 +288,9 @@ class OggOpusWriter @JvmOverloads constructor(
             return d
         }
 
-        /** The vendor string, "QuranLab SDK 2.0.2 libopus 1.6.1" as the Swift SDK writes it. */
+        /** The vendor string, "QuranLab SDK 2.0.3 libopus 1.6.1" as the Swift SDK writes it. */
         @JvmStatic
-        fun vendor(): String = "QuranLab SDK ${TajweedFormer.VERSION} ${OpusVersion.string}"
+        fun vendor(): String = "QuranLab SDK ${SdkInfo.VERSION} ${OpusVersion.string}"
 
         @JvmStatic
         fun opusTags(vendor: String = vendor()): ByteArray {

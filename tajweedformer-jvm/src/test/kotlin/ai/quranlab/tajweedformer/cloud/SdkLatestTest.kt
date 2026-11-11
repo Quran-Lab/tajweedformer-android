@@ -2,7 +2,8 @@ package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Ed25519
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.TajweedFormer
+import ai.quranlab.tajweedformer.OpenChecked
+import ai.quranlab.tajweedformer.SdkInfo
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,7 +26,7 @@ import java.util.Collections
  * then reads only the fields it knows, so a config with `sdk_latest` (or any new top-level field) verifies and parses
  * the same; a changed byte does not verify.
  */
-class SdkLatestTest {
+class SdkLatestTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private lateinit var dir: File
     private val lines = Collections.synchronizedList(ArrayList<String>())
@@ -47,22 +48,23 @@ class SdkLatestTest {
         mapOf("sdk_latest" to mapOf("version" to version, "severity" to severity, "url" to url))
 
     @Test fun aNewerSdkLogsOneLinePerLaunchInADebuggableBuild() {
-        stub.extra = latest("2.0.9")
+        stub.extra = latest("3.0.9")
         val c = cloud()
         c.refreshConfig()
-        stub.extra = latest("2.1.0", "required")
+        stub.extra = latest("3.1.0", "required")
         c.refreshConfig()
-        assertEquals(listOf("Quran Lab SDK 2.0.9 is available (recommended), you have ${TajweedFormer.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
+        assertEquals(listOf("Quran Lab SDK 3.0.9 is available (recommended), you have ${SdkInfo.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
             lines.toList())
         // the next launch (a new cloud for the process) logs again, once
         cloud().refreshConfig()
         assertEquals(2, lines.size)
-        assertTrue(lines[1].startsWith("Quran Lab SDK 2.1.0 is available (required), you have "))
+        assertTrue(lines[1].startsWith("Quran Lab SDK 3.1.0 is available (required), you have "))
     }
 
     @Test fun equalOlderReleaseOrMalformedLogNothing() {
-        for (extra in listOf(latest(TajweedFormer.VERSION), latest("2.0.0"), latest("1.9.9"), latest("2.0"), latest("abc"),
-            latest("2.0.2", null), latest("2.0.2", "recommended", "http://insecure"), latest(2.1), mapOf("sdk_latest" to "2.0.2"),
+        // equal, older, and newer ones that are malformed (two parts, no severity, a plain http link, a number, a string)
+        for (extra in listOf(latest(SdkInfo.VERSION), latest("2.0.3"), latest("1.9.9"), latest("3.0"), latest("abc"),
+            latest("3.0.2", null), latest("3.0.2", "recommended", "http://insecure"), latest(3.1), mapOf("sdk_latest" to "3.0.2"),
             mapOf("sdk_latest" to emptyMap<String, Any?>()), emptyMap())) {
             stub.extra = extra
             val c = cloud()

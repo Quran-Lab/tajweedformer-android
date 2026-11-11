@@ -1,6 +1,7 @@
 package ai.quranlab.tajweedformer.sharing
 
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.OpenChecked
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,7 +26,7 @@ import java.util.Base64
  * message and its signatures, the recovery codes, the libopus encode vector of the web and C SDKs, and
  * since 2.0.1 the adaptive bitrate ladder and the custom consent wording.
  */
-class SharingVectorsTest {
+class SharingVectorsTest : OpenChecked() {
     @Suppress("UNCHECKED_CAST")
     private fun json(path: String): Map<String, Any?> =
         Json.parse(javaClass.getResourceAsStream("/sharing_vectors/$path")!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>

@@ -24,7 +24,7 @@ import kotlin.math.exp
  * fake runner. Where the device-fed bytes of the 11-07 Pixel runs are on this machine
  * (npu_work/c16_l64/pack_t7), the x codes are compared with them byte for byte.
  */
-class NpuHostTest {
+class NpuHostTest : OpenChecked() {
     private val transport = File(TestKit.env("TJ_V4_TRANSPORT_DIR") ?: "")
     private val npuWork = File(TestKit.env("TJ_NPU_WORK") ?: "")
 
@@ -48,12 +48,12 @@ class NpuHostTest {
             assertEquals(110, c.inputs.size)
             assertEquals(97, c.states.size)
             assertEquals(12, c.heads.size)
-            assertEquals(TajweedHead.entries.toSet(), c.heads.map { it.head }.toSet())
+            assertEquals(HeadId.entries.toSet(), c.heads.map { it.head }.toSet())
             assertEquals(12, c.maskInputs.size)
             assertEquals(listOf(1, 1, 45, 80), c.x.shape)
-            assertEquals(HostOp.LOG_SOFTMAX, c.heads.first { it.head == TajweedHead.LOG_PROBS }.op)
-            assertEquals(HostOp.SOFTMAX, c.heads.first { it.head == TajweedHead.GEM }.op)
-            assertEquals(HostOp.NONE, c.heads.first { it.head == TajweedHead.CONF }.op)
+            assertEquals(HostOp.LOG_SOFTMAX, c.heads.first { it.head == HeadId.LOG_PROBS }.op)
+            assertEquals(HostOp.SOFTMAX, c.heads.first { it.head == HeadId.GEM }.op)
+            assertEquals(HostOp.NONE, c.heads.first { it.head == HeadId.CONF }.op)
             val m = NpuMasks.parse(gunzip(staged(soc, "masks.json")), c)
             assertEquals(5, m.sets.size)
             // chunk 0 keeps less of the left context than chunk 4 and later (the same set from 4 on)
@@ -118,7 +118,7 @@ class NpuHostTest {
             "zf_fill0" to NpuTensor("zf_fill0", listOf(2), "int16", 1.0, 0),
         )
         val outs = linkedMapOf("new_s0" to NpuTensor("new_s0", listOf(3), "int16", 2.0, 0))
-        val heads = TajweedHead.entries.map { h ->
+        val heads = HeadId.entries.map { h ->
             val frames = if (h.frameMs == 40) 1 else 2
             outs["o_${h.key}"] = NpuTensor("o_${h.key}", listOf(frames, h.width), "int16", 0.1, 0)
             ai.quranlab.tajweedformer.npu.NpuHeadSpec("o_${h.key}", h, if (h.kind == HeadKind.LOG_PROBS) HostOp.LOG_SOFTMAX else if (h.kind == HeadKind.PROBS) HostOp.SOFTMAX else HostOp.NONE)
@@ -149,7 +149,7 @@ class NpuHostTest {
         val s = NpuStreamer(c, masks, runner)
         // 14 frames of 2 bins, value = frame index / 100, pushed in pieces of 1, 6 and 7 frames
         val all = FloatArray(28) { (it / 2) / 100f }
-        val heads = ArrayList<TajweedHeads>()
+        val heads = ArrayList<HeadValues>()
         heads += s.push(all.copyOfRange(0, 2))
         heads += s.push(all.copyOfRange(2, 14))
         heads += s.push(all.copyOfRange(14, 28))
@@ -170,9 +170,9 @@ class NpuHostTest {
         // heads: one 40 ms frame each, every head, log-softmax rows that sum to 1
         val h = heads[0]
         assertEquals(1, h.n40)
-        assertEquals(TajweedHead.entries.toSet(), h.available)
-        assertEquals(1.0, h[TajweedHead.LOG_PROBS]!!.sumOf { exp(it.toDouble()) }, 1e-5)
-        assertEquals(0.1f, h[TajweedHead.CONF]!![1], 1e-6f)
+        assertEquals(HeadId.entries.toSet(), h.available)
+        assertEquals(1.0, h[HeadId.LOG_PROBS]!!.sumOf { exp(it.toDouble()) }, 1e-5)
+        assertEquals(0.1f, h[HeadId.CONF]!![1], 1e-6f)
         // a new take starts from zero states and set 0
         s.reset()
         seen.clear()

@@ -1,22 +1,8 @@
 package ai.quranlab.tajweedformer.cloud
 
-import ai.quranlab.tajweedformer.CheckStatus
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.LetterVerdict
-import ai.quranlab.tajweedformer.MaddClass
-import ai.quranlab.tajweedformer.MaddVerdict
-import ai.quranlab.tajweedformer.ResolvedCheck
-import ai.quranlab.tajweedformer.ResolvedSite
-import ai.quranlab.tajweedformer.ResolvedTajweedSettings
-import ai.quranlab.tajweedformer.SettingSource
-import ai.quranlab.tajweedformer.SiteClass
-import ai.quranlab.tajweedformer.SiteVerdict
-import ai.quranlab.tajweedformer.TajweedBackend
-import ai.quranlab.tajweedformer.TajweedFormer
-import ai.quranlab.tajweedformer.TajweedPreset
-import ai.quranlab.tajweedformer.TajweedResult
-import ai.quranlab.tajweedformer.TajweedSummary
-import ai.quranlab.tajweedformer.WordVerdict
+import ai.quranlab.tajweedformer.OpenChecked
+import ai.quranlab.tajweedformer.SdkInfo
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -31,7 +17,7 @@ import java.io.File
 import java.nio.file.Files
 
 /** The platform client (docs/platform-client.md and the API it talks to) against [StubQlab] on 127.0.0.1. */
-class CloudTest {
+class CloudTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private lateinit var dir: File
     private var now = System.currentTimeMillis()
@@ -71,7 +57,7 @@ class CloudTest {
         val b = regs[0].json!!
         assertEquals(setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"), b.keys)
         assertEquals("android", b["platform"])
-        assertEquals(TajweedFormer.VERSION, b["sdk_version"])
+        assertEquals(SdkInfo.VERSION, b["sdk_version"])
         assertEquals(true, b["new_install"])
         assertTrue(regs[0].headers["authorization"]!!.startsWith("Bearer qlt_v1."))
         // the token came from POST /v1/attest with the key, unattested (sharing is off)
@@ -106,23 +92,27 @@ class CloudTest {
         val c = cloud()
         val cfg = c.refreshConfig()
         assertNotNull(cfg)
-        assertEquals(TajweedFormer.VERSION, stub.seen("/v1/config")[0].q("sdk"))
+        assertEquals(SdkInfo.VERSION, stub.seen("/v1/config")[0].q("sdk"))
         assertNotNull(stub.seen("/v1/config")[0].q("bucket"))
-        assertTrue(c.tajweedJson!!.contains("\"sensitive\""))
+        assertEquals("c24_l72", c.inferenceContext)
         assertEquals("v4.0+abc", cfg!!.recommendedRevision)
+        assertEquals("4.0.0", cfg.recommendedVersion)
         // the next fetch is conditional: 304 keeps the stored body
         assertNotNull(c.refreshConfig())
         val second = stub.seen("/v1/config")[1]
         assertTrue(second.headers["if-none-match"]!!.startsWith("\""))
-        assertTrue(c.tajweedJson!!.contains("sensitive"))
-        // a change on the portal: 200 with the new block
-        stub.tajweed = mapOf("v" to 1.0, "preset" to "strict", "word" to mapOf("preset" to "beginner"))
+        assertEquals("c24_l72", c.inferenceContext)
+        // a change on the portal (the Response time): 200 with the new field
+        stub.inference = mapOf("context" to "c8_l64")
         c.refreshConfig()
-        assertTrue(c.tajweedJson!!.contains("\"strict\""))
-        assertTrue(c.tajweedJson!!.contains("beginner"))
+        assertEquals("c8_l64", c.inferenceContext)
         // survives a relaunch, re-verified from disk
         val c2 = cloud()
-        assertTrue(c2.tajweedJson!!.contains("\"strict\""))
+        assertEquals("c8_l64", c2.inferenceContext)
+        // no field: nothing chosen on the portal
+        stub.inference = null
+        c2.refreshConfig()
+        assertNull(c2.inferenceContext)
     }
 
     @Test fun theModelFolderUrlComesFromTheSignedBaseElseTheCdnModelsPath() {
@@ -141,10 +131,10 @@ class CloudTest {
     @Test fun aTamperedOrForeignConfigIsRejectedAndTheLastGoodOneKept() {
         val c = cloud()
         c.refreshConfig()
-        stub.tajweed = mapOf("v" to 1.0, "preset" to "strict")
+        stub.inference = mapOf("context" to "c8_l64")
         stub.tamper = true
         c.refreshConfig()
-        assertTrue("the last good block stays", c.tajweedJson!!.contains("sensitive"))
+        assertEquals("the last good config stays", "c24_l72", c.inferenceContext)
         assertTrue(c.issues.pending().any { it["kind"] == "signature_invalid" })
         // a config signed by a key the SDK does not pin
         stub.tamper = false
@@ -185,13 +175,15 @@ class CloudTest {
         assertEquals("lt2", DeviceProfile.ramTier(1_000_000_000))
     }
 
-    private fun session(c: QuranLabCloud, seconds: Double = 30.0, preset: String = "balanced", backend: String = "cpu", context: String = "c16_l64") {
-        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", context, backend, preset, "general", checksOn = setOf("letters", "vowels", "madd", "bogus")))
+    private fun session(c: QuranLabCloud, seconds: Double = 30.0, backend: String = "cpu", context: String = "c16_l64") {
+        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", context, backend))
         repeat(10) { c.onChunk(12.0 + it, 320.0) }
         c.onTokens(floatArrayOf(0.3f, 1.5f, 9f), floatArrayOf(0.99f, 0.6f))
-        c.onScored(TajweedObserver.Scored(1, 2, mapOf("vowel_sub" to (10 to 1), "cons_sub" to (8 to 0), "nonsense" to (1 to 1)), maddC2 = 3, maddC4 = 1, wordsScored = 7, wordsFlagged = 1))
-        c.onScored(TajweedObserver.Scored(112, 1))
-        c.onSessionEnd(TajweedObserver.SessionEnd(seconds, completed = true, feedbackShown = true))
+        c.onSessionEnd(TajweedObserver.SessionEnd(seconds, completed = true, feedbackShown = true, audioMs = (seconds * 1000).toLong(),
+            computeUs = 150_400, speechFrames = 100, silenceFrames = 25, tokens = mapOf("log_probs" to 12, "inter1_log_probs" to 0)))
+        // what the app reported for the take (SPEC 6.3)
+        c.telemetry.recited(1, 2, 2)
+        c.telemetry.recited(112, 1, 1)
     }
 
     private fun body(f: File) = stub.parse(f.readBytes())
@@ -224,12 +216,15 @@ class CloudTest {
         val b = ev.json!!
         assertEquals(2.0, b["v"])
         assertEquals(Day.of(now), b["day"])
-        assertEquals(TajweedFormer.VERSION, b["sdk_version"])
+        assertEquals(SdkInfo.VERSION, b["sdk_version"])
         assertTrue(Regex("^[0-9a-f]{32}$").matches(b["report_id"] as String))
         assertTrue(sealed.name.contains(b["report_id"] as String))
         assertEquals(mapOf("class" to "Pixel8", "soc" to "tensor_g3", "os_major" to 15.0, "ram_tier" to "8_16"), b["device"])
         val co = (b["cohorts"] as List<Map<String, Any?>>)
-        val main = co.first { it["preset"] == "balanced" && (it["sessions"] as Double) > 0 }
+        val main = co.first { (it["sessions"] as Double) > 0 }
+        for (gone in listOf("preset", "word_level", "word_bucket", "site_overrides", "checks_on", "classes", "session_flag_pct", "madd", "words")) {
+            assertFalse("a 3.0 cohort has no $gone", main.containsKey(gone))
+        }
         assertEquals(2.0, main["sessions"])
         assertEquals(0.75, main["minutes"])
         assertEquals(20.0, main["chunks"])
@@ -238,18 +233,21 @@ class CloudTest {
         assertEquals(mapOf("le_250" to 1.0), main["cold_start_ms"])
         assertEquals(mapOf("le_0_5" to 2.0, "le_2" to 2.0, "gt_8" to 2.0), main["margin"])
         assertEquals(mapOf("le_0_7" to 2.0, "gt_0_95" to 2.0), main["confidence"])
-        assertEquals(mapOf("letters" to 2.0, "vowels" to 2.0, "madd" to 2.0), main["checks_on"])
-        assertEquals(mapOf("vowel_sub" to mapOf("sites" to 20.0, "flagged" to 2.0), "cons_sub" to mapOf("sites" to 16.0, "flagged" to 0.0)), main["classes"])
-        assertEquals(mapOf("le_10" to 2.0), main["session_flag_pct"])
         assertEquals(mapOf("pass" to 1.0, "fail" to 0.0), main["self_test"])
-        assertEquals(mapOf("c2" to 6.0, "c4" to 2.0, "c6" to 0.0, "flagged" to 0.0), main["madd"])
-        assertEquals(mapOf("scored" to 14.0, "flagged" to 2.0), main["words"])
+        // SPEC 6.2: the SDK-measured counters of the two takes
+        assertEquals(2.0, main["takes"])
+        assertEquals(45.0, main["audio_s"])
+        assertEquals(8.0, main["speech_s"])
+        assertEquals(2.0, main["silence_s"])
+        assertEquals(0.301, main["compute_s"])
+        assertEquals(mapOf("log_probs" to 24.0), main["tokens"])
         assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["coverage"])
         assertEquals(listOf(mapOf("revision" to "v4.0+abc", "profile" to "android-cpu", "bytes" to 7.2E7, "success" to 1.0, "failed" to 0.0, "resumed" to 1.0)), b["downloads"])
-        // 2.0.1: the delta's counters (zero ones left out)
+        // the delta's counters (zero ones left out); the app-reported ones are listed
         assertEquals(4.0, b["ayahs"])
-        assertEquals(14.0, b["words"])
         assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["surah_ayahs"])
+        assertEquals(listOf("ayahs", "surah_ayahs", "coverage"), b["reported"])
+        assertFalse(b.containsKey("words"))
         assertEquals("each finished session with feedback asks while the learner has not answered (the config offers sharing, a sheet is registered; 3 at most)", 2.0, b["share_asked"])
         for (k in listOf("launches", "rule_checks", "rule_flags", "share_yes", "share_no")) assertFalse(k, b.containsKey(k))
         // nothing that could identify anyone: only the schema's fields (the stub refuses any other)
@@ -383,49 +381,62 @@ class CloudTest {
     }
 
     @Suppress("UNCHECKED_CAST")
-    @Test fun aScoredResultGivesTheRuleCountsOfTheChecksThatRan() {
-        fun site(cls: SiteClass, status: CheckStatus, flagged: Boolean) = SiteVerdict(cls, status, 3, 0, 32, 33, 2.0, 1.0, 1.8, 1.0, flagged, 4, 6)
-        fun madd(cls: MaddClass, flagged: Boolean) = MaddVerdict(5, 1, 40, cls, CheckStatus.VALIDATED, 2.0, if (flagged) 4 else 2, 2.0, 2, 2, flagged, 10, 20)
-        fun letter(status: CheckStatus, flagged: Boolean) = LetterVerdict(7, 2, 12, status, 0.5, 0.6, flagged, 30, 33)
-        val on = ResolvedSite(CheckStatus.VALIDATED, true, 1.0, TajweedPreset.BALANCED, SettingSource.CALIBRATION)
-        val settings = ResolvedTajweedSettings("c16_l64", TajweedBackend.INT8, TajweedPreset.BALANCED,
-            mapOf(SiteClass.VOWEL_SUB to on, SiteClass.CONS_SUB to on.copy(status = CheckStatus.EXPERIMENTAL, enabled = false),
-                SiteClass.INSERTION to on.copy(status = CheckStatus.OFF, enabled = false)),
-            madd = ResolvedCheck(CheckStatus.VALIDATED, true), lazim = ResolvedCheck(CheckStatus.EXPERIMENTAL, false),
-            gemination = ResolvedCheck(CheckStatus.EXPERIMENTAL, false), qalqalah = ResolvedCheck(CheckStatus.VALIDATED, true, tau = 0.6),
-            dropped = emptyList(), refused = emptyList())
-        val result = TajweedResult(2, 255, settings,
-            sites = listOf(site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, true), site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, false),
-                site(SiteClass.VOWEL_SUB, CheckStatus.VALIDATED, false), site(SiteClass.CONS_SUB, CheckStatus.EXPERIMENTAL, false),
-                site(SiteClass.CONS_SUB, CheckStatus.EXPERIMENTAL, false), site(SiteClass.INSERTION, CheckStatus.OFF, false)),
-            madd = listOf(madd(MaddClass.FIXED2, true), madd(MaddClass.FREE, false), madd(MaddClass.LAZIM, false)),
-            qalqalah = listOf(letter(CheckStatus.VALIDATED, true), letter(CheckStatus.VALIDATED, false)),
-            gemination = listOf(letter(CheckStatus.EXPERIMENTAL, false)),
-            summary = TajweedSummary(6, 1, 3, 1, 2, 1, 1, 0, 2.0, true),
-            words = listOf(WordVerdict(0, 1.0, 2.0, false), WordVerdict(1, 3.0, 2.0, true), WordVerdict(2, -1.0, 2.0, false)))
-        val e = TajweedObserver.Scored.of(result)
-        assertEquals("only the checks that ran: no cons_sub (disabled), insertion (off), gemination (disabled) or lazim (disabled)",
-            mapOf("vowel_sub" to 3, "madd" to 2, "qalqalah" to 2, "word" to 3), e.ruleChecks)
-        assertEquals(mapOf("vowel_sub" to 1, "madd" to 1, "qalqalah" to 1, "word" to 1), e.ruleFlags)
-        assertEquals(mapOf("vowel_sub" to (3 to 1), "cons_sub" to (2 to 0), "insertion" to (1 to 0)), e.classes)
+    @Test fun theAppsOwnReportsGiveTheAppReportedFieldsAndTheReportedList() {
+        // SPEC 6.3: nothing the SDK measures; counted only because the app said so, and listed in `reported`
         val c = cloud()
-        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", "balanced", "general"))
-        c.onScored(e)
-        c.onScored(e)
+        c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
         c.onSessionEnd(TajweedObserver.SessionEnd(12.0, completed = true))
+        c.telemetry.recited(2, 255, 256)
+        assertTrue(c.telemetry.checks("vowel_sub", 3, 1))
+        assertTrue(c.telemetry.checks("vowel_sub", 3, 1))
+        assertTrue(c.telemetry.checks("madd", 4, 2))
+        assertTrue(c.telemetry.checks("qalqalah", 4, 2))
+        assertTrue(c.telemetry.checks("word", 6, 2))
+        assertFalse("nothing checked: nothing counted, no place among the day's rules", c.telemetry.checks("gemination", 0, 0))
         c.background()
         assertEquals(1, c.deliver().first)
         val b = stub.seen("/v1/events").single().json!!
         assertEquals(2.0, b["ayahs"])
         assertEquals(6.0, b["words"])
         assertEquals(mapOf("2" to 2.0), b["surah_ayahs"])
+        assertEquals(mapOf("2" to 2.0), b["coverage"])
         val checks = b["rule_checks"] as Map<String, Double>
         val flags = b["rule_flags"] as Map<String, Double>
         assertEquals(mapOf("vowel_sub" to 6.0, "madd" to 4.0, "qalqalah" to 4.0, "word" to 6.0), checks)
         assertEquals(mapOf("vowel_sub" to 2.0, "madd" to 2.0, "qalqalah" to 2.0, "word" to 2.0), flags)
         for ((k, f) in flags) assertTrue("$k: flags <= checks", f <= checks.getValue(k))
+        assertEquals(listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags"), b["reported"])
     }
 
+    @Suppress("UNCHECKED_CAST")
+    @Test fun reportedListsExactlyTheAppReportedFieldsPresentInEveryCombination() {
+        // the server refuses a body whose `reported` and fields disagree (the stub does the same): every combination
+        // of what an app can report gives a list that names exactly the fields the body carries
+        for (mask in 0 until 16) {
+            stub.close()
+            stub = StubQlab()
+            dir.deleteRecursively()
+            dir = Files.createTempDirectory("tj-cloud").toFile()
+            val c = cloud()
+            c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
+            c.onSessionEnd(TajweedObserver.SessionEnd(3.0, completed = true))
+            if (mask and 1 != 0) c.telemetry.recited(1, 1, 7)
+            if (mask and 2 != 0) c.telemetry.checks("word", 5, 0)
+            if (mask and 4 != 0) c.telemetry.checks("madd", 5, 0)
+            if (mask and 8 != 0) c.telemetry.checks("qalqalah", 5, 2)
+            c.background()
+            assertEquals("mask $mask: the server accepted the delta", 1, c.deliver().first)
+            val b = stub.seen("/v1/events").single().json!!
+            val six = listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags")
+            val present = six.filter { b.containsKey(it) }
+            if (present.isEmpty()) assertFalse("mask $mask: nothing reported, no field", b.containsKey("reported"))
+            else assertEquals("mask $mask", present, b["reported"])
+            assertEquals("mask $mask ayahs", mask and 1 != 0, b.containsKey("ayahs"))
+            assertEquals("mask $mask words", mask and 2 != 0, b.containsKey("words"))
+            assertEquals("mask $mask rule_checks", mask and 14 != 0, b.containsKey("rule_checks"))
+            assertEquals("mask $mask rule_flags", mask and 8 != 0, b.containsKey("rule_flags"))
+        }
+    }
     @Test fun theKillSwitchAndTheDeveloperOptOutDropEverything() {
         val c = cloud()
         session(c)

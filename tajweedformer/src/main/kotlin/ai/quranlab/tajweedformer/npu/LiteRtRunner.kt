@@ -25,7 +25,7 @@ internal object LiteRtJni {
  * its function type, e.g. every part in ONE LiteRT environment ([LiteRtRunner.Factory]). [parts] are the
  * part files in the chain's order.
  */
-interface NpuChainOpener {
+internal interface NpuChainOpener {
     fun openChain(contract: NpuContract, parts: List<File>): NpuRunner
 }
 
@@ -47,7 +47,7 @@ interface NpuChainOpener {
  * bench runner. This Kotlin / JNI layer itself has not run in an app on an NPU phone yet, nor on Google
  * Tensor; the self-test against the CPU guards every use.
  */
-class LiteRtRunner private constructor(private val contract: NpuContract, open: (Array<String>, Array<String>) -> Long) : NpuRunner {
+internal class LiteRtRunner private constructor(private val contract: NpuContract, open: (Array<String>, Array<String>) -> Long) : NpuRunner {
     /** One model with its own LiteRT environment (the vendor dispatch library from [dispatchDir]). */
     constructor(model: File, contract: NpuContract, dispatchDir: String?) :
         this(contract, { ins, outs -> LiteRtJni.open(model.path, dispatchDir, ins, outs) })

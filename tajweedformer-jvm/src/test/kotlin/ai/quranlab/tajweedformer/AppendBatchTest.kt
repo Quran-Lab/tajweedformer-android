@@ -12,18 +12,18 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Batched appends (TajweedSession.append keeps audio on the caller's side until it can complete a
+ * Batched appends (RecognizerSession.append keeps audio on the caller's side until it can complete a
  * chunk): against the unbatched path on the real engine, for odd piece sizes, the same chunks with the
  * same heads and tokens, delivered during the same append (no added latency), with far fewer hops; a
  * take ending in a partial chunk; a cancel with audio still buffered.
  */
-class AppendBatchTest {
+class AppendBatchTest : OpenChecked() {
     private val conf = V4ConformanceTest()
 
     /** What a take delivered: per chunk its index, first frame, every head, and the append it came in. */
-    private class Take(val chunks: List<TajweedChunk>, val during: List<Int>, val all: TajweedHeads, val hops: Int)
+    private class Take(val chunks: List<EngineChunk>, val during: List<Int>, val all: HeadValues, val hops: Int)
 
-    private fun run(tj: TajweedRecognizer, samples: FloatArray, piece: Int, batched: Boolean): Take = runBlocking {
+    private fun run(tj: Recognizer, samples: FloatArray, piece: Int, batched: Boolean): Take = runBlocking {
         tj.batchAppends = batched
         var appends = 0
         val during = java.util.Collections.synchronizedList(ArrayList<Int>())
@@ -55,7 +55,7 @@ class AppendBatchTest {
             assertEquals("$what: index", x.index, y.index)
             assertEquals("$what: frame", x.firstFrame, y.firstFrame)
             assertEquals("$what: n40", x.heads.n40, y.heads.n40)
-            for (h in TajweedHead.entries) {
+            for (h in HeadId.entries) {
                 val u = x.heads[h]
                 val v = y.heads[h]
                 assertEquals("$what: head $h present", u != null, v != null)
@@ -63,16 +63,16 @@ class AppendBatchTest {
             }
         }
         assertArrayEquals("$what: tokens", a.all.greedy(), b.all.greedy())
-        assertArrayEquals("$what: the take's log_probs", a.all[TajweedHead.LOG_PROBS]!!, b.all[TajweedHead.LOG_PROBS]!!, 0f)
+        assertArrayEquals("$what: the take's log_probs", a.all[HeadId.LOG_PROBS]!!, b.all[HeadId.LOG_PROBS]!!, 0f)
         // no added latency: every chunk is delivered during the same append (or the finish) as unbatched
         assertEquals("$what: the append each chunk came in", a.during, b.during)
     }
 
-    private fun recognizer(): Pair<TajweedRecognizer, FloatArray>? {
+    private fun recognizer(): Pair<Recognizer, FloatArray>? {
         val audio = conf.env("ZF_V4_AUDIO_DIR")?.let(::File)
         if (audio == null || !File(audio, "Saood_001001.pcm").isFile) return null
         val model = conf.model() ?: return null
-        val tj = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", threads = 4, allHeads = true))
+        val tj = Recognizer.open(model, Recognizer.Options(context = "c16_l64", threads = 4, allHeads = true))
         return tj to conf.readPcm(File(audio, "Saood_001001.pcm"))
     }
 
@@ -119,7 +119,7 @@ class AppendBatchTest {
             val b = minOf(a + 1, clip16.size - 1)
             (clip16[a] + (clip16[b] - clip16[a]) * (x - a)).toFloat()
         }
-        TajweedRecognizer.open(conf.model()!!, TajweedRecognizer.Options(context = "c16_l64", threads = 4, allHeads = true, sampleRate = 48_000)).use { tj ->
+        Recognizer.open(conf.model()!!, Recognizer.Options(context = "c16_l64", threads = 4, allHeads = true, sampleRate = 48_000)).use { tj ->
             run(tj, clip, 960, batched = true)
             for (piece in intArrayOf(1, 7, 960, 4410)) {
                 val plain = run(tj, clip, piece, batched = false)

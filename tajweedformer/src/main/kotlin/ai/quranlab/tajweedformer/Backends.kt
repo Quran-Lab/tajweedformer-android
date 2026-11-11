@@ -11,7 +11,7 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 
 /** Which backend a recognizer should run. */
-enum class BackendPreference {
+internal enum class BackendPreference {
     /** The NPU when this device has a verified build that passes its self-test, else the CPU. */
     AUTO,
     /** The exact CPU engine only. */
@@ -23,7 +23,7 @@ enum class BackendPreference {
  * (Saood_112002 of the engine's conformance set) and the greedy tokens the exact engine gives for it
  * in each context (bit-exact on every device, so the CPU check is an exact comparison).
  */
-class SelfTestClip(val samples: FloatArray, val expectedTokens: Map<String, IntArray>) {
+internal class SelfTestClip(val samples: FloatArray, val expectedTokens: Map<String, IntArray>) {
     companion object {
         private const val RESOURCE = "/ai/quranlab/tajweedformer/selftest_16k.f32"
 
@@ -58,16 +58,16 @@ class SelfTestClip(val samples: FloatArray, val expectedTokens: Map<String, IntA
  * and frame top-1 agreement was 99.6 % or more, so a working NPU passes with margin while a wrong
  * build, a wrong mask table or wrong I/O bytes do not.
  */
-object SelfTest {
-    data class Outcome(val result: SelfTestResult, val heads: TajweedHeads?, val chunkMs: List<Double> = emptyList())
+internal object SelfTest {
+    data class Outcome(val result: SelfTestResult, val heads: HeadValues?, val chunkMs: List<Double> = emptyList())
 
     private val cpuCache = ConcurrentHashMap<String, Outcome>()
 
     /** The heads of [clip] through [engine] (one stream, closed after). */
-    internal fun run(engine: TajweedEngine, clip: FloatArray, sampleRate: Int, times: MutableList<Double>? = null): TajweedHeads {
+    internal fun run(engine: TajweedEngine, clip: FloatArray, sampleRate: Int, times: MutableList<Double>? = null): HeadValues {
         val samples = if (sampleRate == 16_000) clip else throw IllegalStateException("the self-test runs at 16 kHz")
         engine.createStream().use { s ->
-            val out = ArrayList<TajweedHeads>()
+            val out = ArrayList<HeadValues>()
             var at = 0
             while (at < samples.size) {
                 val k = minOf(5120, samples.size - at)
@@ -79,14 +79,14 @@ object SelfTest {
                 at += k
             }
             out += s.finish()
-            return TajweedHeads.concat(out)
+            return HeadValues.concat(out)
         }
     }
 
     /** The CPU check, once per model folder, revision and context in a process. */
     @JvmStatic
-    fun cpu(engine: TajweedEngine, model: TajweedModel, context: String, clip: SelfTestClip = SelfTestClip.builtIn()): Outcome {
-        val key = model.dir.absolutePath + "|" + model.manifest.revision + "|" + context
+    fun cpu(engine: TajweedEngine, model: ModelFolder, context: String, clip: SelfTestClip = SelfTestClip.builtIn()): Outcome {
+        val key = model.dir.absolutePath + "|" + model.manifest.build + "|" + context
         cpuCache[key]?.let { return it }
         val t0 = System.nanoTime()
         val outcome = try {
@@ -98,9 +98,9 @@ object SelfTest {
             val passed = finite && if (want != null) tokens.contentEquals(want) else tokens.isNotEmpty()
             val detail = "tokens ${tokens.size}" + (if (want != null) (if (tokens.contentEquals(want)) " = expected" else " != expected ${want.size}") else " (no expected tokens for $context)") +
                 (if (finite) "" else ", non-finite values")
-            Outcome(SelfTestResult(Backend.CPU, passed, detail, ms(t0), context = context, revision = model.manifest.revision), heads, times)
+            Outcome(SelfTestResult(Backend.CPU, passed, detail, ms(t0), context = context, revision = model.manifest.build), heads, times)
         } catch (e: Exception) {
-            Outcome(SelfTestResult(Backend.CPU, false, "failed: ${e.message}", ms(t0), context = context, revision = model.manifest.revision), null)
+            Outcome(SelfTestResult(Backend.CPU, false, "failed: ${e.message}", ms(t0), context = context, revision = model.manifest.build), null)
         }
         if (outcome.result.passed) cpuCache[key] = outcome
         SdkEvents.emit { it.onSelfTest(outcome.result) }
@@ -109,7 +109,7 @@ object SelfTest {
 
     /** The NPU check against [cpuHeads] (the CPU's heads of the same clip). */
     @JvmStatic
-    fun npu(engine: TajweedEngine, cpuHeads: TajweedHeads, soc: String?, context: String, clip: SelfTestClip = SelfTestClip.builtIn(), revision: String? = null): SelfTestResult {
+    fun npu(engine: TajweedEngine, cpuHeads: HeadValues, soc: String?, context: String, clip: SelfTestClip = SelfTestClip.builtIn(), revision: String? = null): SelfTestResult {
         val t0 = System.nanoTime()
         val r = try {
             val heads = run(engine, clip.samples, 16_000)
@@ -124,17 +124,17 @@ object SelfTest {
 
     /** The NPU rule (see the object's doc): (passed, detail). */
     @JvmStatic
-    fun compare(cpu: TajweedHeads, npu: TajweedHeads): Pair<Boolean, String> {
+    fun compare(cpu: HeadValues, npu: HeadValues): Pair<Boolean, String> {
         if (npu.n40 != cpu.n40) return false to "frames ${npu.n40} != CPU ${cpu.n40}"
         if (!allFinite(npu)) return false to "non-finite values"
-        val missing = TajweedHead.SCORER_HEADS.filter { !npu.has(it) }
+        val missing = HeadId.BASE_HEADS.filter { !npu.has(it) }
         if (missing.isNotEmpty()) return false to "heads missing: ${missing.joinToString { it.key }}"
         val a = cpu.greedy()
         val b = npu.greedy()
         val d = editDistance(a, b)
-        val w = TajweedHead.LOG_PROBS.width
-        val x = cpu[TajweedHead.LOG_PROBS]!!
-        val y = npu[TajweedHead.LOG_PROBS]!!
+        val w = HeadId.LOG_PROBS.width
+        val x = cpu[HeadId.LOG_PROBS]!!
+        val y = npu[HeadId.LOG_PROBS]!!
         var same = 0
         for (t in 0 until cpu.n40) if (argmax(x, t * w, w) == argmax(y, t * w, w)) same++
         val agree = if (cpu.n40 == 0) 0.0 else same.toDouble() / cpu.n40
@@ -151,7 +151,7 @@ object SelfTest {
         return b
     }
 
-    internal fun allFinite(h: TajweedHeads): Boolean = h.available.all { k -> h[k]!!.all { it.isFinite() } }
+    internal fun allFinite(h: HeadValues): Boolean = h.available.all { k -> h[k]!!.all { it.isFinite() } }
 
     internal fun editDistance(a: IntArray, b: IntArray): Int {
         var prev = IntArray(b.size + 1) { it }
@@ -173,15 +173,13 @@ object SelfTest {
 /**
  * The NPU backend's session streams: the exact engine's front end (resampler, fbank, flush) on the CPU, the network
  * on the NPU ([NpuStreamer] over an [NpuRunner]). No fallback inside: a session runs it under
- * [ai.quranlab.tajweedformer.accel.FailoverEngine], which watches every chunk and switches the take to the CPU. Scoring
- * goes to [scorer] (the CPU engine's scorer) when given.
+ * [ai.quranlab.tajweedformer.accel.FailoverEngine], which watches every chunk and switches the take to the CPU.
  */
 internal class NpuTajweedEngine(
     private val contract: NpuContract,
     private val masks: NpuMasks,
     private val runner: NpuRunner,
     private val sampleRate: Int,
-    private val scorer: TajweedEngine? = null,
 ) : TajweedEngine {
     override val chunkMs: Int get() = contract.chunkMs
     override val backend: Backend get() = Backend.NPU
@@ -189,7 +187,7 @@ internal class NpuTajweedEngine(
     override fun createStream(): TajweedEngineStream = NpuStream()
 
     /** The NPU computes every head the build has. */
-    override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream = NpuStream()
+    override fun createStream(heads: Set<HeadId>): TajweedEngineStream = NpuStream()
 
     private inner class NpuStream : TajweedEngineStream {
         private val fe = EngineFrontEnd(sampleRate)
@@ -197,10 +195,10 @@ internal class NpuTajweedEngine(
 
         override val backend: Backend get() = Backend.NPU
 
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> =
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> =
             streamer.push(fe.push(samples, offset, length))
 
-        override fun finish(): List<TajweedHeads> = streamer.push(fe.finish())
+        override fun finish(): List<HeadValues> = streamer.push(fe.finish())
 
         override fun reset() {
             fe.reset()
@@ -210,15 +208,6 @@ internal class NpuTajweedEngine(
         override fun close() = fe.close()
     }
 
-    private fun s(): TajweedEngine = scorer ?: throw UnsupportedOperationException("this NPU engine has no scorer")
-
-    override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int): TajweedResult =
-        s().score(heads, config, settings, surah, ayah)
-
-    override fun expectedTokens(surah: Int, ayah: Int): IntArray = s().expectedTokens(surah, ayah)
-
-    override fun expectedWords(surah: Int, ayah: Int): IntArray = s().expectedWords(surah, ayah)
-
-    /** The runner is the prepared accelerator's; the scorer the caller's. */
+    /** The runner is the prepared accelerator's. */
     override fun close() {}
 }

@@ -17,7 +17,7 @@ import java.util.Base64
  * when the device has it, never exportable (`AndroidKeystoreContributorKeys`). The private key
  * never leaves it; the SDK asks it to sign the deletion message and nothing else.
  */
-interface ContributorKeyStore {
+internal interface ContributorKeyStore {
     /** Makes a new key under [alias] (replacing any); returns the public point, 65 bytes `04 || X || Y`. */
     fun create(alias: String): ByteArray
 
@@ -34,7 +34,7 @@ interface ContributorKeyStore {
 }
 
 /** A small secret kept encrypted at rest (the recovery code). On Android: AES-GCM with a Keystore key. */
-interface SecretBox {
+internal interface SecretBox {
     fun seal(plain: ByteArray): ByteArray
     fun open(sealed: ByteArray): ByteArray
 }
@@ -43,7 +43,7 @@ interface SecretBox {
  * The desktop JVM's stand-in (tests, tools): a software key in a file of the SDK's storage. Not
  * hardware backed; the Android SDK never uses it.
  */
-class FileContributorKeyStore(private val dir: File) : ContributorKeyStore {
+internal class FileContributorKeyStore(private val dir: File) : ContributorKeyStore {
     private fun file(alias: String) = File(dir, "$alias.p8")
 
     override fun create(alias: String): ByteArray {
@@ -73,12 +73,12 @@ class FileContributorKeyStore(private val dir: File) : ContributorKeyStore {
 }
 
 /** No encryption (desktop JVM, tests). */
-object PlainSecretBox : SecretBox {
+internal object PlainSecretBox : SecretBox {
     override fun seal(plain: ByteArray) = plain.copyOf()
     override fun open(sealed: ByteArray) = sealed.copyOf()
 }
 
-object ContributorKeys {
+internal object ContributorKeys {
     /** The uncompressed point `04 || X || Y` of a P-256 public key. */
     @JvmStatic
     fun point(k: ECPublicKey): ByteArray {

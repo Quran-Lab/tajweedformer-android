@@ -8,19 +8,15 @@ import ai.quranlab.tajweedformer.accel.CpuStandby
  * The engine maps `layers.zfw` (POSIX), but on every CPU with the dot-product instructions (every NPU phone) it
  * rewrites the 63 MB of int8 linear weights into its SDOT layout in place at load, so those pages become private
  * copies: a loaded CPU engine costs about 63 MB of anonymous memory there, which the OS cannot drop. So while the
- * accelerator serves, the weights are released ([release]) and only a scoring handle (no weights) stays; a failover
- * or a CPU session loads them again ([createStream]: the mapping, the layout pass, a stream), which is the cold
- * switch the failover's stall includes.
+ * accelerator serves, the engine is closed ([release]); a failover or a CPU session loads it again
+ * ([createStream]: the mapping, the layout pass, a stream), which is the cold switch the failover's stall includes.
  */
 internal class CpuSlot(
     first: TajweedEngine,
     /** Opens the full engine again (the model's weights). */
     private val reopen: () -> TajweedEngine,
-    /** A scoring-only handle (no weights), or null when scoring needs the full engine (then it is never released). */
-    private val openScorer: (() -> TajweedEngine)?,
 ) : CpuStandby {
     @Volatile private var full: TajweedEngine? = first
-    private var scorerOnly: TajweedEngine? = null
     private var closed = false
 
     override val chunkMs: Int = first.chunkMs
@@ -39,12 +35,11 @@ internal class CpuSlot(
         return full ?: reopen().also { full = it; reloads++ }
     }
 
-    /** Releases the weights when scoring can go on without them. Returns whether it did. */
+    /** Releases the weights. Returns whether it did. */
     @Synchronized
     override fun release(): Boolean {
         val f = full ?: return false
-        if (openScorer == null || closed) return false
-        if (scorerOnly == null) scorerOnly = openScorer.invoke()
+        if (closed) return false
         full = null
         f.close()
         return true
@@ -52,24 +47,12 @@ internal class CpuSlot(
 
     override fun createStream(): TajweedEngineStream = engine().createStream()
 
-    override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream = engine().createStream(heads)
-
-    @Synchronized
-    private fun scoring(): TajweedEngine = full ?: scorerOnly ?: engine()
-
-    override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int): TajweedResult =
-        scoring().score(heads, config, settings, surah, ayah)
-
-    override fun expectedTokens(surah: Int, ayah: Int): IntArray = scoring().expectedTokens(surah, ayah)
-
-    override fun expectedWords(surah: Int, ayah: Int): IntArray = scoring().expectedWords(surah, ayah)
+    override fun createStream(heads: Set<HeadId>): TajweedEngineStream = engine().createStream(heads)
 
     @Synchronized
     override fun close() {
         closed = true
         full?.close()
         full = null
-        scorerOnly?.close()
-        scorerOnly = null
     }
 }

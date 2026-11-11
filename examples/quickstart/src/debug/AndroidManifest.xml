@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Not part of the example: the screen the SDK's release gate starts by name on a phone
+             (scripts/phone_gate.py). Debug builds only. -->
+        <activity
+            android:name=".GateActivity"
+            android:exported="true" />
+    </application>
+</manifest>

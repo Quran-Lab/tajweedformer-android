@@ -12,19 +12,21 @@ jobs:
   jvm:
     name: JVM tests (no engine)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Test
-        run: ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
-      - name: Compile the Android library's Kotlin
-        run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin
-      - name: Compile the README's quick start (samples/quickstart; QuickStartDocTest above keeps the README equal to it)
-        run: ./gradlew --no-daemon :samples:quickstart:compileDebugKotlin
+      - name: libopus for the sharing tests (built first, so no sharing test ever skips)
+        run: bash scripts/opus/build_opus_host.sh
+      - name: Test (libopus required)
+        run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
+      - name: Compile the Android library's Kotlin and the Compose module
+        run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin :tajweedformer-compose:compileReleaseKotlin
+      - name: Compile the README's quick start and the example app (examples/quickstart; QuickStartDocTest above keeps the README equal to it)
+        run: ./gradlew --no-daemon :examples:quickstart:compileDebugKotlin
 
   engine:
     name: Engine through JNI, and the AAR
@@ -40,17 +42,25 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools
-        run: sudo apt-get install -y ninja-build
-      - name: JVM tests with the engine (V4; the model-dependent ones skip without the model)
+      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
+        run: |
+          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
+      - name: JVM tests with the engine (the host JNI library is built; the model-dependent ones skip without the model)
         run: |
           ./gradlew --no-daemon :tajweedformer-jvm:test -Pnative \
-            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.EngineSettingsTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedApiTest' --tests 'ai.quranlab.tajweedformer.TajweedModelTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedSettingsTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
-            --tests 'ai.quranlab.tajweedformer.LayersTest'
-      - name: AAR (arm64-v8a, armeabi-v7a)
+            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
+            --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
+            --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
+      - name: AAR (arm64-v8a, armeabi-v7a, x86_64)
         run: ./gradlew --no-daemon :tajweedformer:assembleRelease
+      - name: Android's verifier rule on monitors, on every class of the AAR (first the proof that the check still rejects the class 2.0.2 shipped)
+        run: |
+          python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
+          python3 scripts/check_monitor_handlers.py tajweedformer/build/outputs/aar/*.aar
+      - name: The example app (examples/quickstart)
+        run: ./gradlew --no-daemon :examples:quickstart:assembleDebug
+      - name: The example app as a release build shrunk with R8 and no rule of its own (the AAR's consumer rules must be enough)
+        run: ./gradlew --no-daemon :examples:quickstart:assembleRelease
       - uses: actions/upload-artifact@v4
         with:
           name: aar

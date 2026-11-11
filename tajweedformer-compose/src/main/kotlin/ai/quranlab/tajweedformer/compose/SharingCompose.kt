@@ -1,7 +1,8 @@
 package ai.quranlab.tajweedformer.compose
 
-import ai.quranlab.tajweedformer.cloud.android.QuranLabAndroid
-import ai.quranlab.tajweedformer.cloud.android.SharingDialogs
+import ai.quranlab.tajweedformer.SharingDialogs
+import ai.quranlab.tajweedformer.SharingTheme
+import ai.quranlab.tajweedformer.TajweedClient
 import ai.quranlab.tajweedformer.sharing.ConsentState
 import ai.quranlab.tajweedformer.sharing.Sharing
 import android.app.Activity
@@ -48,32 +49,31 @@ import androidx.compose.ui.window.Dialog
  * The look of the Compose sharing sheets (consent, guardian, thanks, settings): background ([container]),
  * text ([content]), secondary text, accent, corner radius (or a whole [shape]) and the title and body
  * fonts. Defaults come from the app's MaterialTheme. A style changes how the words look, never the words
- * (those are the copy deck's, or the app's own set with `Sharing.setWording`), so it does not change the
+ * (those are the copy deck's, or the app's own set with `client.sharing.setWording`), so it does not change the
  * consent version.
  */
-data class SharingStyle(
-    val container: Color = Color.Unspecified,
-    val content: Color = Color.Unspecified,
+public class SharingStyle(
+    public val container: Color = Color.Unspecified,
+    public val content: Color = Color.Unspecified,
     /** Both buttons use it: the two choices have equal weight. */
-    val accent: Color = Color.Unspecified,
-    val shape: Shape? = null,
+    public val accent: Color = Color.Unspecified,
+    public val shape: Shape? = null,
     /** The re-ask line, the hadith and its reference; unspecified: [content] at 75 %. */
-    val secondaryContent: Color = Color.Unspecified,
+    public val secondaryContent: Color = Color.Unspecified,
     /** The corner radius of the dialogs when no [shape] is given. */
-    val cornerRadius: Dp? = null,
-    val titleFont: FontFamily? = null,
-    val bodyFont: FontFamily? = null,
+    public val cornerRadius: Dp? = null,
+    public val titleFont: FontFamily? = null,
+    public val bodyFont: FontFamily? = null,
 ) {
     internal val dialogShape: Shape? get() = shape ?: cornerRadius?.let { RoundedCornerShape(it) }
 }
 
 /**
  * The consent sheet's content: the deck's lines in order, two equal choices, nothing pre-ticked;
- * the guardian variant asks the parent or guardian to tick the confirmation first. Place it in a
- * dialog or bottom sheet of the app's choosing, or use [SharingConsentDialog].
+ * the guardian variant asks the parent or guardian to tick the confirmation first.
  */
 @Composable
-fun SharingConsentSheet(
+internal fun SharingConsentSheet(
     sharing: Sharing,
     variant: ConsentState.Variant,
     guardian: Boolean = sharing.guardian,
@@ -126,7 +126,7 @@ fun SharingConsentSheet(
 
 /** [SharingConsentSheet] in a dialog; dismissing it counts as "Not now". */
 @Composable
-fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Variant, guardian: Boolean = sharing.guardian,
+internal fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Variant, guardian: Boolean = sharing.guardian,
                          style: SharingStyle = SharingStyle(), onDone: (Boolean) -> Unit) {
     Dialog(onDismissRequest = { sharing.decline(); onDone(false) }) {
         Surface(shape = style.dialogShape ?: MaterialTheme.shapes.extraLarge,
@@ -138,7 +138,7 @@ fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Variant, guardi
 
 /** A short line in a dialog: the thank-you (once) or the impact line. */
 @Composable
-fun SharingMessage(text: String, rtl: Boolean, style: SharingStyle = SharingStyle(), onDone: () -> Unit) {
+internal fun SharingMessage(text: String, rtl: Boolean, style: SharingStyle = SharingStyle(), onDone: () -> Unit) {
     Dialog(onDismissRequest = onDone) {
         Surface(shape = style.dialogShape ?: MaterialTheme.shapes.extraLarge,
             color = if (style.container != Color.Unspecified) style.container else MaterialTheme.colorScheme.surface) {
@@ -153,17 +153,23 @@ fun SharingMessage(text: String, rtl: Boolean, style: SharingStyle = SharingStyl
 }
 
 /**
- * Shows the SDK's sheets in Compose when the SDK asks (after a session with feedback, the
- * thank-you), instead of its Views dialogs. Call once near the root of the app's UI.
+ * Shows the SDK's sharing sheets in Compose when the SDK asks (the consent sheet after a take, the thank-you),
+ * instead of its Views dialogs. Call once near the root of the app's UI, with the app's client:
+ *
+ * ```
+ * SharingSheetHost(client)
+ * ```
  */
 @Composable
-fun SharingSheetHost(style: SharingStyle = SharingStyle()) {
+public fun SharingSheetHost(client: TajweedClient, style: SharingStyle = SharingStyle()) {
+    val sharing = client.cloud.sharing
     var request by remember { mutableStateOf<Sharing.SheetRequest?>(null) }
-    DisposableEffect(Unit) {
-        QuranLabAndroid.sheets = { request = it }
-        onDispose { QuranLabAndroid.sheets = null }
+    DisposableEffect(client) {
+        // while this host is on screen the SDK's requests come here; afterwards its own dialogs take them again
+        val before = sharing.prompts
+        sharing.prompts = { request = it }
+        onDispose { sharing.prompts = before }
     }
-    val sharing = QuranLabAndroid.cloud?.sharing ?: return
     when (val r = request) {
         is Sharing.SheetRequest.Consent -> SharingConsentDialog(sharing, r.variant, r.guardian, style) { request = null }
         is Sharing.SheetRequest.Thanks -> SharingMessage(sharing.copy["thanks"], sharing.copy.rtl, style) { request = null }
@@ -176,9 +182,14 @@ fun SharingSheetHost(style: SharingStyle = SharingStyle()) {
  * The settings rows: "Share my recitations" (off stops uploads at once and deletes the unsent
  * queue), "What is shared", "Delete what I shared" and the recovery code. Deletion and the code
  * open the SDK's own dialogs: the app never handles either.
+ *
+ * ```
+ * SharingSettings(client)
+ * ```
  */
 @Composable
-fun SharingSettings(sharing: Sharing, style: SharingStyle = SharingStyle()) {
+public fun SharingSettings(client: TajweedClient, style: SharingStyle = SharingStyle()) {
+    val sharing = client.cloud.sharing
     val c = sharing.copy
     val activity = LocalContext.current as? Activity
     var on by remember { mutableStateOf(sharing.isOn) }
@@ -192,13 +203,13 @@ fun SharingSettings(sharing: Sharing, style: SharingStyle = SharingStyle()) {
                     Thread { sharing.setOn(v) }.start()
                 })
             }
-            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.whatIsShared(it, sharing, QuranLabAndroid.sharingTheme) } }.padding(vertical = 12.dp)) {
+            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.whatIsShared(it, sharing, SharingTheme.current) } }.padding(vertical = 12.dp)) {
                 Text(c["settings.what"], color = fg, fontFamily = style.bodyFont)
             }
-            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.confirmDelete(it, sharing, QuranLabAndroid.sharingTheme) { on = sharing.isOn } } }.padding(vertical = 12.dp)) {
+            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.confirmDelete(it, sharing, SharingTheme.current) { on = sharing.isOn } } }.padding(vertical = 12.dp)) {
                 Text(c["settings.delete"], color = fg, fontFamily = style.bodyFont)
             }
-            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.showRecoveryCode(it, sharing, QuranLabAndroid.sharingTheme) } }.padding(vertical = 12.dp)) {
+            Row(Modifier.fillMaxWidth().clickable { activity?.let { SharingDialogs.showRecoveryCode(it, sharing, SharingTheme.current) } }.padding(vertical = 12.dp)) {
                 Text(c["recovery.reveal"], color = fg, fontFamily = style.bodyFont)
             }
         }

@@ -9,7 +9,7 @@ import java.io.File
  * implementation is `PlayIntegrity` (it needs `com.google.android.play:integrity` in the app);
  * tests pass their own.
  */
-fun interface IntegrityProvider {
+internal fun interface IntegrityProvider {
     fun token(requestHash: String): String
 }
 
@@ -19,7 +19,7 @@ fun interface IntegrityProvider {
  * [token] is called with `attested = true` (recitation sharing); a refusal pauses attestation for
  * this launch and the SDK continues unattested.
  */
-class TokenProvider(
+internal class TokenProvider(
     private val api: QuranLabApi,
     val key: QuranLabKey,
     private val app: AppIdentity,

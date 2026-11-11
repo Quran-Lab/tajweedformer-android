@@ -6,11 +6,11 @@ import ai.quranlab.tajweedformer.ManifestVerifier
 import java.io.File
 
 /**
- * qlab-api's signed config (PLATFORM_CLIENT.md section 3), parsed after its signature checked out.
- * Unknown fields and flags are ignored. [tajweedJson] is the `tajweed` block as JSON text, for the
- * SDK's settings (`TajweedConfig.remoteJson`), which parse it leniently field by field.
+ * qlab-api's signed config (docs/platform-client.md section 3), parsed after its signature checked out.
+ * Unknown fields and flags are ignored. SDK 3.0 reads `inference.context` (the portal's Response time) and never the
+ * `tajweed` block, which the server keeps sending for 2.x SDKs.
  */
-class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: ByteArray) {
+internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: ByteArray) {
     val app: String? get() = raw["app"] as? String
     val channel: String? get() = raw["channel"] as? String
     val issuedAt: Long get() = (raw["issued_at"] as? Double)?.toLong() ?: 0
@@ -21,7 +21,28 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
     @Suppress("UNCHECKED_CAST")
     val recommended: Map<String, Any?>? get() = raw["recommended"] as? Map<String, Any?>
 
+    /** The build to download (the config's `revision`: 40 hex, the start of the SHA-256 of the build's signed manifest). */
     val recommendedRevision: String? get() = recommended?.get("revision") as? String
+
+    /** The model version the build is of (`x.y.z`), or null when the config does not name a valid one. */
+    val recommendedVersion: String? get() = (recommended?.get("version") as? String)?.takeIf { ai.quranlab.tajweedformer.ModelManifest.isVersion(it) }
+
+    /**
+     * `inference.context`: the context the portal chose for this app (its Response time setting), or null. The app's
+     * own choice wins over it, and a context the model build does not ship is ignored
+     * ([ai.quranlab.tajweedformer.Recognizer.resolveContext]).
+     */
+    val inferenceContext: String? get() = ((raw["inference"] as? Map<*, *>)?.get("context") as? String)?.takeIf { it.isNotEmpty() }
+
+    /** `flags.min_sdk`: the oldest SDK version the server serves this app's platform, when it sets one. */
+    val minSdk: String? get() = ((raw["flags"] as? Map<*, *>)?.get("min_sdk") as? String)?.takeIf { ai.quranlab.tajweedformer.ModelManifest.isVersion(it) }
+
+    /** The version of a pin the server could not serve (`pin: {version, status: "unavailable"}`), else null. */
+    val pinUnavailable: String?
+        get() {
+            val p = raw["pin"] as? Map<*, *> ?: return null
+            return if (p["status"] == "unavailable") p["version"] as? String else null
+        }
 
     /** Where model files are served (qlab-api signs it): `https://cdn.quranlab.ai/models`, or null when absent or not https. */
     val base: String? get() = (raw["base"] as? String)?.takeIf { safeBase.matches(it) }
@@ -40,8 +61,6 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
         return ai.quranlab.tajweedformer.ModelStore.folderUrl(base ?: fallback, model, rev, folder)
     }
 
-    /** The `tajweed` block, or null when the config has none. */
-    val tajweedJson: String? get() = raw["tajweed"]?.takeIf { it is Map<*, *> }?.let { Json.write(it) }
 
     @Suppress("UNCHECKED_CAST")
     val denylist: List<Map<String, Any?>> get() = (raw["denylist"] as? List<Any?>)?.mapNotNull { it as? Map<String, Any?> } ?: emptyList()
@@ -142,6 +161,11 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
         val contributions: Boolean? = null,
         val uploadTrust: Map<String, String> = emptyMap(),
         val cappedLimits: Map<String, Any?> = emptyMap(),
+        /**
+         * `share_join_ms` (SDK 2.0.3): how long a shared recording stays open for the next take, in ms. A whole number
+         * 0 to 10000; absent or anything else 3000; 0 never joins takes.
+         */
+        val shareJoinMs: Int = ai.quranlab.tajweedformer.sharing.TakeJoin.DEFAULT_WINDOW_MS,
     ) {
         /** The tier for a platform: the flag, else the documented default (`attested` for android). */
         fun trust(platform: String): String = uploadTrust[platform] ?: when (platform) {
@@ -162,6 +186,7 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
                     contributions = m["contributions"] as? Boolean,
                     uploadTrust = trust,
                     cappedLimits = m["capped_limits"] as? Map<String, Any?> ?: emptyMap(),
+                    shareJoinMs = ai.quranlab.tajweedformer.sharing.TakeJoin.window(m["share_join_ms"]),
                 )
             }
         }
@@ -195,14 +220,14 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
     }
 }
 
-class ConfigRejected(message: String) : Exception(message)
+internal class ConfigRejected(message: String) : Exception(message)
 
 /**
  * The last good signed config on disk (`<storage>/cloud/config.*`): the exact body, its signature,
  * key id and ETag, re-verified at every read. Refresh per section 3: conditional with the stored
  * ETag (304 = still current); without it when the stored body is within an hour of expiry.
  */
-class ConfigStore(
+internal class ConfigStore(
     private val dir: File,
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
     private val clock: () -> Long = System::currentTimeMillis,
@@ -220,6 +245,9 @@ class ConfigStore(
             cached = c
             return c
         }
+
+    /** Whether a config is stored at all (verified or not, expired or not). */
+    val hasStored: Boolean get() = bodyFile.isFile && metaFile.isFile
 
     private fun meta(): Map<String, Any?>? = try {
         @Suppress("UNCHECKED_CAST")

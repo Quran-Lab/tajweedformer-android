@@ -1,6 +1,7 @@
 package ai.quranlab.tajweedformer.cloud
 
-import ai.quranlab.tajweedformer.TajweedFormer
+import ai.quranlab.tajweedformer.OpenChecked
+import ai.quranlab.tajweedformer.SdkInfo
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -16,7 +17,7 @@ import java.nio.file.Files
  * `gpu` leaves the NPU alone). The controller's side (no promotion, the next session on the CPU, a running one not
  * touched, counted once, no incident) is in AcceleratorTest.
  */
-class AccelDenyTest {
+class AccelDenyTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private lateinit var dir: File
     private var now = 1_762_700_000_000L
@@ -32,7 +33,7 @@ class AccelDenyTest {
     }
 
     private val base = mapOf("platform" to "android", "os_version" to "16", "device_class" to "Pixel10", "accelerator" to "npu",
-        "model_revision" to "v4.0-2026-11-09", "sdk_version" to TajweedFormer.VERSION, "reason" to "Tensor G5 dispatch bug")
+        "model_revision" to "v4.0-2026-11-09", "sdk_version" to SdkInfo.VERSION, "reason" to "Tensor G5 dispatch bug")
 
     /** The values of this device (the stub's device profile: Pixel10, Android 16). */
     private fun denied(vararg rules: Map<String, Any?>, accelerator: String = "npu:tensor_g5", osBuild: String = "16/BD1A.250101.001/12345678",
@@ -62,7 +63,7 @@ class AccelDenyTest {
 
     @Test fun prefixAndStarPatterns() {
         assertNotNull(denied(base + ("os_version" to "1*") + ("device_class" to "Pixel*") + ("model_revision" to "v4.0-*")))
-        assertNotNull(denied(base + ("sdk_version" to "2.0.*") + ("accelerator" to "*")))
+        assertNotNull(denied(base + ("sdk_version" to "3.0.*") + ("accelerator" to "*")))
         assertNull(denied(base + ("device_class" to "SM-*")))
         assertNull(denied(base + ("os_version" to "1")))
     }

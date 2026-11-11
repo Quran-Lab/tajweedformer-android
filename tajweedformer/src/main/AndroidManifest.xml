@@ -4,4 +4,16 @@
          link (config, telemetry, issues, recitation sharing) -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- model.listen() captures the microphone and asks the learner for this permission itself. An app that never
+         calls listen() (it pushes its own audio) can remove it: <uses-permission ... tools:node="remove" /> -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <application>
+        <!-- shows only the system's RECORD_AUDIO dialog for model.listen(), over the app -->
+        <activity
+            android:name="ai.quranlab.tajweedformer.MicrophonePermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
 </manifest>

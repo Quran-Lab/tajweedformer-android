@@ -8,8 +8,8 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** The developer's choices for the platform link (all optional but the key). */
-data class CloudOptions @JvmOverloads constructor(
-    /** The app's developer key, `qlk_v1_...`, from portal.quranlab.ai. Null: offline only, nothing is sent. */
+internal data class CloudOptions @JvmOverloads constructor(
+    /** The app's developer key, `qlk_v1_...`, from sdk.quranlab.ai. Null: offline only, nothing is sent. */
     val key: String?,
     /** Telemetry v2, on by default (anonymous daily sums). [Analytics.OFF] is the developer's one opt-out. */
     val analytics: Analytics = Analytics.ON,
@@ -41,7 +41,7 @@ data class CloudOptions @JvmOverloads constructor(
 }
 
 /** What the cloud side needs from the platform (Android: `QuranLabAndroid` builds it). */
-class CloudEnvironment(
+internal class CloudEnvironment(
     /** The SDK's private storage (Android: `noBackupFilesDir/quranlab`). */
     val storage: File,
     val app: AppIdentity,
@@ -66,7 +66,7 @@ class CloudEnvironment(
 )
 
 /** Where background work runs. */
-interface CloudScheduler {
+internal interface CloudScheduler {
     /** Delivery of telemetry reports and issues is due. */
     fun scheduleDelivery(cloud: QuranLabCloud)
     /** The sharing outbox has something to send (now, or at [atMs]). */
@@ -86,7 +86,7 @@ interface CloudScheduler {
 }
 
 /**
- * Everything the SDK does with portal.quranlab.ai for one app (docs/platform-client.md): the token, the
+ * Everything the SDK does with Quran Lab (sdk.quranlab.ai, api.quranlab.ai) for one app (docs/platform-client.md): the token, the
  * daily registration, the signed config (and its `tajweed` block and flags), telemetry v2 deltas, issue
  * reports, and recitation sharing. It is the [TajweedObserver] the recognizer reports to. Nothing
  * here sits in the recognition path: network work runs on [CloudEnvironment.scheduler]'s threads.
@@ -98,7 +98,7 @@ interface CloudScheduler {
  *
  * Blocking methods ([launch], [foreground], [refreshConfig], [deliver]) are for background threads.
  */
-class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : TajweedObserver {
+internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : TajweedObserver {
     val key: QuranLabKey? = QuranLabKey.parse(options.key)
     val api = QuranLabApi(options.apiUrl, env.http)
     private val cloudDir = File(env.storage, "cloud")
@@ -140,8 +140,19 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     /** The current verified config, or null. */
     val currentConfig: RemoteConfig? get() = config.current
 
-    /** The portal's `tajweed` block for the SDK's settings (`TajweedConfig.remoteJson`); applies at the next session start. */
-    val tajweedJson: String? get() = currentConfig?.tajweedJson
+    /** The signed config's `inference.context` (the portal's Response time); applies when the next model is opened. */
+    val inferenceContext: String? get() = currentConfig?.inferenceContext
+
+    /** The app's pin (a model version), sent with every config request; null: Quran Lab's choice. */
+    @Volatile var modelVersion: String? = null
+
+    /** The last refusal or failure of a config request, for `diagnose()`: a server code, `offline`, or `signature_invalid`. */
+    @Volatile var lastConfigError: String? = null
+        private set
+
+    /** The time of the last config answer the server gave (200 or 304), ms; 0 when none in this process. */
+    @Volatile var lastConfigAt: Long = 0
+        private set
 
     val networkStopped: Boolean get() = stopped.get()
 
@@ -150,11 +161,17 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         stopped.set(true)
     }
 
+    /** The SDK version the server's `sdk_too_old` answer asked for (`min_sdk`), when it named one. */
+    @Volatile var sdkRequired: String? = null
+        private set
+
     /** Handles a refusal common to every route. Returns true when the caller should give up this launch. */
     private fun refused(e: CloudException, route: String): Boolean {
         val a = e.api ?: return false
+        if (a.code == "sdk_too_old") a.minSdk?.takeIf { ai.quranlab.tajweedformer.ModelManifest.isVersion(it) }?.let { sdkRequired = it }
         when (a.action) {
-            ErrorAction.STOP_UNTIL_NEXT_LAUNCH, ErrorAction.STOP_THIS_LAUNCH, ErrorAction.STOP -> { stop(a.code); return true }
+            // what is remembered is what the app was refused for: the body's reason when it has a known one
+            ErrorAction.STOP_UNTIL_NEXT_LAUNCH, ErrorAction.STOP_THIS_LAUNCH, ErrorAction.STOP -> { stop(a.refusal); return true }
             ErrorAction.DROP_AND_REPORT -> report("other", "bad_request:$route")
             else -> {}
         }
@@ -200,6 +217,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
      */
     @JvmOverloads
     fun foreground(modelRevision: String? = null) {
+        sharing.foreground()
         telemetry.launch()
         telemetryFailures = 0
         telemetryRetryAt = 0
@@ -212,8 +230,14 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         if (env.clock() - lastSealAt >= Telemetry.SEND_INTERVAL_MS) sendPoint()
     }
 
-    /** The app went to the background: a send point. */
-    fun background() = sendPoint()
+    /**
+     * The app went to the background: a send point, and a shared recording that waits for the next take closes
+     * (2.0.3; a take that is running keeps its recording until it ends).
+     */
+    fun background() {
+        sharing.background()
+        sendPoint()
+    }
 
     /** What was counted since the last send point is sealed (one report per UTC day) and delivery is scheduled. */
     fun sendPoint() {
@@ -254,19 +278,45 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     }
 
     /** Fetches and verifies the config (conditional on its ETag); the last good one stays on failure. */
+    @Synchronized
     fun refreshConfig(): RemoteConfig? {
         if (key == null || stopped.get()) return config.current
         return try {
-            val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, config.etagToSend()) }
+            val pin = modelVersion
+            // a pin changes the answer: never conditional on the ETag of an answer made for another pin
+            val etag = if (pin == pinOfStored()) config.etagToSend() else null
+            val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, etag, pin) }
             val c = config.apply(r)
+            rememberPin(pin)
+            lastConfigError = null
+            lastConfigAt = env.clock()
             applyFlags(c)
             noteSdkLatest(c)
+            c?.pinUnavailable?.let { v -> if (env.debugBuild) try { env.log("model version $v is not available for this SDK: using ${c.recommendedVersion}") } catch (_: Exception) {} }
             c
         } catch (e: ConfigRejected) {
+            lastConfigError = "signature_invalid"
             report("signature_invalid", "config:" + (e.message ?: "rejected").replace(' ', '_'))
             config.current.also { noteSdkLatest(it) }
         } catch (e: CloudException) {
+            lastConfigError = e.api?.refusal ?: if (e.notPermitted) NOT_PERMITTED else "offline"
             config.current.also { noteSdkLatest(it) }
+        }
+    }
+
+    private val pinFile get() = File(cloudDir, "config.pin")
+
+    /** The pin the stored config was asked with ("" for none). */
+    private fun pinOfStored(): String? = try { pinFile.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() } } catch (_: Exception) { null }
+
+    /** Whether the config in force was asked with [pin] (null: with none). A config asked with another pin says
+     *  nothing about this one: it has to be asked again. */
+    fun configAskedWith(pin: String?): Boolean = pin == pinOfStored()
+
+    private fun rememberPin(pin: String?) {
+        try {
+            if (pin == null) pinFile.delete() else { cloudDir.mkdirs(); pinFile.writeText(pin) }
+        } catch (_: Exception) {
         }
     }
 
@@ -280,7 +330,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     private fun noteSdkLatest(c: RemoteConfig?) {
         if (!env.debugBuild) return
         val l = c?.sdkLatest ?: return
-        val mine = ai.quranlab.tajweedformer.TajweedFormer.VERSION
+        val mine = ai.quranlab.tajweedformer.SdkInfo.VERSION
         if (!l.newerThan(mine)) return
         if (!sdkLatestLogged.compareAndSet(false, true)) return
         try { env.log("Quran Lab SDK ${l.version} is available (${l.severity}), you have $mine: ${l.url}") } catch (_: Exception) {}
@@ -295,7 +345,8 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
 
     /** The backend the deny-list forces on this install for [revision] (`exact`, say), or null. */
     fun forcedBackend(revision: String?): String? =
-        currentConfig?.denyRule(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.TajweedFormer.VERSION, revision)
+        currentConfig?.denyRule(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.SdkInfo.VERSION,
+            revision?.let { ai.quranlab.tajweedformer.ModelIds.version(it) })
             ?.get("backend_forced") as? String
 
     private val accelDenyLogged = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -306,8 +357,8 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
      */
     fun accelDenied(accelerator: String, revision: String, osBuild: String?, deviceModel: String?, chip: String?, delegate: String?): String? {
         val c = currentConfig ?: return null
-        val v = RemoteConfig.AccelValues(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.TajweedFormer.VERSION,
-            revision, accelerator, osBuild, deviceModel?.replace(' ', '_'), chip, delegate)
+        val v = RemoteConfig.AccelValues(env.app.platform, env.device.osVersion, env.device.deviceClass, ai.quranlab.tajweedformer.SdkInfo.VERSION,
+            ai.quranlab.tajweedformer.ModelIds.version(revision), accelerator, osBuild, deviceModel?.replace(' ', '_'), chip, delegate)
         val r = c.accelDenyRule(v, env.clock() / 1000) ?: return null
         val reason = (r["reason"] as? String)?.takeIf { it.isNotBlank() } ?: "accel_deny"
         if (env.debugBuild && accelDenyLogged.add("$accelerator|$revision|$reason")) {
@@ -407,12 +458,12 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     override fun onBlankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = telemetry.blankConfirmed(e)
 
     override fun onModelLoad(e: TajweedObserver.ModelLoad) = telemetry.modelLoad(e)
-    override fun onSelfTest(revision: String, context: String, backend: String, passed: Boolean) {
-        telemetry.selfTest(revision, context, backend, passed)
+    override fun onSelfTest(revision: String, context: String, backend: String, passed: Boolean, build: String) {
+        telemetry.selfTest(revision, context, backend, passed, build)
         if (!passed) report("self_test_failed", "self_test:$backend", backend = backend, revision = revision)
     }
-    override fun onFallback(revision: String, context: String, from: String, reason: TajweedObserver.FallbackReason) {
-        telemetry.fallback(revision, context, from, reason)
+    override fun onFallback(revision: String, context: String, from: String, reason: TajweedObserver.FallbackReason, build: String) {
+        telemetry.fallback(revision, context, from, reason, build)
     }
     override fun onDownload(e: TajweedObserver.Download) = telemetry.download(e)
     override fun onSessionStart(e: TajweedObserver.SessionStart) {
@@ -422,7 +473,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
     override fun onAudio(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) = sharing.audio(samples, offset, length, sampleRate)
     override fun onChunk(computeMs: Double, audioMs: Double) = telemetry.chunk(computeMs, audioMs)
     override fun onTokens(margins: FloatArray?, confidences: FloatArray?) = telemetry.tokens(margins, confidences)
-    override fun onScored(e: TajweedObserver.Scored) = telemetry.scored(e)
+
     override fun onThermal(throttled: Boolean) = telemetry.thermal(throttled)
     override fun onSessionEnd(e: TajweedObserver.SessionEnd) {
         telemetry.sessionEnd(e)
@@ -437,6 +488,9 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
 
         /** The cloud of this process (set by `QuranLabAndroid.configure`). */
         @JvmStatic val current: QuranLabCloud? get() = shared
+
+        /** [lastConfigError] when the system did not let the request out (no INTERNET permission). */
+        const val NOT_PERMITTED = "network_not_permitted"
 
         @JvmStatic fun install(c: QuranLabCloud?) { shared = c }
     }

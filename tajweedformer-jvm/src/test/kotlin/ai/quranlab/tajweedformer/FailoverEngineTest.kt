@@ -51,13 +51,19 @@ import java.util.concurrent.TimeUnit
  * `TJ_SELFTEST_MODEL`); `TJ_FAILOVER_AUDIO` (a folder of the engine's float32 parity clips, `<reciter>_<sss><aaa>.pcm`)
  * adds the divergence over those ayahs. Skipped without them.
  */
-class FailoverEngineTest {
+class FailoverEngineTest : OpenChecked() {
     companion object {
         private var dirOrNull: File? = null
-        private lateinit var model: TajweedModel
+        private lateinit var model: ModelFolder
         private lateinit var inner: ExactTajweedEngine
         private lateinit var promotedRecord: PromotionRecord
         private val key = AcceleratorKey("v4.0-test", "host", "host", "fake", "c16_l64")
+
+        /** A limit for an accelerator chunk that no host misses, however busy (see [promoted]). */
+        private const val NO_HOST_MISSES_MS = 120_000.0
+
+        /** The limit of a take that plans to miss it (mode `hang`): what the first chunk of a take has on a device. */
+        private const val PLANNED_LIMIT_MS = 1_000.0
 
         /** Engine threads (a phone runs 4: its big and mid cores). On a many-core desktop the engine's own default
          *  gives erratic chunk times (a barrier over every core). */
@@ -70,8 +76,9 @@ class FailoverEngineTest {
             val d = (TestKit.env("TJ_FAILOVER_MODEL") ?: TestKit.env("TJ_SELFTEST_MODEL"))?.let(::File) ?: return
             if (!File(d, "selftest/selftest.json").isFile || !File(d, "layers.zfw").isFile) return
             dirOrNull = d
-            model = TajweedModel.open(d, ManifestVerifier(listOf(TestKit.hex(ManifestTest.STAGED_TEST_KEY)), requireSignature = false))
-            inner = ExactTajweedEngine(model.dir, "c16_l64", loadEngine = true, threads = THREADS)
+            // TJ_TEST_PUBLIC_KEY: the key of a folder signed with another test key than the staged one (the local 3.0 folders)
+            model = ModelFolder.open(d, ManifestVerifier(listOf(TestKit.hex(TestKit.env("TJ_TEST_PUBLIC_KEY") ?: ManifestTest.STAGED_TEST_KEY)), requireSignature = false))
+            inner = ExactTajweedEngine(model.dir, "c16_l64", threads = THREADS)
         }
 
         @AfterClass
@@ -105,7 +112,9 @@ class FailoverEngineTest {
 
     private fun dir() = Files.createTempDirectory("tj-fo-").toFile().also { dirs.add(it) }
 
-    data class Fail(val mode: String, val at: Int)
+    /** The failure a take plans: [mode] at chunk [at]. With [slowAt] the chunk before it that a busy host makes slow
+     *  ([slowMs] on the accelerator's thread, the fake's engine stream open all the while). */
+    data class Fail(val mode: String, val at: Int, val slowAt: Int = -1, val slowMs: Long = 0)
 
     /** The fake accelerator's stream: the real CPU engine's chunks, failing at chunk [Fail.at]. Before it fails it closes
      *  its engine stream (the engine allows one per process; a real NPU holds none, so the CPU can open its own). */
@@ -114,29 +123,30 @@ class FailoverEngineTest {
         private var made = 0
         override val backend: Backend get() = Backend.NPU
 
-        private fun check(got: List<TajweedHeads>): List<TajweedHeads> {
+        private fun check(got: List<HeadValues>): List<HeadValues> {
             val f = fail ?: return got
-            val out = ArrayList<TajweedHeads>()
+            val out = ArrayList<HeadValues>()
             for (h in got) {
                 val i = made++
+                if (i == f.slowAt) Thread.sleep(f.slowMs)
                 if (i != f.at) { out.add(h); continue }
                 s?.close()
                 s = null
                 when (f.mode) {
                     "exception" -> throw IllegalStateException("the fake accelerator failed at chunk $i")
                     "hang" -> { hang.await(60, TimeUnit.SECONDS); throw IllegalStateException("released") }
-                    "nan" -> { h[TajweedHead.LOG_PROBS]!![7] = Float.NaN; out.add(h) }
-                    "range" -> { h[TajweedHead.LOG_PROBS]!![7] = 4f; out.add(h) }
+                    "nan" -> { h[HeadId.LOG_PROBS]!![7] = Float.NaN; out.add(h) }
+                    "range" -> { h[HeadId.LOG_PROBS]!![7] = 4f; out.add(h) }
                 }
                 return out
             }
             return out
         }
 
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> =
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> =
             check(s?.pushAudio(samples, offset, length) ?: throw IllegalStateException("closed"))
 
-        override fun finish(): List<TajweedHeads> = check(s?.finish() ?: throw IllegalStateException("closed"))
+        override fun finish(): List<HeadValues> = check(s?.finish() ?: throw IllegalStateException("closed"))
         override fun reset() { s?.reset(); made = 0 }
         override fun close() { s?.close(); s = null }
     }
@@ -148,10 +158,10 @@ class FailoverEngineTest {
 
     /** The real CPU engine's chunks of [audio] and the input samples each needed (pushed 16 samples at a time); the
      *  chunks after the last listed sample count are the flush. */
-    private class Precomputed(val chunks: List<TajweedHeads>, val need: LongArray)
+    private class Precomputed(val chunks: List<HeadValues>, val need: LongArray)
 
     private fun precompute(audio: FloatArray): Precomputed {
-        val chunks = ArrayList<TajweedHeads>()
+        val chunks = ArrayList<HeadValues>()
         val need = ArrayList<Long>()
         inner.createStream().use { s ->
             var at = 0
@@ -167,31 +177,31 @@ class FailoverEngineTest {
     }
 
     /** [h] with every frame's best token the blank (log_probs only; the other heads as they were). */
-    private fun blanked(h: TajweedHeads): TajweedHeads {
-        val m = HashMap<TajweedHead, FloatArray>()
+    private fun blanked(h: HeadValues): HeadValues {
+        val m = HashMap<HeadId, FloatArray>()
         for (k in h.available) m[k] = h[k]!!.copyOf()
-        val lp = m.getValue(TajweedHead.LOG_PROBS)
-        val w = TajweedHead.LOG_PROBS.width
-        for (t in 0 until h.n40) for (j in 0 until w) lp[t * w + j] = if (j == TajweedModel.BLANK) -0.001f else -12f
-        return TajweedHeads(h.n40, m)
+        val lp = m.getValue(HeadId.LOG_PROBS)
+        val w = HeadId.LOG_PROBS.width
+        for (t in 0 until h.n40) for (j in 0 until w) lp[t * w + j] = if (j == ModelFolder.BLANK) -0.001f else -12f
+        return HeadValues(h.n40, m)
     }
 
     /**
      * An accelerator that replays the real CPU engine's chunks computed beforehand ([precompute]), blank over [blank]:
      * it holds no engine stream (a real NPU holds none), so the CPU engine can check it while it serves.
      */
-    private class Replayed(private val p: Precomputed, private val blank: IntRange?, private val blanked: (TajweedHeads) -> TajweedHeads) : TajweedEngineStream {
+    private class Replayed(private val p: Precomputed, private val blank: IntRange?, private val blanked: (HeadValues) -> HeadValues) : TajweedEngineStream {
         private var got = 0L
         private var next = 0
         override val backend: Backend get() = Backend.NPU
         private fun emit(i: Int) = if (blank != null && i in blank) blanked(p.chunks[i]) else p.chunks[i]
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> {
             got += length
-            val out = ArrayList<TajweedHeads>()
+            val out = ArrayList<HeadValues>()
             while (next < p.need.size && p.need[next] <= got) out += emit(next++)
             return out
         }
-        override fun finish(): List<TajweedHeads> = (next until p.chunks.size).map { emit(it) }.also { next = p.chunks.size }
+        override fun finish(): List<HeadValues> = (next until p.chunks.size).map { emit(it) }.also { next = p.chunks.size }
         override fun reset() { got = 0; next = 0 }
         override fun close() {}
     }
@@ -200,16 +210,15 @@ class FailoverEngineTest {
         private val dir = File(model.dir, SelfTestSet.DIR)
         private val set = SelfTestSet.read(dir)
         override val chunkMs = 320
-        override val headsBackend = TajweedBackend.INT8
         override val expected = SelfTestSet.readExpected(dir, "c16_l64")
         override val planted = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
         override fun warmup() {}
         override fun golden(abort: () -> Boolean): GoldenRun {
-            val cpu = SelfTestRunner.run({ inner.createStream() }, inner, model.calibration, "c16_l64", set, dir, TajweedBackend.INT8, abort)
-            val acc = SelfTestRunner.run({ FakeAccStream(null, CountDownLatch(0)) }, inner, model.calibration, "c16_l64", set, dir, TajweedBackend.INT8, abort)
+            val cpu = SelfTestRunner.run({ inner.createStream() }, set, dir, abort)
+            val acc = SelfTestRunner.run({ FakeAccStream(null, CountDownLatch(0)) }, set, dir, abort)
             return GoldenRun(acc, cpu)
         }
-        override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream =
+        override fun stream(heads: Set<HeadId>, sampleRate: Int): TajweedEngineStream =
             nextReplay?.invoke() ?: FakeAccStream(nextFail, CountDownLatch(1).also { latches.add(it) })
         override fun close() {}
     }
@@ -234,6 +243,13 @@ class FailoverEngineTest {
         AcceleratorStore(store).also { it.sessionStarted = true; it.put(key, promotedRecord) }
         return AcceleratorController(env, AcceleratorStore(store), prep, key).also { it.start() }.also {
             assertTrue(it.state.value.toString(), it.state.value is AcceleratorState.Ready)
+            // The accelerator of this test is the exact engine itself, and it holds the process's one engine stream
+            // while a call of its runs (a real accelerator holds none). On a busy desktop a chunk of it can take longer
+            // than the limit measured in the golden stage (50 to 70 ms): the take would switch to the CPU, and the CPU
+            // could not open its stream (`session_open`: the one failure of theStallWarmAndCold, 2026-11-11). So no
+            // take here switches on a limit it did not plan: the limit is one no host misses. The takes that plan a
+            // missed limit (mode `hang`) set their own in failoverRun.
+            it.chunkLimits.fixedMs = NO_HOST_MISSES_MS
         }
     }
 
@@ -261,17 +277,17 @@ class FailoverEngineTest {
             promotedRecord.speedup, promotedRecord.accMedianMs, promotedRecord.accP90Ms, Failover.deadlineMs(promotedRecord.accMedianMs, promotedRecord.accP90Ms)))
     }
 
-    private class Clip(val id: String, val surah: Int, val ayah: Int, val audio: FloatArray)
+    private class Clip(val id: String, val audio: FloatArray)
 
     private fun selftestClips(): List<Clip> {
         val dir = File(model.dir, SelfTestSet.DIR)
-        return SelfTestSet.read(dir).clips.map { Clip(it.id, it.surah, it.ayah, SelfTestSet.samples(File(dir, it.file))) }
+        return SelfTestSet.read(dir).clips.map { Clip(it.id, SelfTestSet.samples(File(dir, it.file))) }
     }
 
-    private class Run(val chunks: List<TajweedChunk>, val heads: TajweedHeads, val result: TajweedResult)
+    private class Run(val chunks: List<EngineChunk>, val heads: HeadValues)
 
     /** One session over [c], pushed in 100 ms pieces as a microphone would. */
-    private fun session(rec: TajweedRecognizer, c: Clip): Run = runBlocking {
+    private fun session(rec: Recognizer, c: Clip): Run = runBlocking {
         val s = rec.startSession()
         val got = async { s.chunks.toList() }
         var at = 0
@@ -281,25 +297,26 @@ class FailoverEngineTest {
             at += k
         }
         val heads = s.finish()
-        Run(got.await(), heads, rec.score(heads, c.surah, c.ayah))
+        Run(got.await(), heads)
     }
 
-    private fun cpuOnly(c: Clip): Pair<IntArray, TajweedResult> {
-        val heads = inner.createStream().use { s -> TajweedHeads.concat(s.pushAudio(c.audio, 0, c.audio.size) + s.finish()) }
-        val config = TajweedConfig(app = TajweedOptions(context = "c16_l64"), backend = TajweedBackend.INT8)
-        return heads.greedy() to inner.score(heads, config, config.resolve(model.calibration), c.surah, c.ayah)
+    /** The clip's greedy tokens on the CPU engine alone. */
+    private fun cpuOnly(c: Clip): IntArray {
+        val heads = inner.createStream().use { s -> HeadValues.concat(s.pushAudio(c.audio, 0, c.audio.size) + s.finish()) }
+        return heads.greedy()
     }
 
-    private class Div(var takes: Int = 0, var exact: Int = 0, var tokenTakes: Int = 0, var edits: Int = 0, var tokens: Int = 0,
-                      var siteDiffs: Int = 0, var wordDiffs: Int = 0, var siteTakes: Int = 0, var wordTakes: Int = 0)
+    private class Div(var takes: Int = 0, var exact: Int = 0, var tokenTakes: Int = 0, var edits: Int = 0, var tokens: Int = 0)
 
-    private fun failoverRun(c: Clip, fail: Fail, warm: Boolean, div: Div?, base: Pair<IntArray, TajweedResult>?,
+    private fun failoverRun(c: Clip, fail: Fail, warm: Boolean, div: Div?, base: IntArray?,
                             windowMs: Int = Failover.REPLAY_WINDOW_MS): AcceleratorFailoverEvent {
         nextFail = fail
         failovers.clear()
         val acc = promoted()
         acc.replayWindowMs = windowMs
-        val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+        // a planned missed limit: the fake closes its stream and hangs at the planned chunk, and the limit ends the wait
+        if (fail.mode == "hang") acc.chunkLimits.fixedMs = PLANNED_LIMIT_MS
+        val rec = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
         rec.releaseCpuForAccelerator = !warm
         try {
             val r = session(rec, c)
@@ -315,26 +332,15 @@ class FailoverEngineTest {
             assertTrue(tag, r.chunks.take(maxOf(0, at - 3)).all { it.backend == Backend.NPU })
             assertTrue(tag, r.chunks.drop(at).all { it.backend == Backend.CPU })
             assertEquals(tag, warm, f.failover.warm)
-            // every word of the ayah decoded: the scorer read every expected word
-            val words = rec.expectedWordsBlocking(c.surah, c.ayah)
-            assertEquals(tag, words, r.result.words.size)
             if (base != null && div != null) {
                 val t = r.heads.greedy()
-                val ed = SelfTest.editDistance(base.first, t)
-                fun <T> d(a: Set<T>, b: Set<T>) = (a - b).size + (b - a).size
-                val sd = d(base.second.sites.filter { it.flagged }.map { it.position to it.siteClass }.toSet(),
-                    r.result.sites.filter { it.flagged }.map { it.position to it.siteClass }.toSet())
-                val wd = d(base.second.words.filter { it.flagged }.map { it.word }.toSet(), r.result.words.filter { it.flagged }.map { it.word }.toSet())
+                val ed = SelfTest.editDistance(base, t)
                 div.takes++
                 if (f.failover.exact) div.exact++
                 if (ed > 0) div.tokenTakes++
                 div.edits += ed
-                div.tokens += base.first.size
-                div.siteDiffs += sd
-                div.wordDiffs += wd
-                if (sd > 0) div.siteTakes++
-                if (wd > 0) div.wordTakes++
-                if (f.failover.exact) assertEquals("$tag: a replay from the take's start is exact", 0, ed + sd + wd)
+                div.tokens += base.size
+                if (f.failover.exact) assertEquals("$tag: a replay from the take's start is exact", 0, ed)
             }
             // later sessions: on the CPU after a demotion (an exception: retried later; NaN, out of range: off for good);
             // a single missed limit demotes nothing, and the next take is on the CPU only while the late call runs
@@ -354,7 +360,6 @@ class FailoverEngineTest {
         }
     }
 
-    private fun TajweedRecognizer.expectedWordsBlocking(s: Int, a: Int): Int = runBlocking { (expectedWords(s, a).maxOrNull() ?: -1) + 1 }
 
     private fun fmt(v: Double) = String.format(Locale.ROOT, "%.1f", v)
 
@@ -386,8 +391,7 @@ class FailoverEngineTest {
         println("self-test clips, failover at the first / a middle / the last chunk, 4 causes, cold standby:")
         for ((m, v) in stalls) println("  $m: ${v.size} takes, stall median ${fmt(median(v))} ms, max ${fmt(v.max())} ms")
         println("  divergence vs CPU-only: ${div.takes} takes (${div.exact} replayed from the take's start: exact), " +
-            "${div.tokenTakes} with a token difference (${div.edits} edits of ${div.tokens} tokens), " +
-            "${div.siteTakes} with a site flag difference (${div.siteDiffs}), ${div.wordTakes} with a word flag difference (${div.wordDiffs})")
+            "${div.tokenTakes} with a token difference (${div.edits} edits of ${div.tokens} tokens)")
         // the telemetry counted every failover with its cause and stall
         telemetry.seal(TelemetryContext(AppIdentity("app.test", "1.0"), DeviceProfile("host", null, 15, "15")))
         val body = telemetry.pendingReports().single().readText()
@@ -435,17 +439,66 @@ class FailoverEngineTest {
             }
         }
         val t0 = System.nanoTime()
-        val e = ExactTajweedEngine(model.dir, "c16_l64", loadEngine = true, threads = THREADS)
+        val e = ExactTajweedEngine(model.dir, "c16_l64", threads = THREADS)
         val openMs = (System.nanoTime() - t0) / 1e6
         val t1 = System.nanoTime()
-        e.createStream(TajweedHead.SCORER_HEADS).use { }
+        e.createStream(HeadId.BASE_HEADS).use { }
         val streamMs = (System.nanoTime() - t1) / 1e6
         e.close()
         println("this host: CPU chunk median ${fmt(median(times))} ms; engine open (weights in the page cache) ${fmt(openMs)} ms; first stream ${fmt(streamMs)} ms")
     }
 
-    /** What the CPU standby costs while the accelerator serves: the process's memory with the weights loaded, released
-     *  (a scoring handle only), and loaded again. */
+    /**
+     * A busy host: one chunk of the fake accelerator takes 400 ms, far past any limit a device measures, with its
+     * engine stream open all the while. The take does not switch on it; the failure it planned, at its last chunk, is
+     * its only switch.
+     */
+    @Test
+    fun aSlowChunkOnABusyHostDoesNotSwitchATakeThatPlansAnotherFailure() {
+        val c = selftestClips().maxBy { it.audio.size }
+        val n = inner.createStream().use { s -> (s.pushAudio(c.audio, 0, c.audio.size) + s.finish()).size }
+        assertTrue("the clip is long enough: $n chunks", n >= 10)
+        val e = failoverRun(c, Fail("exception", n - 1, slowAt = 2, slowMs = 400), warm = true, div = null, base = null).failover
+        assertEquals(Failover.EXCEPTION, e.cause)
+        assertTrue("the take switched at chunk ${e.chunk}, not at its planned chunk ${n - 1}", e.chunk >= n - 5)
+    }
+
+    /**
+     * Why these tests fix the limit: with the limits a device measures (never more than 300 ms a warm chunk) the same
+     * slow chunk is a missed limit. The take switches to the CPU, as it must; but the accelerator of this test still
+     * holds the process's one engine stream inside its late call, so the CPU cannot open its own: `session_open`, from
+     * the failover's own call. That is the failure theStallWarmAndCold showed once on a loaded desktop. A real
+     * accelerator holds no engine stream, so a device's CPU takes over there.
+     */
+    @Test
+    fun withMeasuredLimitsTheSameSlowChunkIsTheSessionOpenThisFakeGives() {
+        val c = selftestClips().maxBy { it.audio.size }
+        val n = inner.createStream().use { s -> (s.pushAudio(c.audio, 0, c.audio.size) + s.finish()).size }
+        nextFail = Fail("exception", n - 1, slowAt = 2, slowMs = 800)
+        failovers.clear()
+        val acc = promoted()
+        acc.chunkLimits.fixedMs = null
+        assertTrue("a measured warm limit is at most ${Failover.DEADLINE_CAP_MS} ms: ${acc.deadlineMs}", acc.deadlineMs <= Failover.DEADLINE_CAP_MS)
+        val rec = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+        rec.releaseCpuForAccelerator = false
+        try {
+            val error = try {
+                session(rec, c)
+                null
+            } catch (e: TajweedError) {
+                e
+            }
+            assertEquals("session_open", error?.code)
+            assertTrue("the error came from the failover's own call: ${error!!.stackTrace.take(6).map { it.methodName }}",
+                error.stackTrace.any { it.methodName == "failover" })
+        } finally {
+            rec.close()
+            acc.close()
+        }
+    }
+
+    /** What the CPU standby costs while the accelerator serves: the process's memory with the weights loaded, and
+     *  released. */
     @Test
     fun theStandbysMemory() {
         fun mem(): Pair<Long, Long> {
@@ -454,17 +507,14 @@ class FailoverEngineTest {
             return ProcessMemory.snapshot()
         }
         val base = mem()
-        val e = ExactTajweedEngine(model.dir, "c16_l64", loadEngine = true, threads = THREADS)
-        e.createStream(TajweedHead.SCORER_HEADS).use { s -> s.pushAudio(FloatArray(16_000), 0, 16_000) }
+        val e = ExactTajweedEngine(model.dir, "c16_l64", threads = THREADS)
+        e.createStream(HeadId.BASE_HEADS).use { s -> s.pushAudio(FloatArray(16_000), 0, 16_000) }
         val loaded = mem()
         e.close()
         val closed = mem()
-        val scorer = ExactTajweedEngine(model.dir, "c16_l64", loadEngine = false)
-        val scorerOnly = mem()
-        scorer.close()
         fun mb(b: Long) = String.format(Locale.ROOT, "%.1f", b / 1e6)
         println("process memory (${ProcessMemory.what}): engine loaded +${mb(loaded.first - base.first)} MB private, +${mb(loaded.second - base.second)} MB resident; " +
-            "after release ${mb(closed.first - base.first)} MB private; a scoring-only handle +${mb(scorerOnly.first - closed.first)} MB private")
+            "after release ${mb(closed.first - base.first)} MB private")
     }
 
     private val blanks = Collections.synchronizedList(ArrayList<BlankConfirmedEvent>())
@@ -472,7 +522,8 @@ class FailoverEngineTest {
         override fun onBlankConfirmed(event: BlankConfirmedEvent) { blanks.add(event) }
     }
 
-    private fun basmalaClips() = selftestClips().filter { it.surah == 1 && it.ayah == 1 }
+    /** The three clips of 1:1 (their ids end in the surah and ayah). */
+    private fun basmalaClips() = selftestClips().filter { it.id.endsWith("_001001") }
 
     /**
      * The blank rule with the real CPU engine checking: the accelerator (the CPU's own chunks, replayed) writes nothing over
@@ -493,7 +544,7 @@ class FailoverEngineTest {
             failovers.clear()
             val acc = promoted()
             acc.blankRunMs = runMs
-            val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+            val rec = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
             try {
                 val r = session(rec, c)
                 val tag = "${c.id} blank from chunk 1, run $runMs ms"
@@ -507,10 +558,8 @@ class FailoverEngineTest {
                 assertTrue(tag, f.exact)
                 assertTrue(tag, r.chunks.any { it.replaces })
                 assertEquals(tag, (0 until pre.chunks.size).toSet(), r.chunks.map { it.index }.toSet())
-                // every word of the ayah decoded
-                assertEquals(tag, rec.expectedWordsBlocking(c.surah, c.ayah), r.result.words.size)
                 // the check replayed from the take's first sample: the transcript is the CPU-only run's
-                assertEquals(tag, base.first.toList(), r.heads.greedy().toList())
+                assertEquals(tag, base.toList(), r.heads.greedy().toList())
                 stalls += f.stallMs
                 checks += f.elapsedMs
                 println(String.format(Locale.ROOT, "%s: CPU check (cold: weights loaded, %d chunks replayed) %.1f ms off the audio path; switch from chunk %d %.1f ms; " +
@@ -534,7 +583,7 @@ class FailoverEngineTest {
     fun aHeldStretchTheRealCpuConfirmsStaysOnTheAccelerator() {
         val c0 = selftestClips().first { it.id == "Husary_001001" }
         val tone = FloatArray(6 * 16_000) { (0.05 * Math.sin(2 * Math.PI * 220.0 * it / 16_000)).toFloat() }
-        val c = Clip(c0.id + "+tone", c0.surah, c0.ayah, c0.audio + tone)
+        val c = Clip(c0.id + "+tone", c0.audio + tone)
         val pre = precompute(c.audio)
         // the stretch the CPU itself writes nothing over, with energy
         val blankRun = pre.chunks.indices.reversed().takeWhile { pre.chunks[it].greedy().isEmpty() }.size
@@ -548,7 +597,7 @@ class FailoverEngineTest {
                 failovers.clear()
                 nextReplay = { Replayed(pre, null, ::blanked) }
                 val acc = promoted()
-                val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+                val rec = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
                 rec.releaseCpuForAccelerator = !warm
                 try {
                     val r = session(rec, c)
@@ -594,7 +643,7 @@ class FailoverEngineTest {
         nextReplay = { Replayed(pre, null, ::blanked) }
         val acc = promoted()
         acc.blankRunMs = 1280
-        val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
+        val rec = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc, soc = "fake", threads = THREADS))
         try {
             session(rec, c)
             val released = mem()
@@ -612,7 +661,7 @@ class FailoverEngineTest {
         }
         // the warm-up through the exact engine as the accelerator (one stream opened, one chunk of silence)
         val acc2 = promoted()
-        val rec2 = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = "c16_l64", accelerator = acc2, soc = "fake", threads = THREADS))
+        val rec2 = Recognizer.open(model, Recognizer.Options(context = "c16_l64", accelerator = acc2, soc = "fake", threads = THREADS))
         rec2.releaseCpuForAccelerator = false
         try {
             val times = ArrayList<Double>()
@@ -660,24 +709,21 @@ class FailoverEngineTest {
         val byPos = mapOf("first" to Div(), "middle" to Div(), "last" to Div())
         for (f in audio.listFiles()!!.filter { it.name.endsWith(".pcm") }.sortedBy { it.name }) {
             val id = f.name.removeSuffix(".pcm")
-            val sa = id.substringAfter('_')
             val fb = ByteBuffer.wrap(f.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
-            val c = Clip(id, sa.substring(0, 3).toInt(), sa.substring(3).toInt(), FloatArray(fb.remaining()).also { fb.get(it) })
+            val c = Clip(id, FloatArray(fb.remaining()).also { fb.get(it) })
             val base = cpuOnly(c)
             val n = inner.createStream().use { s -> (s.pushAudio(c.audio, 0, c.audio.size) + s.finish()).size }
             for ((pos, at) in listOf("first" to 0, "middle" to n / 2, "last" to n - 1)) {
                 val d = byPos.getValue(pos)
-                val before = Div(d.takes, d.exact, d.tokenTakes, d.edits, d.tokens, d.siteDiffs, d.wordDiffs, d.siteTakes, d.wordTakes)
+                val before = Div(d.takes, d.exact, d.tokenTakes, d.edits, d.tokens)
                 stalls += failoverRun(c, Fail("exception", at), warm = false, div = d, base = base, windowMs = windowMs).failover.stallMs
                 div.takes++; div.exact += d.exact - before.exact; div.tokenTakes += d.tokenTakes - before.tokenTakes
-                div.edits += d.edits - before.edits; div.tokens += d.tokens - before.tokens; div.siteDiffs += d.siteDiffs - before.siteDiffs
-                div.wordDiffs += d.wordDiffs - before.wordDiffs; div.siteTakes += d.siteTakes - before.siteTakes; div.wordTakes += d.wordTakes - before.wordTakes
+                div.edits += d.edits - before.edits; div.tokens += d.tokens - before.tokens
             }
         }
         for ((pos, d) in byPos + ("all" to div)) {
             println("parity ayahs, window $windowMs ms, failover at the $pos chunk: ${d.takes} takes (${d.exact} exact replays), ${d.tokenTakes} with a token difference " +
-                "(${d.edits} edits of ${d.tokens} tokens), ${d.siteTakes} with a site flag difference (${d.siteDiffs}), " +
-                "${d.wordTakes} with a word flag difference (${d.wordDiffs})")
+                "(${d.edits} edits of ${d.tokens} tokens)")
         }
         println("parity ayahs, window $windowMs ms: stall median ${fmt(median(stalls))} ms, max ${fmt(stalls.max())} ms (cold, this host)")
     }

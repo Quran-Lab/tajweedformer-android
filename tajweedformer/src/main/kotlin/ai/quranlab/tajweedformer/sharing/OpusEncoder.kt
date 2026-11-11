@@ -6,7 +6,7 @@ package ai.quranlab.tajweedformer.sharing
  * complexity 10, fullband, automatic signal type, 20 ms frames, one-second Ogg pages. Since 2.0.1 a
  * shared session's bitrate steps down on a bad network ([BitrateLadder]); [bitrate] is where it starts.
  */
-data class OpusSettings(
+internal data class OpusSettings(
     val application: Application = Application.AUDIO,
     val bitrate: Int = 192_000,
     /** 0 (fastest) to 10 (best). */
@@ -36,7 +36,7 @@ data class OpusSettings(
 }
 
 /** Where an encoder hands its packets, one at a time ([OpusEncoding.encodeTo]). */
-interface PacketSink {
+internal interface PacketSink {
     /** Called before each packet is encoded: the Ogg writer opens a segment here and sets its bitrate. */
     fun beforePacket() {}
 
@@ -45,7 +45,7 @@ interface PacketSink {
 }
 
 /** An Opus encoder: PCM in, Opus packets out. The Ogg writer depends only on this. */
-interface OpusEncoding : AutoCloseable {
+internal interface OpusEncoding : AutoCloseable {
     /** The encoder's lookahead in 48 kHz samples (OpusHead pre-skip). */
     val preSkip: Int
 
@@ -78,7 +78,7 @@ interface OpusEncoding : AutoCloseable {
  * Opus from libopus 1.6.1 through JNI, set up per [OpusSettings]. Non-finite samples are coded as
  * silence. Not thread safe.
  */
-class LibOpusEncoder(
+internal class LibOpusEncoder(
     val sampleRate: Int = OpusSettings.CODED_RATE,
     val channels: Int = 1,
     val settings: OpusSettings = OpusSettings.SHARED,

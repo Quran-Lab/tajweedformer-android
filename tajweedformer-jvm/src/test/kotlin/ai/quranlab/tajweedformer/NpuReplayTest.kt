@@ -26,7 +26,7 @@ import java.security.MessageDigest
  *   outputs (each part answers only the input bytes it was recorded with, by the fake's key), so the
  *   device run's decisions are known before the phone is used.
  */
-class NpuReplayTest {
+class NpuReplayTest : OpenChecked() {
     private val export = TestKit.env("TJ_NPU_REPLAY_EXPORT")
     private val replay = TestKit.env("TJ_NPU_REPLAY")
     private val v4 = File(TestKit.env("TJ_V4_DIR") ?: "")
@@ -95,21 +95,23 @@ class NpuReplayTest {
         val masks = NpuMasks.read(File(r, "$base.masks.json"), contract)
         val parts = contract.parts.indices.map { k -> ReplayPart(File(r, contract.parts[k].file), contract.partContract(k)) }
         val pub = TestKit.env("TJ_TEST_PUBLIC_KEY") ?: File("").readText().trim()
-        val model = TajweedModel.open(v4, ManifestVerifier(listOf(TestKit.hex(pub)), requireSignature = false))
-        val scorer = ExactTajweedEngine(model.dir, "c16_l64", loadEngine = false)
+        val model = ModelFolder.open(v4, ManifestVerifier(listOf(TestKit.hex(pub)), requireSignature = false))
         val dir = File(model.dir, SelfTestSet.DIR)
         val set = SelfTestSet.read(dir)
         val expected = SelfTestSet.readExpected(dir, "c16_l64")
-        val e = NpuTajweedEngine(contract, masks, NpuChainRunner(contract, parts), 16_000, scorer)
-        val observed = SelfTestRunner.run(e, scorer, model.calibration, "c16_l64", set, dir, TajweedBackend.INT8)
+        val e = NpuTajweedEngine(contract, masks, NpuChainRunner(contract, parts), 16_000)
+        val observed = SelfTestRunner.run(e, set, dir)
         assertEquals(0, parts.sumOf { it.misses })
+        val planted = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
         for ((id, o) in observed) {
             val x = expected.clips.getValue(id)
-            println("$id: tokens ${if (o.tokens == x.tokens) "=" else "DIFFER"}, sites ${o.flaggedSites} vs ${x.flaggedSites}, words ${o.flaggedWords} vs ${x.flaggedWords}")
+            println("$id: tokens ${if (o.tokens == x.tokens) "=" else if (id in planted) "differ (planted: not compared)" else "DIFFER"}")
         }
-        val planted = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
-        val v = SelfTestSet.judge(expected, observed, planted)
-        println("self-test verdict (decisions; latency is the device's): $v")
-        scorer.close()
+        // the replayed NPU against the shipped tokens of the clean clips (the raw measures need a CPU run of the
+        // same clips, which the promotion's golden stage does on the device)
+        val edits = observed.filterKeys { it !in planted }.entries.sumOf { (id, o) ->
+            SelfTest.editDistance(expected.clips.getValue(id).tokens.toIntArray(), o.tokens.toIntArray())
+        }
+        println("self-test of the replayed Exynos 2500: $edits token edits on the clean clips (latency is the device's)")
     }
 }

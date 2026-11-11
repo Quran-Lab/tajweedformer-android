@@ -5,7 +5,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 
 /** Which app the SDK runs in: what registration and tokens name. On Android, from the Context. */
-data class AppIdentity(
+internal data class AppIdentity(
     /** The Gradle `applicationId`. */
     val bundleId: String,
     /** The app's version name (letters, digits, `.+-`, at most 32). */
@@ -31,7 +31,7 @@ data class AppIdentity(
  * Coarse device context for telemetry and issue reports: never an identifier. `deviceClass` is the
  * model family (`Pixel8`, `SM-S921`), `soc` the chip (`tensor_g3`), both `[A-Za-z0-9][A-Za-z0-9_.-]{0,23}`.
  */
-data class DeviceProfile(
+internal data class DeviceProfile(
     val deviceClass: String,
     val soc: String? = null,
     val osMajor: Int,
@@ -86,7 +86,7 @@ data class DeviceProfile(
 }
 
 /** UTC days, the finest time anything the SDK sends carries. */
-object Day {
+internal object Day {
     @JvmStatic
     fun of(epochMs: Long): String = Instant.ofEpochMilli(epochMs).atOffset(ZoneOffset.UTC).toLocalDate().toString()
 
@@ -97,7 +97,7 @@ object Day {
 }
 
 /** A Quran Lab developer key, `qlk_v1_<key_id>_<22 chars>`: shipped in the app, sent as `x-qlab-key`. */
-class QuranLabKey private constructor(val value: String, val keyId: String) {
+internal class QuranLabKey private constructor(val value: String, val keyId: String) {
     override fun toString(): String = "qlk_v1_${keyId}_..."
 
     companion object {

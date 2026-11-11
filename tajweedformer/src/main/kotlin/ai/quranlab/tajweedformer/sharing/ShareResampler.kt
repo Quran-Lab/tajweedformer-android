@@ -12,7 +12,7 @@ package ai.quranlab.tajweedformer.sharing
  * (The Swift SDK uses AVAudioConverter at its mastering quality; the two are not byte-identical,
  * which only matters for non-48 kHz input. At 48 kHz neither resamples.)
  */
-class ShareResampler(val inputRate: Int) {
+internal class ShareResampler(val inputRate: Int) {
     private val outRate = OpusSettings.CODED_RATE
     /** Cutoff as a fraction of the input's Nyquist rate. */
     private val fc = 0.95 * minOf(1.0, outRate.toDouble() / inputRate)

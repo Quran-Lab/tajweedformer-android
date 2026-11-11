@@ -15,20 +15,21 @@ import java.nio.ByteOrder
  * End to end on the staged layout-v2 folder: [ModelStore] downloads the android CPU profile from a
  * local HTTP server serving `sdk_v4.0_l3` (signed with the test key), verifies and inflates it,
  * and the V4 conformance runs through this SDK's own stream API: the 35 parity clips' 16 kHz audio pushed through
- * TajweedRecognizer sessions in pieces, and for every clip the chunk count, the greedy tokens, the
+ * Recognizer sessions in pieces, and for every clip the chunk count, the greedy tokens, the
  * cumulative FNV-1a of log_probs and an FNV-1a of each of the 12 outputs of every chunk compared with
  * the engine's conformance file (conformance/v4_<context>_audio_expected.jsonl, the fields
  * bench/v4_conformance_check.py compares). One bit of difference in one value fails the clip.
  *
- * Needs (skipped when absent): the JNI library (scripts/build_host.sh), `TJ_V4_TRANSPORT_DIR` = the
- * staged transport folder or `TJ_V4_DIR` = a
- * decoded folder already in place, `ZF_V4_AUDIO_DIR` = the clips' float32 .pcm, and
+ * Needs (skipped when absent): the JNI library (scripts/build_host.sh), `TJ_V4_DIR` = a decoded 3.0 folder
+ * already in place (with `TJ_TEST_PUBLIC_KEY` when it is signed with a test key) or `TJ_V4_TRANSPORT_DIR` = a
+ * stored 3.0 folder to download from (a 2.x folder is refused by SDK 3.0, and the tests then skip),
+ * `ZF_V4_AUDIO_DIR` = the clips' float32 .pcm, and
  * `ZF_V4_CONFORMANCE_DIR` = the engine's conformance folder (default: the engine submodule's).
  * c16_l64 and c8_l64 have audio expected files; the c24 contexts' expected files are feature-level,
  * and this SDK's V4 API takes audio, not features. `TJ_V4_DIR` may name an unsigned decoded folder with
  * `TJ_V4_UNSIGNED=1` (no signature is checked then); the calibration sha256 is checked on both routes.
  */
-class V4ConformanceTest {
+class V4ConformanceTest : OpenChecked() {
     internal fun env(name: String): String? = System.getenv(name) ?: System.getProperty(name)
 
     companion object {
@@ -58,11 +59,12 @@ class V4ConformanceTest {
     }
 
     /** The staged folder through ModelStore (a local server) into build/v4.0-l3, or TJ_V4_DIR. */
-    internal fun model(): TajweedModel? {
+    internal fun model(): ModelFolder? {
         if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) return null
-        val key = listOf(TestKit.hex(ManifestTest.STAGED_TEST_KEY))
+        // the key the folder is signed with: TJ_TEST_PUBLIC_KEY (the local 3.0 folders), else the staged folder's
+        val key = listOf(TestKit.hex(env("TJ_TEST_PUBLIC_KEY") ?: ManifestTest.STAGED_TEST_KEY))
         env("TJ_V4_DIR")?.let {
-            val m = TajweedModel.open(File(it), ManifestVerifier(key, requireSignature = env("TJ_V4_UNSIGNED") == null))
+            val m = ModelFolder.open(File(it), ManifestVerifier(key, requireSignature = env("TJ_V4_UNSIGNED") == null))
             // the 2.0.0 design: the shipping calibration.json
             val sha = java.security.MessageDigest.getInstance("SHA-256").digest(File(it, "calibration.json").readBytes())
             assertEquals(SHIPPING_CALIBRATION_SHA256, sha.joinToString("") { b -> "%02x".format(b) })
@@ -85,7 +87,14 @@ class V4ConformanceTest {
             val root = File("build/v4.0-l3")
             val store = ModelStore(root, "http://127.0.0.1:${server.address.port}/", verifier = ManifestVerifier(key))
             val t0 = System.nanoTime()
-            store.manifest(refresh = true)   // the staged folder may have been re-signed since the last run
+            try {
+                store.manifest(refresh = true)   // the staged folder may have been re-signed since the last run
+            } catch (e: RecognizerException.ModelIncompatible) {
+                // the staged folder of the 2.x days is a 2.x build, which SDK 3.0 refuses (ManifestTest checks that):
+                // these tests then need TJ_V4_DIR, a decoded 3.0 folder
+                println("the staged folder is not a 3.0 build (${e.message}): set TJ_V4_DIR to a decoded 3.0 folder")
+                return null
+            }
             val m = store.ensureCpu("c16_l64")
             // the 2.0.0 design: the shipping calibration.json
             assertEquals(SHIPPING_CALIBRATION_SHA256, m.manifest.file("calibration.json")!!.localSha256)
@@ -116,7 +125,7 @@ class V4ConformanceTest {
         Assume.assumeTrue("no JNI library or no staged folder", model != null)
         model!!
         Assume.assumeTrue("the folder has no $context", context in model.availableContexts)
-        val tj = TajweedRecognizer.open(model, TajweedRecognizer.Options(context = context, threads = 4, selfTest = true, allHeads = true))
+        val tj = Recognizer.open(model, Recognizer.Options(context = context, threads = 4, selfTest = true, allHeads = true))
         assertTrue("CPU self-test: ${tj.cpuSelfTest}", tj.cpuSelfTest!!.passed)
         assertEquals(Backend.CPU, tj.backend)
         assertEquals("no_accelerator", tj.backendChoice.reason)
@@ -144,11 +153,11 @@ class V4ConformanceTest {
                 var logp = FNV0
                 val out = HashMap<String, ArrayList<String>>()
                 for (c in got) {
-                    for (h in TajweedHead.entries) {
+                    for (h in HeadId.entries) {
                         val v = c.heads[h] ?: continue
                         out.getOrPut(h.key) { ArrayList() }.add(hex(fnv(FNV0, v)))
                     }
-                    logp = fnv(logp, c.heads[TajweedHead.LOG_PROBS]!!)
+                    logp = fnv(logp, c.heads[HeadId.LOG_PROBS]!!)
                 }
                 val tokens = all.greedy().toList()
                 val why = when {
@@ -165,26 +174,17 @@ class V4ConformanceTest {
                 // the take's heads are the chunks' heads, joined
                 assertEquals(got.sumOf { it.heads.n40 }, all.n40)
             }
-            // the tajweed layer of a known ayah (Saood_001001 is 1:1): with an API 3 engine the words are the
-            // engine's own readout at calibration's default word level
+            // the decoded layer of a whole take (Saood_001001 is 1:1): tokens and words from the model's own output
             val s = tj.startSession()
             s.append(readPcm(File(audio, "Saood_001001.pcm")))
-            val r = s.finishAndScore(1, 1)
-            val wordApi = ai.quranlab.tajweedformer.engine.TajweedJni.apiVersion() >= 3
-            println("1:1 scored: ${r.sites.size} sites (${r.flaggedSites.size} flagged), ${r.words.size} words " +
-                "(${r.flaggedWords.size} flagged, from the engine: ${r.wordsFromEngine}), word setting ${r.wordSettings}; " +
-                "scores ${r.words.joinToString { String.format(java.util.Locale.ROOT, "%.2f", it.score) }}")
-            assertTrue(r.words.isNotEmpty())
-            if (wordApi) {
-                assertTrue(r.wordsFromEngine)
-                val want = WordCalibration.of(model.calibration, context)
-                assertEquals(want.threshold(want.defaultLevel), r.wordSettings!!.threshold, 1e-12)
-                assertTrue(r.words.all { it.flagged == (it.hasScore && it.score >= it.threshold) })
-            }
+            val take = s.finish()
+            val d = tj.decode(take)
+            println("1:1 decoded: ${d.tokens.size} tokens, ${d.words.size} words: ${d.text}")
+            assertTrue(d.words.isNotEmpty())
         } finally {
             tj.close()
         }
-        println("V4 $context audio through TajweedRecognizer: ${expected.size - bad.size}/${expected.size} clips bit-identical " +
+        println("V4 $context audio through Recognizer: ${expected.size - bad.size}/${expected.size} clips bit-identical " +
             "($outputsChecked chunk outputs)" + if (bad.isEmpty()) "" else "; differ: ${bad.joinToString()}")
         assertTrue(bad.joinToString(), bad.isEmpty())
     }
@@ -207,9 +207,9 @@ class V4ConformanceTest {
                     val dst = File(root, e.localPath).also { it.parentFile.mkdirs() }
                     java.util.zip.GZIPInputStream(src.inputStream()).use { i -> dst.outputStream().use { i.copyTo(it) } }
                 }
-                TajweedModel.open(root, ManifestVerifier(listOf(TestKit.hex(ManifestTest.STAGED_TEST_KEY))), require = listOf(ctx))
+                ModelFolder.open(root, ManifestVerifier(listOf(TestKit.hex(ManifestTest.STAGED_TEST_KEY))), require = listOf(ctx))
             }
-            TajweedRecognizer.open(model, TajweedRecognizer.Options(context = ctx, threads = 4)).use { tj ->
+            Recognizer.open(model, Recognizer.Options(context = ctx, threads = 4)).use { tj ->
                 val heads = kotlinx.coroutines.runBlocking {
                     val s = tj.startSession()
                     s.append(clip.samples)

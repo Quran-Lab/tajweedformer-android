@@ -9,7 +9,7 @@ package ai.quranlab.tajweedformer
  * json module, it also reads the literals `NaN`, `Infinity` and `-Infinity`, so a portal block that
  * carries one is read and its field dropped by validation instead of losing the whole document.
  */
-object Json {
+internal object Json {
     /** Parses [text]; throws [JsonException] when it is not one JSON value. */
     @JvmStatic
     fun parse(text: String): Any? {
@@ -21,6 +21,7 @@ object Json {
         return v
     }
 
+
     /** Compact JSON for [value] (the types [parse] gives; Int, Long and Float are written as numbers). */
     @JvmStatic
     fun write(value: Any?): String = StringBuilder().also { write(it, value) }.toString()
@@ -29,6 +30,7 @@ object Json {
         when (v) {
             null -> sb.append("null")
             is Boolean -> sb.append(v)
+
             is Double -> sb.append(number(v))
             is Float -> sb.append(number(v.toDouble()))
             is Number -> sb.append(v.toLong())
@@ -220,7 +222,7 @@ object Json {
 }
 
 /** Text that is not JSON. */
-class JsonException(message: String) : IllegalArgumentException(message)
+internal class JsonException(message: String) : IllegalArgumentException(message)
 
 /** Typed reads of parsed JSON, for the SDK's own files. Each throws [JsonException] naming the key. */
 internal object J {

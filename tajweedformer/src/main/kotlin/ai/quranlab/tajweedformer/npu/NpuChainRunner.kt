@@ -19,7 +19,7 @@ package ai.quranlab.tajweedformer.npu
  *
  * [runners] are the parts' runners in order; this runner owns them and closes them all.
  */
-class NpuChainRunner(private val contract: NpuContract, private val runners: List<NpuRunner>) : NpuRunner {
+internal class NpuChainRunner(private val contract: NpuContract, private val runners: List<NpuRunner>) : NpuRunner {
     init {
         require(contract.parts.isNotEmpty()) { "not a chained build" }
         require(runners.size == contract.parts.size) { "${runners.size} runners for ${contract.parts.size} parts" }

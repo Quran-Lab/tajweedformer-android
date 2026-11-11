@@ -2,7 +2,7 @@ package ai.quranlab.tajweedformer.android
 
 import ai.quranlab.tajweedformer.accel.AcceleratorEnvironment
 import ai.quranlab.tajweedformer.accel.Conditions
-import ai.quranlab.tajweedformer.cloud.android.QuranLabAndroid
+import ai.quranlab.tajweedformer.TajweedClient
 import android.app.ActivityManager
 import android.content.ComponentCallbacks2
 import android.content.Context
@@ -29,7 +29,7 @@ import java.util.concurrent.TimeUnit
  *   thermal status NONE or LIGHT (API 29+); the download stage waits for an unmetered network;
  * - at a session start, thermal SEVERE or worse and memory warnings (`onTrimMemory(RUNNING_LOW)` or worse, or
  *   `MemoryInfo.lowMemory`) keep that session on the CPU;
- * - the denylist: the portal link's `forcedBackend(revision)`;
+ * - the denylist: the client's signed config (`forcedBackend`, `accelDenied`);
  * - scheduling: work with no delay and no network need runs at once on a low-priority thread; a delayed or
  *   unmetered-only run goes through WorkManager (with that delay, and `NetworkType.UNMETERED` when asked).
  * - incident reports: `Build.MODEL` (a model code, never a name), `<release>/<Build.ID>/<incremental>`, the dispatch
@@ -37,7 +37,7 @@ import java.util.concurrent.TimeUnit
  * - the app becoming active ([onAppActive]): the process's first started activity (a rotation is not one), so the
  *   accelerator is warmed up before the first chunk after the app sat in the background.
  */
-class AndroidAccelerator internal constructor(
+internal class AndroidAccelerator internal constructor(
     context: Context,
     override val soc: String?,
     /** Every run at once on a background thread (DebugHooks.scheduleNow, debuggable apps only). */
@@ -94,6 +94,7 @@ class AndroidAccelerator internal constructor(
     override val deviceModel: String = "${Build.MANUFACTURER} ${Build.MODEL}"
     override val deviceModelCode: String = Build.MODEL ?: "unknown"
     override val osBuildReport: String = "${Build.VERSION.RELEASE}/${Build.ID}/${Build.VERSION.INCREMENTAL}"
+    override val osVersion: String? = Build.VERSION.RELEASE?.take(32)
 
     /** The vendor dispatch library the SoC uses (its version is the app's LiteRT dependency). */
     override val delegate: String? = when {
@@ -132,10 +133,10 @@ class AndroidAccelerator internal constructor(
 
     override fun unmetered(): Boolean = network.isUnmetered()
 
-    override fun forcedBackend(revision: String): String? = try { QuranLabAndroid.cloud?.forcedBackend(revision) } catch (_: Exception) { null }
+    override fun forcedBackend(revision: String): String? = try { TajweedClient.current?.cloud?.forcedBackend(revision) } catch (_: Exception) { null }
 
     override fun accelDenied(revision: String, accelerator: String): String? = try {
-        QuranLabAndroid.cloud?.accelDenied(accelerator, revision, osBuildReport, deviceModelCode, soc, delegate)
+        TajweedClient.current?.cloud?.accelDenied(accelerator, revision, osBuildReport, deviceModelCode, soc, delegate)
     } catch (_: Exception) {
         null
     }
@@ -143,7 +144,7 @@ class AndroidAccelerator internal constructor(
     /**
      * A pipeline run, durable: the closure runs in this process (at once on a low-priority thread when it is due now and
      * needs no network, else when WorkManager's unique work fires), and the same unique work survives process death and
-     * reboots, so a fresh process resumes every key from its persisted record ([TajweedFormerAndroid.resumePromotions]).
+     * reboots, so a fresh process resumes every key from its persisted record ([ai.quranlab.tajweedformer.TajweedClient.resumePromotions]).
      * Constraints: battery not low; an unmetered network when the download waits for one; no "device idle" (rarely met
      * while the app is in use). A run due now also leaves a durable fallback 15 minutes later (nothing to do once done).
      */
@@ -196,12 +197,12 @@ class AndroidAccelerator internal constructor(
 /**
  * Runs the promotion pipeline once WorkManager's delay and constraints hold: what this process scheduled, or, in a
  * process WorkManager started for it (after the app was killed or the phone restarted), every key resumed from its
- * persisted record ([TajweedFormerAndroid.resumePromotions]).
+ * persisted record (the client made from the options saved last time, [AndroidPlatform.restore]).
  */
-class NpuPrepareWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+internal class NpuPrepareWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         if (!AndroidAccelerator.runPending()) {
-            try { TajweedFormerAndroid.resumePromotions(applicationContext) } catch (_: Exception) {}
+            try { AndroidPlatform.restore(applicationContext)?.resumePromotions() } catch (_: Exception) {}
         }
         return Result.success()
     }

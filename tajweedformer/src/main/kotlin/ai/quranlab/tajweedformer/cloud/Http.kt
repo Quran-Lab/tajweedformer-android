@@ -8,7 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /** One HTTP request. A body is bytes or a file (PUTs of segments stream from disk). */
-class HttpRequest(
+internal class HttpRequest(
     val method: String,
     val url: String,
     val headers: Map<String, String> = emptyMap(),
@@ -17,7 +17,7 @@ class HttpRequest(
 )
 
 /** One HTTP response; header names lower case. */
-class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray) {
+internal class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray) {
     val ok: Boolean get() = status in 200..299
 
     fun header(name: String): String? = headers[name.lowercase()]
@@ -33,12 +33,12 @@ class HttpResponse(val status: Int, val headers: Map<String, String>, val body: 
     /** qlab-api's `{"error","message"}`, or `http_<status>`. */
     val error: ApiError get() {
         val o = json()
-        return ApiError(status, o?.get("error") as? String ?: "http_$status")
+        return ApiError(status, o?.get("error") as? String ?: "http_$status", o?.get("min_sdk") as? String, o?.get("reason") as? String)
     }
 }
 
 /** The network, replaceable in tests. Throws [IOException] when no response came. */
-fun interface HttpTransport {
+internal fun interface HttpTransport {
     @Throws(IOException::class)
     fun send(request: HttpRequest): HttpResponse
 }
@@ -47,7 +47,7 @@ fun interface HttpTransport {
  * [HttpURLConnection], available on Android and the JVM without a dependency. Never sends an
  * `Origin` header (an `apps` key with one is refused), never follows redirects, never caches.
  */
-class UrlConnectionTransport(
+internal class UrlConnectionTransport(
     private val connectTimeoutMs: Int = 15_000,
     private val readTimeoutMs: Int = 60_000,
 ) : HttpTransport {
@@ -85,7 +85,7 @@ class UrlConnectionTransport(
 }
 
 /** What the SDK does about an answer (PLATFORM_CLIENT.md section 8, the error table). */
-enum class ErrorAction {
+internal enum class ErrorAction {
     /** A bug in the SDK: drop the request, report `other`/`bad_request:<route>` once a day. */
     DROP_AND_REPORT,
     /** Revoked key: no network calls until the next launch. */
@@ -121,7 +121,24 @@ enum class ErrorAction {
 }
 
 /** An error answer: HTTP status and qlab-api's code. */
-data class ApiError(val status: Int, val code: String) {
+internal data class ApiError(
+    val status: Int,
+    val code: String,
+    /** With 403 `sdk_too_old`: the SDK version the server asks for (`min_sdk`), when the answer names it. */
+    val minSdk: String? = null,
+    /** The body's `reason`: why the server gave this answer, when it says. A key that belongs to another app, a
+     *  key of the wrong type and an origin that is not on the key are answered as a bad key (401 `invalid_key`)
+     *  with the reason `app_not_allowed`, `key_type_mismatch` or `origin_not_allowed`; a made-up or revoked key
+     *  has none. */
+    val reason: String? = null,
+) {
+    /**
+     * What the app was refused for: the body's [reason] when the error catalogue has words for it (the `reasons` of
+     * `server_rejected`), else the error [code]. The reason is read first; what the SDK does to its network calls
+     * ([action]) follows the code as before.
+     */
+    val refusal: String get() = reason?.takeIf { it in ai.quranlab.tajweedformer.ErrorCatalogue.reasons("server_rejected") } ?: code
+
     val action: ErrorAction get() = when {
         status == 400 -> ErrorAction.DROP_AND_REPORT
         status == 401 && code == "invalid_key" -> ErrorAction.STOP_UNTIL_NEXT_LAUNCH
@@ -149,8 +166,11 @@ data class ApiError(val status: Int, val code: String) {
 }
 
 /** A request that did not succeed: an error answer, or no answer ([api] null: offline). */
-class CloudException(val api: ApiError?, message: String) : Exception(message) {
+internal class CloudException(val api: ApiError?, message: String, cause: Throwable? = null) : Exception(message, cause) {
     val offline: Boolean get() = api == null
+
+    /** No answer because the system does not let the app use the network (no INTERNET permission). */
+    val notPermitted: Boolean get() = cause is ai.quranlab.tajweedformer.NetworkNotPermitted
     /** Worth retrying later. */
     val retryable: Boolean get() = api == null || api.action in setOf(ErrorAction.BACKOFF, ErrorAction.RETRY_NEXT_LAUNCH)
 }

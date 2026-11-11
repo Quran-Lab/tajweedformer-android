@@ -36,7 +36,7 @@ object ProgramDeltaRebuildMain {
     }
 }
 
-class ProgramDeltaTest {
+class ProgramDeltaTest : OpenChecked() {
     private val dirs = ArrayList<File>()
     private fun dir() = Files.createTempDirectory("tj-qlpd-").toFile().also { dirs.add(it) }
 
