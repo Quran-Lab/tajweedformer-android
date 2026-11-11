@@ -15,7 +15,10 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/** One shared session in the outbox. */
+/**
+ * One shared recording in the outbox. Since 2.0.3 a recording holds the takes that followed one another within the
+ * join window ([TakeJoin]): one Ogg stream, one upload id.
+ */
 data class Contribution(
     /** The session's upload id (32 hex), also the server's. */
     val id: String,
@@ -31,6 +34,8 @@ data class Contribution(
     val lastError: String?,
     /** The bit rate (bit/s) each closed segment was encoded at, in segment order (SDK 2.0.1, [BitrateLadder]). */
     val segmentBitrates: List<Int> = emptyList(),
+    /** The takes in the recording so far (SDK 2.0.3): 1, or more when takes in a row joined it. */
+    val takes: Int = 1,
 ) {
     enum class Status { QUEUED, UPLOADED, FAILED }
 }
@@ -51,14 +56,19 @@ internal interface SharingGate {
     fun contributorRevoked() {}
     /** A refusal that is an SDK bug (400): one issue a day. */
     fun badRequest(route: String) {}
+    /** A line for the developer's log (debuggable builds). */
+    fun log(message: String) {}
 }
 
 /**
- * One session being shared: Ogg Opus segments written while the session runs, into its folder in the
+ * One recording being shared: Ogg Opus segments written while it runs, into its folder in the
  * outbox, each closed segment handed to the outbox at once. Audio is copied on the caller's thread
  * and encoded on a thread of its own, so recognition never waits for the encoder. Each segment is
  * encoded at the outbox's [BitrateLadder] rate in force when it opens; a closed segment tells the ladder
  * how much audio waits.
+ *
+ * Since 2.0.3 it outlives a take ([ShareRecorder]): takes in a row append to the same writer, so the stream, the
+ * encoder, the resampler and the segment plan run on across them, and [takes] keeps their boundaries in `takes.json`.
  */
 internal class ShareCapture(
     private val outbox: ContributionOutbox,
@@ -66,7 +76,7 @@ internal class ShareCapture(
     private val session: (Int, String) -> ByteArray,
     private val route: String,
     private val stillOn: () -> Boolean,
-) {
+) : Recording {
     val id: String = UUID.randomUUID().toString().replace("-", "").lowercase()
     val folder = File(outbox.root, id)
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "tj-share").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } }
@@ -77,11 +87,30 @@ internal class ShareCapture(
     @Volatile private var ended = false
     private var preSkip = -1
     private val bitrates = ArrayList<Int>()
+    private var abandoned = false
+    /** Sharing went off ([abandon]): nothing of the capture is kept. */
+    private var off = false
 
     init { ACTIVE.add(id) }
 
+    /**
+     * False once the capture failed or ended, or the server refused its upload or ended it at the capped tier's
+     * segment cap: no take joins it (the next take starts a recording of its own).
+     */
+    override val alive: Boolean get() = !failed && !ended && outbox.accepts(id)
+
+    /** The recording's takes so far (two or more), kept in `takes.json` before the joining take's audio is encoded. */
+    override fun takes(list: List<Take>) {
+        if (failed || ended) return
+        worker.execute {
+            if (failed || writer == null) return@execute
+            // a list that cannot be written leaves the earlier one: the audio still joins
+            try { ShareFiles.writeTakes(folder, list) } catch (_: Exception) {}
+        }
+    }
+
     /** Mono samples at [sampleRate]; a different rate than the session's first is ignored (one rate per session). */
-    fun append(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) {
+    override fun append(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) {
         if (failed || ended || length <= 0) return
         val copy = samples.copyOfRange(offset, offset + length)
         worker.execute {
@@ -128,9 +157,10 @@ internal class ShareCapture(
 
     /**
      * Ends the capture: the last segment and `end.json`; or nothing kept when sharing went off, or a
-     * failed or cancelled session is shorter than [MINIMUM_PARTIAL_S] with no segment gone.
+     * failed or cancelled session is shorter than [MINIMUM_PARTIAL_S] with no segment gone. For a recording of
+     * several takes [completed] is the last take's, and the minimum counts the audio of all of them.
      */
-    fun finish(completed: Boolean) {
+    override fun finish(completed: Boolean) {
         if (ended) return
         ended = true
         worker.execute {
@@ -151,18 +181,38 @@ internal class ShareCapture(
         worker.shutdown()
     }
 
+    /**
+     * Sharing went off (the settings switch, a deletion, the signed config): the capture ends at once and its folder
+     * goes, whatever was already handed to the outbox. It does not wait for [stillOn] to say so: the recording may
+     * be between takes, and the caller may record the learner's answer only afterwards.
+     */
+    override fun abandon() {
+        if (ended) return
+        ended = true
+        worker.execute {
+            off = true
+            abandonNow()
+            outbox.poke()
+        }
+        worker.shutdown()
+    }
+
     /** Waits until the audio given so far is encoded and on disk. */
-    fun sync() { if (!worker.isShutdown) worker.submit {}.get() }
+    override fun sync() { if (!worker.isShutdown) worker.submit {}.get() }
 
     /** Waits for the encoder thread (tests, and before the process is torn down). */
     fun await(ms: Long = 30_000) { worker.awaitTermination(ms, TimeUnit.MILLISECONDS) }
 
     private fun abandonNow() {
+        // once: a capture that failed while it ran is ended later (a recording waits for the next take), when the
+        // outbox may already have sent what it kept
+        if (abandoned) return
+        abandoned = true
         writer?.abandon()
         writer = null
         failed = true
         // segments already handed over stay with the outbox only while sharing is on
-        if (segments == 0 || !stillOn()) folder.deleteRecursively() else ShareFiles.recover(folder)
+        if (segments == 0 || off || !stillOn()) folder.deleteRecursively() else ShareFiles.recover(folder)
         release()
     }
 
@@ -209,6 +259,11 @@ internal class ShareCapture(
  * The [ladder] hears how uploads go: a network failure of any upload request (no connection, a
  * timeout, HTTP 408 or 5xx) steps it down, a segment PUT answered 2xx counts towards a step up.
  *
+ * Since 2.0.3 a recording may hold several takes. Its segments upload as before while it waits for the next
+ * take; once it has closed and every segment is up, the item is uploaded, and a recording of two or more takes
+ * then sends its take list (`POST /v1/uploads/{id}/takes`, the body of `takes.json`). That call never changes the
+ * item's state: it is retried with the same backoff until it is accepted or dropped, across relaunches.
+ *
  * Blocking; [drain] runs one pass at a time (a call during a pass runs one more after it).
  */
 class ContributionOutbox internal constructor(
@@ -234,12 +289,25 @@ class ContributionOutbox internal constructor(
         var attempts: Int = 0,
         var lastError: String? = null,
         var nextAttempt: Long = 0,
-    )
+        /**
+         * The take list of a recording of two or more takes (SDK 2.0.3): null when there is none to send,
+         * [TAKES_PENDING] from the moment the item is uploaded until the list is [TAKES_SENT] or [TAKES_DROPPED].
+         */
+        var takes: String? = null,
+        var takesAttempts: Int = 0,
+        var takesNextAttempt: Long = 0,
+    ) {
+        /** Something is still to send: segments, or the take list of an uploaded recording. */
+        val waiting: Boolean get() = state == "active" || takes == TAKES_PENDING
+        /** When the next try is due (ms). */
+        val due: Long get() = if (state == "active") nextAttempt else takesNextAttempt
+    }
 
     private val records = HashMap<String, Record>()
     private val lock = Object()
     private var running = false
     private var again = false
+    private val takesRouteLogged = java.util.concurrent.atomic.AtomicBoolean(false)
 
     init { root.mkdirs() }
 
@@ -250,6 +318,9 @@ class ContributionOutbox internal constructor(
 
     /** A capture closed a segment or ended. */
     internal fun poke() = onWork()
+
+    /** Whether the upload of a recording that is still written goes on: not refused, not ended at the segment cap. */
+    internal fun accepts(id: String): Boolean = synchronized(records) { records[id]?.state ?: "active" } == "active"
 
     /** Seconds of audio in closed segments not yet uploaded, of every session still to send. */
     fun backlogSeconds(): Double = synchronized(records) {
@@ -262,10 +333,13 @@ class ContributionOutbox internal constructor(
     /** A network failure of an upload request: no answer, or HTTP 408 or 5xx. */
     private fun networkFailure(status: Int?): Boolean = status == null || status == 408 || status in 500..599
 
-    /** Sharing was turned off: every session not fully uploaded goes, and nothing else is sent. */
+    /** Sharing was turned off: every session not fully uploaded goes, and nothing else is sent (a take list neither). */
     fun cancelQueued() = synchronized(records) {
         scan()
-        for (r in records.values.toList()) if (r.state == "active" && r.id !in ShareCapture.ACTIVE) remove(r.id)
+        for (r in records.values.toList()) {
+            if (r.state == "active" && r.id !in ShareCapture.ACTIVE) remove(r.id)
+            else if (r.takes == TAKES_PENDING) endTakes(r, TAKES_DROPPED)
+        }
         // folders the outbox has not picked up yet
         for (f in root.listFiles() ?: emptyArray()) if (f.isDirectory && f.name !in ShareCapture.ACTIVE && records[f.name] == null) f.deleteRecursively()
     }
@@ -277,10 +351,10 @@ class ContributionOutbox internal constructor(
     }
 
     /** The earliest retry due (ms), or null when nothing waits. */
-    fun nextDue(): Long? = synchronized(records) { scan(); records.values.filter { it.state == "active" }.minOfOrNull { it.nextAttempt } }
+    fun nextDue(): Long? = synchronized(records) { scan(); records.values.filter { it.waiting }.minOfOrNull { it.due } }
 
-    /** True while some session still has something to send. */
-    fun hasWork(): Boolean = synchronized(records) { scan(); records.values.any { it.state == "active" } }
+    /** True while some session still has something to send (segments, or the take list of an uploaded recording). */
+    fun hasWork(): Boolean = synchronized(records) { scan(); records.values.any { it.waiting } }
 
     /** One upload pass. [ignoringBackoff] is for tests and an explicit retry. Returns false when the pass stopped offline. */
     fun drain(ignoringBackoff: Boolean = false): Boolean {
@@ -305,7 +379,7 @@ class ContributionOutbox internal constructor(
             scan()
             expireOld()
             val now = clock()
-            records.values.filter { it.state == "active" && (ignoringBackoff || it.nextAttempt <= now) }.sortedBy { it.seq }.map { it.id }
+            records.values.filter { it.waiting && (ignoringBackoff || it.due <= now) }.sortedBy { it.seq }.map { it.id }
         }
         if (due.isEmpty()) return true
         if (!gate.uploadsAllowed()) {
@@ -317,7 +391,8 @@ class ContributionOutbox internal constructor(
             val token = try {
                 gate.uploadToken()
             } catch (e: CloudException) {
-                retry(id, "token: ${e.message}", longWait = !e.retryable)
+                if (synchronized(records) { records[id] }?.state == "active") retry(id, "token: ${e.message}", longWait = !e.retryable)
+                else retryTakes(id, longWait = !e.retryable)
                 return !e.offline
             }
             if (!step(id, token)) return false
@@ -328,9 +403,11 @@ class ContributionOutbox internal constructor(
     /** Moves one session on as far as it goes now. False when offline (the pass stops). */
     private fun step(id: String, token: String): Boolean {
         val folder = File(root, id)
+        var rec = synchronized(records) { records[id] } ?: return true
+        // uploaded, its take list still to send
+        if (rec.state != "active") return sendTakes(id, token)
         val markers = ShareFiles.markers(folder)
         val end = ShareFiles.end(folder)
-        var rec = synchronized(records) { records[id] } ?: return true
         if (!rec.started) {
             if (markers.isEmpty()) return true
             val session = try { File(folder, ShareFiles.SESSION).readBytes() } catch (_: Exception) { return true }
@@ -390,14 +467,103 @@ class ContributionOutbox internal constructor(
         rec.lastError = null
         rec.nextAttempt = 0
         rec.urls.clear()
+        // 2.0.3: a recording of several takes sends its take list next; the session is uploaded whatever comes of it
+        if (ShareFiles.takes(folder) != null) rec.takes = TAKES_PENDING
         save(rec)
-        // the item, the markers, the end and the session JSON stay (the status's numbers)
+        // the item, the markers, the end, the session JSON and the take list stay (the status's numbers)
         for (f in folder.listFiles() ?: emptyArray()) {
             val n = f.name
-            if (n != ITEM && n != ShareFiles.END && n != ShareFiles.SESSION && !(n.startsWith("seg-") && n.endsWith(".json"))) f.delete()
+            if (n != ITEM && n != ShareFiles.END && n != ShareFiles.SESSION && n != ShareFiles.TAKES && !(n.startsWith("seg-") && n.endsWith(".json"))) f.delete()
         }
         gate.uploaded(id)
+        return sendTakes(id, token)
+    }
+
+    /**
+     * The take list of an uploaded recording of two or more takes (SDK 2.0.3): `POST /v1/uploads/{id}/takes` with the
+     * body of `takes.json`, once the recording has closed and its segments are up. The session stays uploaded whatever
+     * the answer: 2xx, the list is sent; 404 (a server without the route, or one that does not know the upload) and
+     * 410 drop it; 400 drops it and reports the SDK bug; 401 renews the token and tries again; 408, 429, 5xx and no
+     * answer keep it for a later pass with the outbox's backoff (the same body again; the server replaces the list).
+     * The bitrate ladder does not hear of this call: it is not audio. False when offline (the pass stops).
+     */
+    private fun sendTakes(id: String, token: String): Boolean {
+        val folder = File(root, id)
+        var rec = synchronized(records) { records[id] } ?: return true
+        if (rec.state != "uploaded" || rec.takes != TAKES_PENDING) return true
+        if (ShareFiles.end(folder) == null) {
+            // ended at the capped tier's segment cap while the capture still writes: the list is final when it ends
+            if (id !in ShareCapture.ACTIVE) endTakes(rec, TAKES_DROPPED)
+            return true
+        }
+        // what the cap left of the recording: only the takes inside the audio that went up
+        if (rec.lastError == "segment_cap") ShareFiles.trimTakes(folder, uploadedMs(folder, rec))
+        val list = ShareFiles.takes(folder)
+        if (list == null) { endTakes(rec, null); return true }
+        val body = ShareFiles.takesJson(list).toByteArray(Charsets.UTF_8)
+        // the contributor the recording was shared under (the session JSON's)
+        val who = ShareFiles.readJson(File(folder, ShareFiles.SESSION))?.get("contributor") as? String ?: contributor()
+        rec.takesAttempts++
+        save(rec)
+        val r = try {
+            api.uploadTakes(token, id, who, body)
+        } catch (e: CloudException) {
+            retryTakes(id)
+            return false
+        }
+        rec = synchronized(records) { records[id] } ?: return true
+        if (rec.takes != TAKES_PENDING) return true
+        val e = r.error
+        when {
+            r.ok -> endTakes(rec, TAKES_SENT)
+            r.status == 401 || e.action == ErrorAction.NEW_TOKEN -> {
+                gate.invalidateToken()
+                retryTakes(id, immediately = rec.takesAttempts < 3)
+            }
+            r.status == 408 || r.status == 429 || r.status >= 500 -> retryTakes(id)
+            e.action == ErrorAction.PAUSE_SHARING || e.action == ErrorAction.NEED_ATTESTATION -> retryTakes(id, longWait = true)
+            r.status == 400 -> { gate.badRequest("uploads_takes"); endTakes(rec, TAKES_DROPPED) }
+            r.status == 404 -> {
+                if (takesRouteLogged.compareAndSet(false, true)) {
+                    gate.log("the server answered 404 to POST /v1/uploads/{id}/takes: the take boundaries of a recording are not sent (the recording is uploaded)")
+                }
+                endTakes(rec, TAKES_DROPPED)
+            }
+            // 410 (the upload was deleted) and any other refusal
+            else -> endTakes(rec, TAKES_DROPPED)
+        }
         return true
+    }
+
+    /** Milliseconds of audio in the segments that went up (from the last one's granule position). */
+    private fun uploadedMs(folder: File, rec: Record): Long {
+        val last = ShareFiles.markers(folder).lastOrNull { ShareFiles.name(it.n) + ".opus" in rec.uploaded } ?: return 0
+        val preSkip = (ShareFiles.readJson(File(folder, ShareFiles.CAPTURE))?.get("preSkip") as? Double)?.toLong() ?: 312
+        return maxOf(0L, last.granule - preSkip) / 48
+    }
+
+    /** The take list call is over: sent, dropped, or (null) there was none to send. */
+    private fun endTakes(rec: Record, state: String?) {
+        rec.takes = state
+        rec.takesNextAttempt = 0
+        save(rec)
+    }
+
+    private fun retryTakes(id: String, immediately: Boolean = false, longWait: Boolean = false) {
+        val rec = synchronized(records) { records[id] } ?: return
+        rec.takesNextAttempt = clock() + delayMs(rec.takesAttempts, immediately, longWait)
+        save(rec)
+    }
+
+    /** The outbox's backoff: 30 s doubling to 6 h, with jitter; an hour for a long wait. */
+    private fun delayMs(attempts: Int, immediately: Boolean, longWait: Boolean): Long {
+        val n = maxOf(1, attempts)
+        val delayS = when {
+            immediately -> 0.0
+            longWait -> 3600.0
+            else -> minOf(30.0 * Math.pow(2.0, minOf(n - 1, 16).toDouble()), 6 * 3600.0) * (0.8 + 0.4 * Math.random())
+        }
+        return (delayS * 1000).toLong()
     }
 
     @Volatile private var lastOffline = false
@@ -468,6 +634,8 @@ class ContributionOutbox internal constructor(
         val rec = synchronized(records) { records[id] } ?: return
         rec.state = "uploaded"
         rec.lastError = "segment_cap"
+        // a recording of several takes: the list of those inside what went up follows once the capture has ended
+        if (id in ShareCapture.ACTIVE || ShareFiles.takes(File(root, id)) != null) rec.takes = TAKES_PENDING
         save(rec)
         for (f in File(root, id).listFiles() ?: emptyArray()) if (f.name.endsWith(".opus")) f.delete()
     }
@@ -475,13 +643,7 @@ class ContributionOutbox internal constructor(
     private fun retry(id: String, why: String, immediately: Boolean = false, longWait: Boolean = false) {
         val rec = synchronized(records) { records[id] } ?: return
         rec.lastError = why
-        val n = maxOf(1, rec.attempts)
-        val delayS = when {
-            immediately -> 0.0
-            longWait -> 3600.0
-            else -> minOf(30.0 * Math.pow(2.0, minOf(n - 1, 16).toDouble()), 6 * 3600.0) * (0.8 + 0.4 * Math.random())
-        }
-        rec.nextAttempt = clock() + (delayS * 1000).toLong()
+        rec.nextAttempt = clock() + delayMs(rec.attempts, immediately, longWait)
         save(rec)
     }
 
@@ -498,18 +660,24 @@ class ContributionOutbox internal constructor(
 
     private fun note(id: String, why: String) {
         val rec = synchronized(records) { records[id] } ?: return
-        if (rec.lastError == why) return
+        // an uploaded item whose take list waits keeps its state as it is
+        if (rec.state != "active" || rec.lastError == why) return
         rec.lastError = why
         save(rec)
     }
 
-    /** Unsent sessions older than 7 days are deleted (their URLs and the server's window are gone). */
+    /**
+     * Unsent sessions older than 7 days are deleted (their URLs and the server's window are gone); a take list that
+     * could not be sent for as long is dropped (its recording stays uploaded).
+     */
     private fun expireOld() {
         val today = Day.of(clock())
         for (r in records.values.toList()) {
-            if (r.state != "active" || r.id in ShareCapture.ACTIVE) continue
+            if (!r.waiting || r.id in ShareCapture.ACTIVE) continue
             val day = ShareFiles.readJson(File(File(root, r.id), ShareFiles.SESSION))?.get("day") as? String ?: continue
-            if (try { Day.between(day, today) > 7 } catch (_: Exception) { false }) remove(r.id)
+            if (try { Day.between(day, today) > 7 } catch (_: Exception) { false }) {
+                if (r.state == "active") remove(r.id) else endTakes(r, TAKES_DROPPED)
+            }
         }
     }
 
@@ -553,8 +721,11 @@ class ContributionOutbox internal constructor(
         }
         val day = ShareFiles.readJson(File(f, ShareFiles.SESSION))?.get("day") as? String ?: ""
         return Contribution(r.id, markers.size, markers.sumOf { it.bytes }, end?.durationMs ?: 0, day, end?.completed, status, r.attempts, r.lastError,
-            markers.map { it.bitrate ?: ShareFiles.LEGACY_BITRATE })
+            markers.map { it.bitrate ?: ShareFiles.LEGACY_BITRATE }, ShareFiles.takes(f)?.size ?: 1)
     }
+
+    /** Where the take list of an item stands (null: none to send, else [TAKES_PENDING], [TAKES_SENT] or [TAKES_DROPPED]). */
+    internal fun takesState(id: String): String? = synchronized(records) { scan(); records[id]?.takes }
 
     private fun save(r: Record) {
         synchronized(records) { records[r.id] = r }
@@ -562,6 +733,12 @@ class ContributionOutbox internal constructor(
             "urls" to r.urls.map { (n, u) -> linkedMapOf("n" to n, "url" to u.first, "expires_at" to u.second) },
             "uploaded" to r.uploaded.toList(), "failCode" to r.failCode, "attempts" to r.attempts, "lastError" to r.lastError,
             "nextAttempt" to r.nextAttempt)
+        // 2.0.3 fields, written only for a recording of several takes (an item of one take reads the same in 2.0.2)
+        if (r.takes != null || r.takesAttempts != 0) {
+            o["takes"] = r.takes
+            o["takesAttempts"] = r.takesAttempts
+            o["takesNextAttempt"] = r.takesNextAttempt
+        }
         try {
             val dir = File(root, r.id)
             if (dir.isDirectory) ShareFiles.writeJson(File(dir, ITEM), o)
@@ -585,10 +762,16 @@ class ContributionOutbox internal constructor(
         r.attempts = (o["attempts"] as? Double)?.toInt() ?: 0
         r.lastError = o["lastError"] as? String
         r.nextAttempt = (o["nextAttempt"] as? Double)?.toLong() ?: 0
+        r.takes = (o["takes"] as? String)?.takeIf { it == TAKES_PENDING || it == TAKES_SENT || it == TAKES_DROPPED }
+        r.takesAttempts = (o["takesAttempts"] as? Double)?.toInt() ?: 0
+        r.takesNextAttempt = (o["takesNextAttempt"] as? Double)?.toLong() ?: 0
         return r
     }
 
     companion object {
         const val ITEM = "item.json"
+        internal const val TAKES_PENDING = "pending"
+        internal const val TAKES_SENT = "sent"
+        internal const val TAKES_DROPPED = "dropped"
     }
 }

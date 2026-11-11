@@ -288,7 +288,7 @@ class OggOpusWriter @JvmOverloads constructor(
             return d
         }
 
-        /** The vendor string, "QuranLab SDK 2.0.2 libopus 1.6.1" as the Swift SDK writes it. */
+        /** The vendor string, "QuranLab SDK 2.0.3 libopus 1.6.1" as the Swift SDK writes it. */
         @JvmStatic
         fun vendor(): String = "QuranLab SDK ${TajweedFormer.VERSION} ${OpusVersion.string}"
 

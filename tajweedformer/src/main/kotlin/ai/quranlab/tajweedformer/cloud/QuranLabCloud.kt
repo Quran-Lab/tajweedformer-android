@@ -200,6 +200,7 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
      */
     @JvmOverloads
     fun foreground(modelRevision: String? = null) {
+        sharing.foreground()
         telemetry.launch()
         telemetryFailures = 0
         telemetryRetryAt = 0
@@ -212,8 +213,14 @@ class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : Tajw
         if (env.clock() - lastSealAt >= Telemetry.SEND_INTERVAL_MS) sendPoint()
     }
 
-    /** The app went to the background: a send point. */
-    fun background() = sendPoint()
+    /**
+     * The app went to the background: a send point, and a shared recording that waits for the next take closes
+     * (2.0.3; a take that is running keeps its recording until it ends).
+     */
+    fun background() {
+        sharing.background()
+        sendPoint()
+    }
 
     /** What was counted since the last send point is sealed (one report per UTC day) and delivery is scheduled. */
     fun sendPoint() {

@@ -85,9 +85,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:2.0.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.2"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.3"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | Build tag 2.0.2 with CMake |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 2.0.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, tajweed scorer, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -106,6 +106,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 // app/build.gradle.kts
 dependencies { implementation("ai.quranlab:tajweedformer:2.0.2") }
 ```
+
+Maven Central serves 2.0.2 today. 2.0.3 is tagged in this repository and follows there; the quick start below is the same for both.
 
 ## Before you start
 
@@ -547,6 +549,18 @@ once and deletes the unsent queue), "What is shared", "Delete what I shared" (si
 never leaves the device; "Try again" when the request did not get through) and the one-time recovery
 code for portal.quranlab.ai/delete. Stopping and deleting work whatever words the learner agreed to.
 The app can never delete or read the recovery code itself.
+
+**Takes in a row are one recording (2.0.3).** An app often stops and starts its takes while the learner
+keeps reciting, which used to cut the shared recitation into recordings that began or ended in the
+middle of speech. A shared recording now stays open after a take for a few seconds (3 s; Quran Lab's
+signed config can set it from 0, never, to 10 s with `flags.share_join_ms`), and a take that starts in
+that time continues the same Ogg stream: no new headers, the encoder keeps its state, segments are cut
+by the same plan counted across the takes, and the pause between the takes is left out (no audio is made
+up for it). The recording closes when no take follows in time, when the app goes to the background, when
+sharing is turned off (the unsent queue is deleted, as before), when the next take has another sample
+rate, or at 20 minutes of audio. For a recording of several takes the SDK sends, after the last segment,
+where each take starts in the stream and how long the pause before it was; `Contribution.takes` is their
+count. Nothing changes in your code, and audio from outside a take is never recorded.
 
 **Bitrate on bad networks.** Opus mono at 48 kHz starts at 192 kbit/s. One ladder per process steps
 192, 96, 64, 32 kbit/s: one step down when an upload request fails for network reasons (no connection,

@@ -81,6 +81,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:2.0.2") }
 ```
 
+Maven Central serves 2.0.2 today. 2.0.3 is tagged in this repository and follows there; the quick start below is the same for both.
+
 ## Before you start
 
 | | |

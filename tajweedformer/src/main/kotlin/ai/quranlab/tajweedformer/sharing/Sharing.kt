@@ -13,7 +13,9 @@ import java.io.File
  * (`flags.contributions`, decided per app on the server; the app's option no longer does since 2.0.1),
  * the SDK asks the learner at the right moment (the sheet at most 3 times per install, never again after a
  * yes), and while the learner agreed, every recitation session the SDK listens to is shared whole, in the
- * background, under the consent version the learner agreed to.
+ * background, under the consent version the learner agreed to. Since 2.0.3 takes that follow one another
+ * within a few seconds are one recording ([TakeJoin]): an app that stops and starts takes while the learner
+ * keeps reciting no longer splits the recitation.
  *
  * What the app can do: let the SDK show its own sheet (the default, themed or not), or show its own UI:
  * set [prompts] (or `QuranLabAndroid.sheets`), read the strings from [copy] and report the learner's tap
@@ -90,8 +92,12 @@ class Sharing internal constructor(private val cloud: QuranLabCloud) {
         env.scheduler.scheduleUploads(cloud)
     })
 
-    private var capture: ShareCapture? = null
-    private var sessionInfo: TajweedObserver.SessionStart? = null
+    /**
+     * The recording of the takes (SDK 2.0.3): it stays open after a take for the join window (the signed config's
+     * `flags.share_join_ms`, 3000 ms when absent), so the next take in a row continues the same stream ([TakeJoin]).
+     */
+    internal val recorder = ShareRecorder(env.clock, { cloud.currentConfig?.flags?.shareJoinMs ?: TakeJoin.DEFAULT_WINDOW_MS },
+        { active }, ::identity, ::open)
 
     // ---- state ----
 
@@ -192,16 +198,19 @@ class Sharing internal constructor(private val cloud: QuranLabCloud) {
     }
 
     private fun stopAndClearQueue() {
-        capture?.finish(completed = false)
-        capture = null
+        // the open recording ends at once, in a take or waiting for the next one
+        recorder.stop()
         outbox.cancelQueued()
     }
 
     /** The signed config switched sharing off: pause; the local queue is kept 7 days (the outbox expires it). */
-    internal fun configTurnedOff() {
-        capture?.finish(completed = false)
-        capture = null
-    }
+    internal fun configTurnedOff() = recorder.stop()
+
+    /** The app went to the background: a recording waiting for the next take closes now (a running take's when it ends). */
+    internal fun background() = recorder.background()
+
+    /** The app is in the foreground again: takes in a row join again. */
+    internal fun foreground() = recorder.foreground()
 
     // ---- the SDK's own settings sheet only (internal: no app API deletes or reveals) ----
 
@@ -245,31 +254,41 @@ class Sharing internal constructor(private val cloud: QuranLabCloud) {
 
     // ---- the recognizer's hooks (through QuranLabCloud) ----
 
-    internal fun sessionStarted(e: TajweedObserver.SessionStart) {
-        sessionInfo = e
-        capture?.finish(completed = false)
-        capture = null
-        if (!active) return
-        val binding = try { contributor.binding() } catch (_: Exception) { return }
+    /** A take starts: it continues the recording the previous take left open, or starts a new one. */
+    internal fun sessionStarted(e: TajweedObserver.SessionStart) = recorder.takeStarted(e)
+
+    /**
+     * What a recording is bound to: a take joins an open recording only under the same contributor, consent version
+     * (and wording hash) and model revision. The backend and the input route may differ (the session JSON keeps the
+     * first take's).
+     */
+    private fun identity(e: TajweedObserver.SessionStart): Any? {
+        val version = state.consentVersion
+        val textSha = if (version?.startsWith(ConsentWording.PREFIX) == true) state.consentTextSha256 else null
+        return listOf(contributor.id, version, textSha, e.revision)
+    }
+
+    /** A new recording for the take [e] (its session JSON is written once, with the first audio), or null. */
+    private fun open(e: TajweedObserver.SessionStart): Recording? {
+        if (!active) return null
+        val binding = try { contributor.binding() } catch (_: Exception) { return null }
         val c = contributor.id
         // the version the learner agreed to (not the copy's now), and for the app's own wording its hash
-        val consentVersion = state.consentVersion ?: return
-        val textSha = if (consentVersion.startsWith(ConsentWording.PREFIX)) state.consentTextSha256 ?: return else null
+        val consentVersion = state.consentVersion ?: return null
+        val textSha = if (consentVersion.startsWith(ConsentWording.PREFIX)) state.consentTextSha256 ?: return null else null
         val day = Day.of(env.clock())
         val dev = env.device
-        capture = ShareCapture(outbox, { rate, route ->
+        return ShareCapture(outbox, { rate, route ->
             ShareCapture.sessionJson(e.revision, e.decodeBackend, e.weightsSha256, consentVersion, c, binding.first, binding.second,
                 day, dev.deviceClass, dev.osMajor, rate, route, textSha)
         }, e.inputRoute.takeIf { it in ROUTES } ?: env.inputRoute().takeIf { it in ROUTES } ?: "unknown", { active })
     }
 
-    internal fun audio(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) {
-        capture?.append(samples, offset, length, sampleRate)
-    }
+    internal fun audio(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) = recorder.audio(samples, offset, length, sampleRate)
 
     internal fun sessionEnded(e: TajweedObserver.SessionEnd) {
-        capture?.let { it.finish(e.completed); lastCapture = it }
-        capture = null
+        // the recording stays open for the next take; the ask below does not close it
+        recorder.takeEnded(e.completed)
         if (!e.completed) return
         // an ask nobody can show is not counted: the sheet goes to the SDK's UI or the app's own
         val show = prompts
@@ -280,11 +299,14 @@ class Sharing internal constructor(private val cloud: QuranLabCloud) {
         }
     }
 
-    /** Waits until the open session's audio is encoded and on disk (tests). */
-    internal fun syncCapture() { capture?.sync() }
+    /** Waits until the open recording's audio is encoded and on disk (tests). */
+    internal fun syncCapture() = recorder.sync()
 
-    /** The last capture ended, for tests to wait on its encoder. */
-    @Volatile internal var lastCapture: ShareCapture? = null
+    /** The last recording closed, for tests to wait on its encoder. */
+    internal val lastCapture: ShareCapture? get() = recorder.lastClosed as? ShareCapture
+
+    /** The join window's check now (its timer calls the same): closes a waiting recording whose window passed (tests). */
+    internal fun checkJoinWindow() = recorder.checkWindow()
 
     private inner class Gate : SharingGate {
         override fun uploadsAllowed(): Boolean = active
@@ -303,6 +325,7 @@ class Sharing internal constructor(private val cloud: QuranLabCloud) {
         override fun uploaded(id: String) { if (state.takeThanks()) prompts?.invoke(SheetRequest.Thanks) }
         override fun contributorRevoked() { contributor.reset() }
         override fun badRequest(route: String) = cloud.report("other", "bad_request:$route")
+        override fun log(message: String) { if (env.debugBuild) try { env.log(message) } catch (_: Exception) {} }
     }
 
     companion object {

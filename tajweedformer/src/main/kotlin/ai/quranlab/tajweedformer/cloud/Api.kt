@@ -127,6 +127,17 @@ class QuranLabApi(
         }
     }
 
+    /**
+     * `POST /v1/uploads/{id}/takes` with `x-qlab-contributor` (SDK 2.0.3): the take boundaries of a recording of two or
+     * more takes, `{"takes":[{"start_ms","gap_ms"},...]}`, after its last segment. Idempotent: the server replaces the list.
+     */
+    fun uploadTakes(token: String, id: String, contributor: String, body: ByteArray): HttpResponse {
+        val h = linkedMapOf("authorization" to "Bearer $token", "content-type" to "application/json", "x-qlab-contributor" to contributor)
+        return try { http.send(HttpRequest("POST", "$base/v1/uploads/$id/takes", h, body)) } catch (e: IOException) {
+            throw CloudException(null, "POST /v1/uploads/$id/takes: ${e.message}")
+        }
+    }
+
     /** A plain PUT of one segment to its presigned URL: `content-type: audio/ogg` and nothing else to sign. */
     fun putSegment(url: String, file: java.io.File): HttpResponse = try {
         http.send(HttpRequest("PUT", url, mapOf("content-type" to "audio/ogg"), bodyFile = file))

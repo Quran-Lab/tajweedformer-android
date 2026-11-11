@@ -142,6 +142,11 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
         val contributions: Boolean? = null,
         val uploadTrust: Map<String, String> = emptyMap(),
         val cappedLimits: Map<String, Any?> = emptyMap(),
+        /**
+         * `share_join_ms` (SDK 2.0.3): how long a shared recording stays open for the next take, in ms. A whole number
+         * 0 to 10000; absent or anything else 3000; 0 never joins takes.
+         */
+        val shareJoinMs: Int = ai.quranlab.tajweedformer.sharing.TakeJoin.DEFAULT_WINDOW_MS,
     ) {
         /** The tier for a platform: the flag, else the documented default (`attested` for android). */
         fun trust(platform: String): String = uploadTrust[platform] ?: when (platform) {
@@ -162,6 +167,7 @@ class RemoteConfig internal constructor(val raw: Map<String, Any?>, val body: By
                     contributions = m["contributions"] as? Boolean,
                     uploadTrust = trust,
                     cappedLimits = m["capped_limits"] as? Map<String, Any?> ?: emptyMap(),
+                    shareJoinMs = ai.quranlab.tajweedformer.sharing.TakeJoin.window(m["share_join_ms"]),
                 )
             }
         }

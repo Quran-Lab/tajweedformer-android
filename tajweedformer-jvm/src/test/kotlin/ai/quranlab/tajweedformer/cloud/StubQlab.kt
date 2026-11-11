@@ -64,7 +64,22 @@ class StubQlab : AutoCloseable {
     @Volatile var expiresIn = 86_400L
     @Volatile var tamper = false
     @Volatile var down = false
+    /** A request this says true for gets no answer (an IOException), as [down] does for every request. */
+    @Volatile var offlineFor: ((HttpRequest) -> Boolean)? = null
     @Volatile var batch = 20
+    /** The 2.0.3 server's `POST /v1/uploads/{id}/takes`. Off: a server without the route (404 `not_found`). */
+    @Volatile var takesRoute = true
+    /** The take list stored per upload id (the last one sent replaces the earlier). */
+    val takes: MutableMap<String, List<Map<String, Any?>>> = Collections.synchronizedMap(HashMap())
+    /** Uploads deleted on the server (410 `upload_deleted` to a take list). */
+    val deletedUploads: MutableSet<String> = Collections.synchronizedSet(HashSet())
+    /**
+     * Milliseconds added to the clock of the clients made here: a test moves time on (past the join window of a
+     * shared recording, say) without sleeping.
+     */
+    @Volatile var skewMs = 0L
+    /** The clock of the clients made here. */
+    val clock: () -> Long = { System.currentTimeMillis() + skewMs }
     /** The integrity token Play would give for a request hash (the stub's "Google" accepts only this). */
     fun integrityToken(hash: String) = "pi.$hash"
     @Volatile var integrityRefuses = false
@@ -91,6 +106,8 @@ class StubQlab : AutoCloseable {
     val puts: List<Seen> get() = seen.filter { it.method == "PUT" }
     fun starts() = seen.filter { it.method == "POST" && it.path == "/v1/uploads" }
     fun urlCalls(id: String) = seen.filter { it.path == "/v1/uploads/$id/urls" }.mapNotNull { it.q("from")?.toInt() }
+    /** Every take list call for an upload, in order. */
+    fun takeCalls(id: String) = seen.filter { it.method == "POST" && it.path == "/v1/uploads/$id/takes" }
     fun segments(id: String) = objects.filterKeys { it.startsWith("v1/$id/seg-") }.toSortedMap().values.toList()
 
     private fun handle(ex: HttpExchange) {
@@ -128,7 +145,11 @@ class StubQlab : AutoCloseable {
                 ?: Reply.json(200, mapOf("nonce" to "d1.${System.currentTimeMillis() / 1000 + 300}.${"n".repeat(18)}${count(s.path).toString().padStart(4, '0')}.${"s".repeat(22)}", "expires_in" to 300))
             "POST /v1/contributions/delete" -> delete(s)
             "GET /v1/contributions/summary" -> needToken(s) ?: Reply.json(200, mapOf("you" to mapOf("sessions" to 3, "minutes" to 12.4), "app" to null, "all" to mapOf("contributors" to 120, "minutes" to 5000.0)))
-            else -> if (s.method == "POST" && s.path.matches(Regex("^/v1/uploads/[0-9a-f]{32}/urls$"))) uploadUrls(s) else Reply.error(404, "not_found")
+            else -> when {
+                s.method == "POST" && s.path.matches(Regex("^/v1/uploads/[0-9a-f]{32}/urls$")) -> uploadUrls(s)
+                takesRoute && s.method == "POST" && s.path.matches(Regex("^/v1/uploads/[0-9a-f]{32}/takes$")) -> uploadTakes(s)
+                else -> Reply.error(404, "not_found")
+            }
         }
     }
 
@@ -313,6 +334,67 @@ class StubQlab : AutoCloseable {
         return urls(id, s.q("from")?.toIntOrNull() ?: 0, 200)
     }
 
+    /** Milliseconds of audio the stub holds for an upload: the last page's granule position less the pre-skip, at 48 kHz. */
+    fun receivedMs(id: String): Long {
+        val d = segments(id).fold(ByteArray(0)) { a, b -> a + b }
+        var at = 0
+        var granule = 0L
+        var preSkip = 0L
+        var page = 0
+        while (at + 27 <= d.size) {
+            val n = d[at + 26].toInt() and 0xff
+            var len = 0
+            for (i in 0 until n) len += d[at + 27 + i].toInt() and 0xff
+            if (page == 0) preSkip = ((d[at + 27 + n + 10].toInt() and 0xff) or ((d[at + 27 + n + 11].toInt() and 0xff) shl 8)).toLong()
+            var g = 0L
+            for (i in 0 until 8) g = g or ((d[at + 6 + i].toLong() and 0xff) shl (8 * i))
+            granule = g
+            at += 27 + n + len
+            page++
+        }
+        return maxOf(0L, granule - preSkip) / 48
+    }
+
+    /**
+     * `POST /v1/uploads/{id}/takes` (SDK 2.0.3) as the server checks it: the token and `x-qlab-contributor`, the upload
+     * known under that contributor (404 `not_found` otherwise), 410 for a deleted upload, a closed body
+     * `{"takes":[{"start_ms","gap_ms"}]}` of 2 to 256 entries, the first `{0, 0}`, `start_ms` whole and strictly
+     * increasing and no further than the received audio plus 1000 ms, `gap_ms` 0 to 10000 in hundreds. The list
+     * replaces any earlier one; 204.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun uploadTakes(s: Seen): Reply {
+        needToken(s)?.let { return it }
+        if (tokenOf(s) == null) return Reply.error(401, "unauthorized")
+        val who = s.headers["x-qlab-contributor"] ?: ""
+        if (!Regex("^[0-9a-f]{32}$").matches(who)) return Reply.error(400, "invalid_body")
+        val id = s.path.removePrefix("/v1/uploads/").take(32)
+        if (id in deletedUploads) return Reply.error(410, "upload_deleted")
+        val start = starts().firstOrNull { it.headers["x-qlab-id"] == id } ?: return Reply.error(404, "not_found")
+        if (start.json?.get("contributor") != who) return Reply.error(404, "not_found")
+        if (s.body.size > 16 * 1024) return Reply.error(413, "too_large")
+        closed(s, setOf("takes"))?.let { return it }
+        fun bad(why: String) = Reply.json(400, mapOf("error" to "invalid_body", "message" to why))
+        val list = s.json!!["takes"] as? List<*> ?: return bad("json.takes")
+        if (list.size !in 2..256) return bad("json.takes: 2 to 256 entries")
+        val received = receivedMs(id)
+        var last = -1.0
+        for ((i, x) in list.withIndex()) {
+            val o = x as? Map<String, Any?> ?: return bad("json.takes[$i]")
+            o.keys.firstOrNull { it != "start_ms" && it != "gap_ms" }?.let { return bad("json.takes[$i].$it: unknown field") }
+            val at = o["start_ms"] as? Double ?: return bad("json.takes[$i].start_ms")
+            val gap = o["gap_ms"] as? Double ?: return bad("json.takes[$i].gap_ms")
+            if (at != Math.floor(at) || gap != Math.floor(gap)) return bad("json.takes[$i]: whole numbers")
+            if (i == 0 && (at != 0.0 || gap != 0.0)) return bad("json.takes[0]: 0, 0")
+            if (i > 0 && at <= last) return bad("json.takes[$i].start_ms: not increasing")
+            if (at > received + 1000) return bad("json.takes[$i].start_ms: past the received audio ($received ms)")
+            if (gap < 0 || gap > 10_000 || gap % 100 != 0.0) return bad("json.takes[$i].gap_ms")
+            last = at
+        }
+        takes[id] = list as List<Map<String, Any?>>
+        return Reply(204)
+    }
+
     private fun r2(s: Seen): Reply {
         if (s.method != "PUT") return Reply.error(405, "method")
         if (s.headers["content-type"] != "audio/ogg") return Reply(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>".toByteArray())
@@ -333,6 +415,7 @@ class StubQlab : AutoCloseable {
             revoked.add(o["contributor"] as String)
             val ids = starts().filter { it.json?.get("contributor") == o["contributor"] }.mapNotNull { it.headers["x-qlab-id"] }.toSet()
             objects.keys.removeIf { key -> ids.any { key.startsWith("v1/$it/") } }
+            deletedUploads.addAll(ids)
             deletions++
         }
         return Reply.json(202, mapOf("ok" to true))
@@ -351,18 +434,18 @@ class StubQlab : AutoCloseable {
     // ---- a configured client against this stub ----
 
     fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { integrityToken(it) },
-                    clock: () -> Long = System::currentTimeMillis, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
+                    clock: () -> Long = this.clock, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
                     debugBuild: Boolean = false, log: (String) -> Unit = {}) =
         CloudEnvironment(storage, AppIdentity("org.example.recite", "3.1", "Recite"), device, FileContributorKeyStore(File(storage, "keys")),
             PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" }, debugBuild, log = log)
 
     /** The client's network: offline (an IOException, no answer) while [down]. */
     val transport: HttpTransport = UrlConnectionTransport(5_000, 10_000).let { real ->
-        HttpTransport { r -> if (down) throw java.io.IOException("offline") else real.send(r) }
+        HttpTransport { r -> if (down || offlineFor?.invoke(r) == true) throw java.io.IOException("offline") else real.send(r) }
     }
 
     fun cloud(storage: File, options: CloudOptions = CloudOptions(key, contributions = true, apiUrl = base, trustedKeys = listOf(publicKey)),
               scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { integrityToken(it) },
-              clock: () -> Long = System::currentTimeMillis) =
+              clock: () -> Long = this.clock) =
         QuranLabCloud(options, environment(storage, scheduler, integrity, clock))
 }

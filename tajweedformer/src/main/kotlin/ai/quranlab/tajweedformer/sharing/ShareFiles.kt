@@ -11,11 +11,14 @@ import java.security.MessageDigest
  * since 2.0.1, the bit rate of every segment opened so far, written when a segment opens so recovery
  * can read it), `seg-NNNNN.opus` and a marker `seg-NNNNN.json` per closed segment (`n`, `bytes`,
  * `sha256`, `granule`, `bitrate`), `end.json` once the session ended, and the outbox's own `item.json`.
+ * Since 2.0.3 a recording that holds two or more takes also has `takes.json` (`{"takes":[{"start_ms","gap_ms"}]}`,
+ * rewritten when a take joins), which the outbox sends after the last segment.
  */
 object ShareFiles {
     const val SESSION = "session.json"
     const val CAPTURE = "capture.json"
     const val END = "end.json"
+    const val TAKES = "takes.json"
 
     fun name(n: Int): String = "seg-%05d".format(n)
 
@@ -90,10 +93,52 @@ object ShareFiles {
 
     fun writeEnd(folder: File, e: End) = writeJson(File(folder, END), linkedMapOf("durationMs" to e.durationMs, "completed" to e.completed))
 
+    /** The take list as `POST /v1/uploads/{id}/takes` gets it and as `takes.json` keeps it: `{"takes":[{"start_ms","gap_ms"},...]}`. */
+    fun takesJson(takes: List<Take>): String = Json.write(takesMap(takes))
+
+    private fun takesMap(takes: List<Take>) =
+        linkedMapOf("takes" to takes.map { linkedMapOf<String, Any?>("start_ms" to it.startMs, "gap_ms" to it.gapMs) })
+
+    /** `takes.json`: the recording's takes so far (written when a take joins, so two or more), replaced in one step. */
+    fun writeTakes(folder: File, takes: List<Take>) = writeJson(File(folder, TAKES), takesMap(takes))
+
+    /**
+     * The takes of a recording, or null when it has one take (no file) or the file is not a take list: the first
+     * entry `{0, 0}`, `start_ms` strictly increasing, each gap 0 to 10000, at most [TakeJoin.MAX_TAKES] entries.
+     */
+    fun takes(folder: File): List<Take>? {
+        val list = readJson(File(folder, TAKES))?.get("takes") as? List<*> ?: return null
+        val out = ArrayList<Take>(list.size)
+        for (x in list) {
+            val o = x as? Map<*, *> ?: return null
+            val start = (o["start_ms"] as? Double)?.takeIf { it == Math.rint(it) && it >= 0 }?.toLong() ?: return null
+            val gap = (o["gap_ms"] as? Double)?.takeIf { it == Math.rint(it) && it >= 0 && it <= TakeJoin.MAX_WINDOW_MS }?.toInt() ?: return null
+            if (out.isEmpty()) { if (start != 0L || gap != 0) return null } else if (start <= out.last().startMs) return null
+            out.add(Take(start, gap))
+        }
+        return out.takeIf { it.size in 2..TakeJoin.MAX_TAKES }
+    }
+
+    /**
+     * Keeps the takes that start inside the first [durationMs] of the recording (what a recovery or the capped tier's
+     * segment cap left of it); fewer than two left: no list (the file goes).
+     */
+    fun trimTakes(folder: File, durationMs: Long) {
+        val f = File(folder, TAKES)
+        if (!f.exists()) return
+        val all = takes(folder)
+        val kept = all?.filter { it.startMs < durationMs } ?: emptyList()
+        try {
+            if (kept.size < 2) f.delete() else if (kept.size < all!!.size) writeTakes(folder, kept)
+        } catch (_: Exception) {
+        }
+    }
+
     /**
      * A session the app was killed in: the open segment is cut back to its last whole page and
      * closed, and the session ended as not completed. False when there is nothing to share (the
-     * folder is then removed).
+     * folder is then removed). A recording of several takes (2.0.3) keeps the takes that start inside
+     * what was recovered.
      */
     fun recover(folder: File): Boolean {
         val cap = readJson(File(folder, CAPTURE))
@@ -113,7 +158,9 @@ object ShareFiles {
         }
         val last = markers(folder).lastOrNull()
         if (last == null) { folder.deleteRecursively(); return false }
-        writeEnd(folder, End((maxOf(0L, last.granule - preSkip) / 48).toInt(), false))
+        val ms = maxOf(0L, last.granule - preSkip) / 48
+        trimTakes(folder, ms)
+        writeEnd(folder, End(ms.toInt(), false))
         return true
     }
 

@@ -77,8 +77,16 @@ class SharingTest {
         }
     }
 
+    /**
+     * Ends the session, and (2.0.3) lets the join window pass: a recording now stays open after a take so that the next
+     * take in a row continues it. The sessions of these tests are separate recordings, as they were in 2.0.2, so no
+     * take follows within the window: the clients' clock moves past it and the window's check (what its timer does)
+     * closes the recording. Takes in a row are SharingTakesTest's.
+     */
     private fun endSession(c: QuranLabCloud, completed: Boolean, feedback: Boolean = true) {
         c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = feedback))
+        stub.skewMs += TakeJoin.DEFAULT_WINDOW_MS + 1
+        c.sharing.checkJoinWindow()
         c.sharing.lastCapture?.await()
     }
 
