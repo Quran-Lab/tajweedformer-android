@@ -50,15 +50,11 @@
 </td>
 <td valign="top">
 
-**Tajweed scoring in SDK 2.x**<br>For a known ayah, SDK 2.x also scores the take: letters and vowels, madd held too short or too long, a score for every word. Qalqalah checks are experimental.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds and the expected units of each ayah come with it as read-only data, so your app can judge a recitation its own way.
 
 </td>
 </tr>
 </table>
-
-### Tajweed scoring in SDK 2.x
-
-Scoring has four presets. **Strict** almost never flags a correct recitation. **Balanced** is the default. **Sensitive** catches more, and **Very sensitive** catches the most, for a teacher who reviews every flag first. The word level follows your learners: **strict** for huffaz and advanced students, **general** for most apps, **beginner** for children and classes. You set them in the portal and your app picks them up without a new build. Scoring is part of SDK 2.x; SDK 3.0 is inference only, so build new judging on the model's output.
 
 ## Why TajweedFormer
 
@@ -69,7 +65,7 @@ Scoring has four presets. **Strict** almost never flags a correct recitation. **
 
 ## Built for AI developers
 
-Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and paste it into your coding assistant. That one prompt sets everything up: the package, your key, and the settings for the learners your app is for. [AGENTS.md](AGENTS.md), beside this README, gives the assistant the complete API, so the code it writes uses names that exist. Prefer to do it by hand? Get a key in the portal and start below.
+Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste it into your coding assistant. That one prompt sets everything up: the package, your key, and the first calls. [AGENTS.md](AGENTS.md), beside this README, gives the assistant the complete API, so the code it writes uses names that exist. Prefer to do it by hand? Get a key in the portal and start below.
 
 ## Install
 
@@ -78,95 +74,67 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:2.0.2") }
+dependencies { implementation("ai.quranlab:tajweedformer:3.0.0") }
 ```
 
 ## Before you start
 
 | | |
 | - | - |
-| **Key** | An Android key from [portal.quranlab.ai](https://portal.quranlab.ai), for your app's package name. |
-| **Devices** | Android 8.0 (API 26) and later, on `arm64-v8a` and `armeabi-v7a`. There is no x86_64 library: run it on a phone or an ARM emulator image, not on an x86_64 emulator. |
-| **Permissions** | `RECORD_AUDIO`: declare it in your manifest and ask for it at run time (the quick start does both). The SDK's own manifest brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
-| **Download** | The first run downloads the model: 56.5 MB, once (73.5 MB on disk), on any network. A phone with a supported NPU fetches its build later, on an unmetered network only. |
-| **Sharing** | Recognition needs nothing more. If your app offers recording sharing, uploads need Play Integrity: add `com.google.android.play:integrity` and pass Quran Lab's project number in `CloudOptions`. |
+| **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai), for your app's package name. |
+| **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. On another ABI the SDK fails with `runtime_unsupported`. An app that does not ship to Chromebooks keeps `x86_64` out of its release build with one `abiFilters` line. |
+| **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
+| **Download** | The first run downloads the model: 56.5 MB, once (73.5 MB on disk), on any network. `client.prefetch()` does it before the learner taps, and `prefetch(unmeteredOnly = true)` waits for Wi-Fi. A phone with a supported NPU fetches its build later, on an unmetered network only. |
+| **Sharing** | Recognition needs nothing more. If Quran Lab offers recording sharing to your app, uploads need Play Integrity: add `com.google.android.play:integrity` and put Quran Lab's project number in your manifest. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
-| **Takes** | A recognizer runs one take at a time. |
+| **Takes** | A Model runs one take (one Session) at a time; a take holds at most 20 minutes of audio. |
 
 ## Quick start
 
-From your key to what the model hears from the microphone, as one screen. The manifest needs
-`<uses-permission android:name="android.permission.RECORD_AUDIO" />`.
-
 ```kotlin
-import ai.quranlab.tajweedformer.TajweedHeads
-import ai.quranlab.tajweedformer.TajweedRecognizer
-import ai.quranlab.tajweedformer.android.Microphone
-import ai.quranlab.tajweedformer.android.TajweedFormerAndroid
-import ai.quranlab.tajweedformer.cloud.CloudOptions
-import ai.quranlab.tajweedformer.cloud.android.QuranLabAndroid
-import android.Manifest
-import android.app.Activity
-import android.content.pm.PackageManager
-import android.os.Bundle
-import android.widget.TextView
-import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-
-class QuickStartActivity : Activity() {
-    private val scope = MainScope()
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        val heard = TextView(this).also { setContentView(it) }
-        QuranLabAndroid.configure(this, CloudOptions(key = "qlk_v1_..."))   // your key from portal.quranlab.ai
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-            return
-        }
-        scope.launch {
-            // the first run downloads and verifies the model; the microphone and the recognizer both run at 48 kHz
-            val recognizer = TajweedFormerAndroid.client(this@QuickStartActivity)
-                .recognizer(TajweedRecognizer.Options(sampleRate = 48_000))
-            val take = recognizer.startSession()
-            val chunks = mutableListOf<TajweedHeads>()
-            launch {   // every 320 ms: what the model heard so far
-                take.chunks.collect { chunk ->
-                    if (chunk.index < chunks.size) chunks.subList(chunk.index, chunks.size).clear()   // a chunk sent again
-                    chunks += chunk.heads
-                    heard.text = recognizer.decode(TajweedHeads.concat(chunks)).text
-                }
-            }
-            Microphone.samples(48_000).collect { samples -> take.append(samples) }
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) recreate()
-    }
-
-    override fun onDestroy() {
-        scope.cancel()
-        super.onDestroy()
-    }
+suspend fun quickStart(context: Context, heard: TextView) {
+    val client = TajweedClient(context, "qlk_v1_...")       // your key from sdk.quranlab.ai; one Client per process
+    val model = client.model()                              // the first run downloads and verifies the model
+    val session = model.listen(TajweedSessionOptions(endOnSilenceMs = 1500))   // asks for the microphone itself
+    session.chunks.collect { chunk -> heard.text = chunk.decoded.text }       // what the model heard so far
 }
 ```
 
-This is the app in [`samples/quickstart`](samples/quickstart), which CI compiles. `tf.recognizer()` downloads the
-CPU profile on the first call (any network), verifies it, runs the CPU self-test, and serves on the exact CPU
-engine; the NPU is promoted in the background after the first session and used from the next one once it is ready
-and warm ("CPU first, then the accelerator" below). `recognizer.decode(...)` is what the model heard: each token
-with its confidence, runner-up and times; each chunk carries every head of the network you selected. To end the
-take, stop collecting the microphone and call `take.finish()`.
+These are the four calls of every Quran Lab SDK: Client, model, listen, read. The code is
+[`examples/quickstart`](examples/quickstart)'s `QuickStart.kt`, which CI builds. The app beside it,
+[`ExampleActivity.kt`](examples/quickstart/src/main/kotlin/ai/quranlab/tajweedformer/example/ExampleActivity.kt), is
+the smallest screen around those calls, in one file: the model loading with its download progress, "Play sample" (a
+sample clip, no microphone), "Recite", the tokens as they come (tentative ones dimmed) and "Diagnose". Its
+application id is `ai.quranlab.tajweedformer.example`: a key works for the first app that used it, so run the example
+with a key made for that identifier ([its README](examples/quickstart/README.md) says how). Nothing else is needed:
 
-In SDK 2.x a take of a known ayah can also be scored: `take.finishAndScore(surah = 1, ayah = 2)` gives verdicts per
-site and per word. In a real app call `QuranLabAndroid.configure` once, in `Application.onCreate`.
+- **The microphone.** `model.listen()` asks for `android.permission.RECORD_AUDIO` when it has to (the SDK's manifest
+  declares it; a refusal is the error `microphone_denied`), captures at the device's own rate and carries that rate
+  to the Session. No sample rate appears in your code.
+- **The end of a take.** With `endOnSilenceMs` (500 to 60000) the take finishes by itself after that much silence
+  following speech: the last chunk has `decoded.isFinal`, `chunks` completes and `session.finish()` returns the
+  take's Heads. Silence is where the model writes nothing, on `log_probs` and on its timing head, so a held sound
+  is speech, however long, and does not end the take. In a noisy room a take may not end on silence, so keep a
+  Stop button (`session.finish()`; the example has one); the 20 minute limit ends a take in any case. Values under
+  1000 can end a take in a breath pause between two words; the quick start uses 1500, and the minimum is 500.
+  Without it the take runs until `finish()` or `cancel()`.
+- **Background.** A `listen` take ends when the app leaves the foreground (`Ended(BACKGROUND)`); it is not paused.
+  Start a new one when the app comes back: the example does it in `onStart` with one line.
+- **Your own audio.** `model.session()` and `session.push(samples)` replace `listen()`; everything else is the
+  same. `TajweedSessionOptions(sampleRate = ...)` names the rate of what you push (default 16000).
 
 ## More
 
-The full reference (every layer of the API, backends, what a device downloads, platform settings, recording sharing, building and testing) is in [AGENTS.md](AGENTS.md), written for coding assistants and just as readable for you. Guides: [portal.quranlab.ai/docs](https://portal.quranlab.ai/docs).
+The full reference (every layer of the API, backends, what a device downloads, platform settings, recording sharing, building and testing) is in [AGENTS.md](AGENTS.md), written for coding assistants and just as readable for you. Guides: [sdk.quranlab.ai/docs](https://sdk.quranlab.ai/docs).
+
+## Problems and wishes
+
+Something does not work, something is missing, or you want to tell us how it went:
+[open an issue](https://github.com/Quran-Lab/tajweedformer-android/issues/new/choose). There is a form for a bug, one for a
+wish and one for a word of feedback. Issues are public, so leave out keys and anything that came from a learner.
+A security problem does not go into an issue: use "Report a vulnerability" on the
+[Security tab](https://github.com/Quran-Lab/tajweedformer-android/security). A coding assistant can file an issue for you; it
+shows you the text first.
 
 ## Licence
 
@@ -177,6 +145,6 @@ Quran-Lab No-Profit License 1.2 ([NPL-1.2](LICENSE)): use, copy, modify and buil
 but never charge for them, for access to them, or for any feature they power. The weights are not
 stored in this repository; Quran Lab hosts them itself and serves them to apps by
 `cdn.quranlab.ai/models` under the same licence. Get access at
-[portal.quranlab.ai](https://portal.quranlab.ai).
+[sdk.quranlab.ai](https://sdk.quranlab.ai).
 
 Third-party components keep their own licences, listed in their folders under `third_party/`.

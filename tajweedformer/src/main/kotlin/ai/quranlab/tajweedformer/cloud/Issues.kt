@@ -2,7 +2,7 @@ package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.AcceleratorIncident
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.TajweedFormer
+import ai.quranlab.tajweedformer.SdkInfo
 import java.io.File
 
 /**
@@ -14,7 +14,7 @@ import java.io.File
  * [INCIDENT_KEEP_MS] (7 days); one made before the app configured Quran Lab waits in the [IncidentSpool] and joins
  * the queue when it does ([adopt]).
  */
-class IssueQueue(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
+internal class IssueQueue(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val queueFile = File(dir, "issues.json")
     private val seenFile = File(dir, "issues-seen.json")
     /** The accelerator incident kinds already reported for a revision ("<kind>|<revision>"). */
@@ -36,7 +36,7 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
         val b = LinkedHashMap<String, Any?>()
         b["day"] = day
         b["platform"] = app.platform
-        b["sdk_version"] = TajweedFormer.VERSION
+        b["sdk_version"] = SdkInfo.VERSION
         b["app_version"] = app.version
         b["os_version"] = device.osVersion.take(32)
         b["device_class"] = device.deviceClass
@@ -60,7 +60,8 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
      */
     fun addIncident(i: AcceleratorIncident, frames: List<String>, app: AppIdentity, device: DeviceProfile): Boolean {
         if (i.kind !in INCIDENT_KINDS) return false
-        val rev = cleanRevision(i.revision) ?: return false
+        // the report's revision is the model's version; the build id goes in detail.build (SDK 3.0)
+        val rev = cleanRevision(ai.quranlab.tajweedformer.ModelIds.version(i.revision)) ?: return false
         return addIncidentBody(i.kind, cleanCode(i.code), rev, stripMessage(i.message ?: i.error?.message), detail(i), frames, clock(), app, device)
     }
 
@@ -105,7 +106,7 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
         val b = LinkedHashMap<String, Any?>()
         b["day"] = day
         b["platform"] = app.platform
-        b["sdk_version"] = TajweedFormer.VERSION
+        b["sdk_version"] = SdkInfo.VERSION
         b["app_version"] = app.version
         b["os_version"] = device.osVersion.take(32)
         b["device_class"] = device.deviceClass
@@ -232,12 +233,40 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
             return s.take(200).takeIf { it.isNotEmpty() }
         }
 
+        /**
+         * `detail.divergence` in the server's shape for SDK 3.0: `tokens_expected`; `heads` (per compared CTC head
+         * `token_edits`, `lp_mean`, `lp_p99`, `frames`, null for a head whose shapes differed; `attr`: `p_mean`,
+         * `values`); `tolerance` (the build's signed entry, left out when it signs none); `failed`. Each part is left
+         * out when there is nothing to say. Never the 2.x `tokens_differ`, `sites_differ`, `words_differ`.
+         */
+        @JvmStatic
+        fun divergence(v: ai.quranlab.tajweedformer.accel.Divergence): Map<String, Any?> {
+            val o = LinkedHashMap<String, Any?>()
+            o["tokens_expected"] = v.tokensExpected.coerceIn(0, 100_000)
+            val heads = LinkedHashMap<String, Any?>()
+            for ((name, m) in v.heads.entries.take(7)) {
+                heads[name] = m?.let { linkedMapOf("token_edits" to it.tokenEdits.coerceIn(0, 100_000), "lp_mean" to it.lpMean.coerceIn(0.0, 30.0),
+                    "lp_p99" to it.lpP99.coerceIn(0.0, 30.0), "frames" to it.frames) }
+            }
+            v.pMean?.let { heads["attr"] = linkedMapOf("p_mean" to it.coerceIn(0.0, 1.0), "values" to v.values) }
+            if (heads.isNotEmpty()) o["heads"] = heads
+            v.tolerance?.let { t ->
+                val tol = LinkedHashMap<String, Any?>()
+                for ((name, h) in t.heads) tol[name] = linkedMapOf("token_edits" to h.tokenEdits, "lp_mean" to h.lpMean, "lp_p99" to h.lpP99)
+                t.pMean?.let { tol["attr"] = linkedMapOf("p_mean" to it) }
+                if (tol.isNotEmpty()) o["tolerance"] = tol
+            }
+            if (v.failed.isNotEmpty()) o["failed"] = v.failed.take(32)
+            return o
+        }
+
         /** The closed `detail` object of section 7.1: every value checked against its type and range, absent when unknown. */
         @JvmStatic
         fun detail(i: AcceleratorIncident): Map<String, Any?> {
             val d = LinkedHashMap<String, Any?>()
             d["stage"] = if (i.stage in STAGES) i.stage else "session"
             d["cause"] = if (i.cause in CAUSES) i.cause else "other"
+            ai.quranlab.tajweedformer.ModelIds.build(i.revision).takeIf { it.isNotEmpty() }?.let { d["build"] = it }
             val e = i.error
             clean(e?.javaClass?.simpleName, 64) { it.isLetterOrDigit() || it in "_.:-" }?.let { d["error_domain"] = it }
             clean(i.errorCode, 32) { it.isLetterOrDigit() || it in "_.:-" }?.let { d["error_code"] = it }
@@ -246,11 +275,7 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
             ms(i.elapsedMs)?.let { d["elapsed_ms"] = it }
             ms(i.deadlineMs)?.let { d["deadline_ms"] = it }
             clean(i.clip, 32) { it.isLetterOrDigit() || it in "_.-" }?.let { d["clip"] = it }
-            i.divergence?.let { v ->
-                fun n(x: Int) = x.coerceIn(0, 100_000)
-                d["divergence"] = linkedMapOf("tokens_expected" to n(v.tokensExpected), "tokens_differ" to n(v.tokensDiffer),
-                    "sites_differ" to n(v.sitesDiffer), "words_differ" to n(v.wordsDiffer))
-            }
+            i.divergence?.let { v -> d["divergence"] = divergence(v) }
             clean(i.deviceModel?.replace(' ', '_'), 32) { it.isLetterOrDigit() || it in "_.,-" }?.let { d["device_model"] = it }
             clean(i.osBuild?.replace(' ', '_'), 64) { it.isLetterOrDigit() || it in "_.:/-" }?.let { d["os_build"] = it }
             i.chip?.takeIf { SOC.matches(it) }?.let { d["chip"] = it }
@@ -302,7 +327,7 @@ class IssueQueue(private val dir: File, private val clock: () -> Long = System::
  * Lab, [IssueQueue.adopt] moves them into the issue queue and they are sent with its key once the network is there.
  * An app that never configures Quran Lab sends none: there is no key to send them with.
  */
-class IncidentSpool(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
+internal class IncidentSpool(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val file = File(dir, "incidents-offline.json")
 
     fun add(i: AcceleratorIncident, frames: List<String>) = synchronized(LOCK) {
@@ -361,7 +386,7 @@ class IncidentSpool(private val dir: File, private val clock: () -> Long = Syste
  * The cloud observer while the app has not configured Quran Lab: nothing is counted or sent, but every accelerator
  * incident (a failed promotion, a failover) is kept in the [IncidentSpool] for when it does.
  */
-class OfflineIncidents(private val spool: IncidentSpool) : TajweedObserver {
+internal class OfflineIncidents(private val spool: IncidentSpool) : TajweedObserver {
     override fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {
         if (!e.promoted) e.incident?.let { spool.add(it, IssueQueue.frames(it.error)) }
     }

@@ -1,131 +1,301 @@
 package ai.quranlab.tajweedformer
 
+import ai.quranlab.tajweedformer.accel.AcceleratorController
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * A verified TajweedFormer V4 model folder (`sdk/v4.0`, manifest format 3, engine format 3; LAYOUT.md
- * layout v2), as [ModelStore] keeps it on disk:
- *
- *     manifest.json, tokens.txt, calibration.json, expected_tj3.zfx
- *     layers.zfw, frontend.zfw                      shared by every context
- *     <context>/model_engine2.onnx.zfg, .zfg.bin, frames.zfw
- *     npu/<soc>/<context>/...                       optional, the NPU backend only
- *
- * Opening checks the manifest (signature, format, `min_sdk_version`, engine format), then the CPU
- * profile's files ([ModelProfile.cpu]): every shared required file and the three files of each
- * context that is present, size and SHA-256 (hashes are remembered per file, see [ModelDownloader]).
- * A context is usable ([availableContexts]) when all its files are present and verified; a context
- * that is partly present is an error. Files outside the CPU profile are not opened here.
+ * What a [TajweedModel] gets from where it was made: a [TajweedClient] (which can download more of the build, has
+ * the signed config and may have an accelerator) or a folder opened by hand (which has none of that).
  */
-class TajweedModel private constructor(
-    val dir: File,
-    val manifest: ModelManifest,
-    val calibration: Calibration,
-    val vocabulary: Vocabulary,
-    /** The contexts whose files are on disk and verified, in the manifest's order. */
-    val availableContexts: List<String>,
-) {
-    /** The model's id ("v4.0"). */
-    val modelId: String get() = manifest.modelId
+internal class ModelHost(
+    /** Fetches what is not in the folder yet (another context, the reference data, the sample clips); null: nothing can be fetched. */
+    val store: ModelStore? = null,
+    val verifier: ManifestVerifier = ManifestVerifier(),
+    val engine: TajweedEngineFactory = TajweedEngineFactory.EXACT,
+    val soc: String? = null,
+    /** The rate the engine is opened for first (the microphone's, so the first `listen` take needs no reload). */
+    val warmRate: Int = 16_000,
+    val microphone: () -> AudioInput? = { null },
+    /** The signed config's `inference.context`, read when a Session starts. */
+    val configContext: () -> String? = { null },
+    /** The accelerator of a context (made and started once per key); null: the CPU only. */
+    val accelerator: (ModelFolder, String) -> AcceleratorController? = { _, _ -> null },
+    /** Whether the signed config forces the CPU for this build. */
+    val forcedCpu: (ModelFolder) -> Boolean = { false },
+    /** A take that counts reported where the learner recited (surah, first ayah, last ayah): its one report. */
+    val recited: (Triple<Int, Int, Int>) -> Unit = { },
+    /** A waiting chunk was dropped because the app did not collect `chunks` (counted for `diagnose()`). */
+    val chunkDropped: () -> Unit = { },
+    /** The audio a take may hold ([TakeLimits.MAX_TAKE_MS]; the tests of the limit set a shorter one). */
+    val maxTakeMs: Long = TakeLimits.MAX_TAKE_MS,
+    val onClose: (TajweedModel) -> Unit = {},
+)
 
-    /** Every shipped context ("c16_l64", "c8_l64", "c24_l72", ...), calibration.json's order. */
-    val contexts: List<String> get() = calibration.contexts.keys.toList()
+/**
+ * One verified model build on this device: its version, contexts, tokens, calibration and reference data, sample
+ * clips, and the engine that runs it (the CPU engine, and an accelerator once it passed its test). Made by
+ * `client.model()` (download, verify, open, warm), or opened from a folder already on disk with [open].
+ *
+ * ```
+ * val model = client.model()
+ * val session = model.listen()                     // the microphone
+ * val session = model.session()                    // or: the app pushes audio
+ * ```
+ *
+ * A Model has one open Session at a time (`session_open` otherwise). A new take is a new Session: the engine stays
+ * loaded between takes.
+ */
+public class TajweedModel internal constructor(
+    folder: ModelFolder,
+    internal val host: ModelHost,
+    first: Recognizer,
+) : AutoCloseable {
+    @Volatile internal var folder: ModelFolder = folder
+        private set
+    @Volatile private var recognizer: Recognizer? = first
+    private val switching = Mutex()
+    private val lock = Any()
+    private var open: TajweedSession? = null
+    private var starting = false
+    @Volatile private var closed = false
 
-    val defaultContext: String get() = calibration.defaultContext
-
-    /** The expected tj3 sequence of every ayah (the engine reads it). */
-    val expectedTable: File get() = File(dir, EXPECTED_TABLE)
-
-    /** The exact engine's files of one context (the shared files are at the folder's root). */
-    class ContextFiles(val context: String, val dir: File) {
-        val graph: File get() = File(dir, CONTEXT_FILES[0])
-        val all: List<File> get() = CONTEXT_FILES.map { File(dir, it) }
+    init {
+        OpenObjects.opened(this, "Model ${folder.manifest.version ?: folder.manifest.build}")
     }
 
-    /** [context]'s files. Throws [RecognizerException.InvalidAppOption] for a context the model does
-     *  not ship and [RecognizerException.ModelMissing] for one not downloaded. */
-    fun contextFiles(context: String = defaultContext): ContextFiles {
-        if (context !in calibration.contexts) throw RecognizerException.InvalidAppOption("context", "$context is not shipped ($contexts)")
-        if (context !in availableContexts) throw RecognizerException.ModelMissing("context $context is not downloaded")
-        return ContextFiles(context, File(dir, context))
+    /** The model's id, `v4.0`. */
+    public val id: String get() = folder.modelId
+
+    /** The model's version, `4.0.0`: the weights and what they recognise. */
+    public val version: String get() = folder.manifest.version ?: ""
+
+    /** The build id (a build is one uploaded folder of a version). For diagnostics only: never select by it. */
+    public val build: String get() = folder.manifest.build
+
+    /** The contexts the model ships: `c8_l64` (160 ms chunks), `c16_l64` (320 ms), `c24_l72` and `c24_l256` (480 ms). */
+    public val contexts: List<String> get() = folder.contexts
+
+    /** The context a Session gets when neither the app nor sdk.quranlab.ai chose one. */
+    public val defaultContext: String get() = folder.defaultContext
+
+    /** Audio per chunk of a context, in ms. A context the model does not list is `invalid_argument`. */
+    @JvmOverloads
+    public fun chunkMs(context: String = defaultContext): Int {
+        if (context !in folder.contexts) throw RecognizerException.InvalidAppOption("context", "$context is not shipped (${folder.contexts})")
+        return folder.chunkMs(context)
     }
 
-    /** Audio per engine chunk for [context] (320 ms for chunk 16, 480 ms for chunk 24), from its name. */
-    fun chunkMs(context: String = defaultContext): Int = chunkMsOf(context)
+    /** The vocabulary. */
+    public val tokens: TajweedTokens = TajweedTokens(folder.vocabulary)
 
-    companion object {
-        const val VOCAB_SIZE = 38
-        const val BLANK = 0
-        /** The tj3 word boundary token ("|"). */
-        const val WORD_BOUNDARY = 1
-        const val EXPECTED_TABLE = "expected_tj3.zfx"
+    /** `calibration.json` as shipped, read only and never applied by the SDK; null when the folder has none. */
+    public val calibration: TajweedCalibration? get() = folder.calibration
 
-        /** Per context folder (layout v2). */
-        @JvmField
-        val CONTEXT_FILES = listOf("model_engine2.onnx.zfg", "model_engine2.onnx.zfg.bin", "frames.zfw")
+    /** The expected units of each ayah, read-only data fetched on request; null when this build has none. */
+    public val reference: TajweedReference? = ModelProfile.reference(folder.manifest).takeIf { it.isNotEmpty() }
+        ?.let { TajweedReference(it, folder.dir, host.store, folder.manifest.tokensSha256) }
 
-        /** Shared, at the folder's root. */
-        @JvmField
-        val SHARED_FILES = listOf("tokens.txt", Calibration.FILE_NAME, EXPECTED_TABLE, "layers.zfw", "frontend.zfw")
+    /** The sample clips of the folder (its self-test clips); empty when they are not on this device. */
+    public val sampleClips: List<TajweedClip>
+        get() = try {
+            val dir = File(folder.dir, SelfTestSet.DIR)
+            SelfTestSet.read(dir).clips.mapNotNull { c ->
+                val f = File(dir, c.file)
+                if (f.isFile && c.sampleRate > 0) TajweedClip(c.id, c.kind, c.samples * 1000L / c.sampleRate, f, c.sampleRate) else null
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
 
-        internal fun chunkMsOf(context: String): Int =
-            Regex("^c(\\d+)_l\\d+$").find(context)?.groupValues?.get(1)?.toInt()?.times(20) ?: 0
+    /** The Backend the next Session will use. */
+    public val backend: TajweedBackend
+        get() {
+            val acc = recognizer?.accelerator() ?: return TajweedBackend.CPU
+            return TajweedBackend.of(acc.state.value, acc.key.soc)
+        }
 
-        /** Opens and verifies the V4 folder [dir]; [require] are contexts that must be present. */
+    internal fun backendFor(b: Backend): TajweedBackend {
+        if (b == Backend.NPU) return TajweedBackend.ofChunk(b, host.soc)
+        val acc = recognizer?.accelerator() ?: return TajweedBackend.CPU
+        return TajweedBackend.of(acc.state.value, acc.key.soc, acc.lastCpuReason ?: "cpu")
+    }
+
+    /**
+     * A Session fed by the SDK's microphone. Asks for the microphone permission when it has to (the error is
+     * `microphone_denied` when it is refused), captures at the device's own rate and carries that rate to the
+     * Session. A call or another app taking the audio pauses the take (`Interrupted`, then `Resumed`); headphones
+     * going in or out are followed; the app leaving the foreground ends the take (`Ended(BACKGROUND)`). No audio is
+     * captured before this call or after the take ends.
+     */
+    @JvmOverloads
+    public suspend fun listen(options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession = guard {
+        options.validate()
+        val input = host.microphone() ?: throw RecognizerException.MicrophoneUnavailable("this platform has no microphone the SDK can open")
+        reserve()
+        var capture: AudioCapture? = null
+        try {
+            if (input.permission() != MicPermission.GRANTED && !input.requestPermission()) throw RecognizerException.MicrophoneDenied()
+            val listener = TajweedSession.MicListener()
+            capture = withContext(Dispatchers.IO) { input.open(listener) }
+            val session = start(options, capture.sampleRate, listening = true)
+            session.feedFrom(input, capture, listener)
+            session
+        } catch (e: Throwable) {
+            try { capture?.close() } catch (_: Exception) {}
+            release()
+            throw e
+        }
+    }
+
+    /**
+     * The same path with no microphone: a Session fed by one of [sampleClips], at the speed it was recorded
+     * (`pace = REAL_TIME`, the default) or as fast as the engine takes it (`pace = FAST`). The take ends when the
+     * clip does (`Ended(SOURCE_END)`).
+     */
+    @JvmOverloads
+    public suspend fun listen(from: TajweedClip, options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession = guard {
+        val samples = withContext(Dispatchers.IO) { SelfTestSet.samples(from.file) }
+        listen(samples, from.sampleRate, options)
+    }
+
+    /** The same with samples the app already has: mono float in -1..1 at [sampleRate] (8000 to 48000). */
+    @JvmOverloads
+    public suspend fun listen(from: FloatArray, sampleRate: Int, options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession = guard {
+        options.validate()
+        if (sampleRate !in 8_000..48_000) throw RecognizerException.UnsupportedAudioFormat("$sampleRate Hz (the SDK resamples 8000 to 48000)")
+        reserve()
+        try {
+            val session = start(options, sampleRate, listening = true)
+            session.feedFrom(from, sampleRate)
+            session
+        } catch (e: Throwable) {
+            release()
+            throw e
+        }
+    }
+
+    /** A Session the app pushes audio into (`session.push(samples)` at `options.sampleRate`). */
+    @JvmOverloads
+    public suspend fun session(options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession = guard {
+        options.validate()
+        reserve()
+        try {
+            start(options, options.sampleRate, listening = false)
+        } catch (e: Throwable) {
+            release()
+            throw e
+        }
+    }
+
+    /** One open Session per Model: taken before anything else is done for a new take. */
+    private fun reserve() = synchronized(lock) {
+        if (closed) throw RecognizerException.SessionClosed()
+        if (open != null || starting) throw RecognizerException.SessionActive()
+        starting = true
+    }
+
+    private fun release() = synchronized(lock) { starting = false }
+
+    private suspend fun start(options: TajweedSessionOptions, sampleRate: Int, listening: Boolean): TajweedSession {
+        val context = Recognizer.resolveContext(folder, options.context, host.configContext())
+        val rec = recognizerFor(context)
+        // a first take at another rate than the engine was warmed for reopens it: off the caller's thread
+        val inner = withContext(Dispatchers.IO) {
+            rec.startSession(sampleRate, options.headSet(), cpuOnly = options.backend == TajweedSessionOptions.Backend.CPU)
+        }
+        val session = TajweedSession(this, rec, inner, options, listening)
+        synchronized(lock) {
+            starting = false
+            open = session
+        }
+        return session
+    }
+
+    /**
+     * The engine of [context]: the one that is loaded, or (another context, or the signed config now forces the CPU
+     * or no longer does) a new one in its place. Another context's files are downloaded first when they are not on
+     * the device.
+     */
+    private suspend fun recognizerFor(context: String): Recognizer = switching.withLock {
+        val now = recognizer
+        val wantCpu = host.forcedCpu(folder)
+        if (now != null && now.context == context && (now.options.backend == BackendPreference.CPU) == wantCpu) return now
+        withContext(Dispatchers.IO) {
+            if (context !in folder.availableContexts) {
+                val store = host.store ?: throw RecognizerException.ModelMissing("context $context is not in this folder")
+                folder = runInterruptible { store.ensureCpu(context) }
+            }
+            now?.close()
+            recognizer = null
+            openRecognizer(folder, host, context, wantCpu).also { recognizer = it }
+        }
+    }
+
+    internal fun sessionEnded(s: TajweedSession) = synchronized(lock) { if (open === s) open = null }
+
+    /** The context of the engine that is loaded (the last Session's, or the one the Model was opened with). */
+    internal fun contextInForce(): String? = recognizer?.context
+
+    /** The app left the foreground: an open `listen` take ends. */
+    internal fun background() {
+        synchronized(lock) { open }?.background()
+    }
+
+    /** Whether a take is open (the signed config is refreshed more often while one is). */
+    internal val sessionOpen: Boolean get() = synchronized(lock) { open != null }
+
+    /** Ends the open Session (as `cancel()`), releases the engine and any accelerator. The files stay on disk. */
+    override fun close() {
+        val s = synchronized(lock) {
+            if (closed) return
+            closed = true
+            open
+        }
+        s?.cancel()
+        try { recognizer?.close() } catch (_: Exception) {}
+        recognizer = null
+        reference?.close()
+        host.onClose(this)
+        OpenObjects.closed(this)
+    }
+
+    public companion object {
+        /**
+         * Opens a model folder already on disk (a folder with the build's `manifest.json` and files), verified the same
+         * way as a downloaded one: the manifest's signature, then every file's size and SHA-256. No download, no
+         * accelerator. Errors: `model_missing`, `model_invalid`, `signature_invalid`, `checksum_mismatch`,
+         * `model_incompatible`.
+         */
         @JvmStatic
-        @JvmOverloads
-        fun open(dir: File, verifier: ManifestVerifier = ManifestVerifier(), require: List<String> = emptyList()): TajweedModel =
-            open(dir, verifier, ModelManifest.read(dir), require)
+        public suspend fun open(folder: File): TajweedModel = open(folder, ModelHost(microphone = { TajweedClient.current?.platform?.microphone }))
 
-        internal fun open(dir: File, verifier: ManifestVerifier, m: ModelManifest, require: List<String>): TajweedModel {
-            verifier.verify(m)
-            val stamps = VerifiedStamps(File(dir, VerifiedStamps.FILE_NAME))
-            fun ok(e: ModelManifest.FileEntry) = stamps.verified(File(dir, e.localPath), e.localSize, e.localSha256)
-            // the shared files first: every required file of context "*"
-            val shared = m.files.filter { it.need == ModelManifest.Need.REQUIRED && it.forPlatform(TajweedFormer.PLATFORM) && it.context == "*" }
-            for (name in SHARED_FILES) {
-                if (shared.none { it.localPath == name }) throw RecognizerException.ManifestInvalid("$name is not listed as a required file")
+        internal suspend fun open(dir: File, host: ModelHost, context: String? = null): TajweedModel = guard {
+            withContext(Dispatchers.IO) {
+                val folder = ModelFolder.open(dir, host.verifier)
+                of(folder, host, context)
             }
-            for (e in shared) {
-                val f = File(dir, e.localPath)
-                if (!f.isFile) throw RecognizerException.ModelMissing(e.localPath)
-                if (!ok(e)) throw RecognizerException.ChecksumMismatch(e.localPath)
-            }
-            val available = ArrayList<String>()
-            for (ctx in m.contexts) {
-                val files = ModelProfile.contextOnly(m, ctx)
-                for (name in CONTEXT_FILES) {
-                    if (files.none { it.localPath == "$ctx/$name" }) throw RecognizerException.ManifestInvalid("$ctx/$name is not listed as a required file")
-                }
-                val present = files.count { File(dir, it.localPath).isFile }
-                if (present == 0) continue
-                if (present < files.size) {
-                    throw RecognizerException.ModelMissing("context $ctx is partly downloaded: " +
-                        files.filter { !File(dir, it.localPath).isFile }.joinToString { it.localPath })
-                }
-                for (e in files) if (!ok(e)) throw RecognizerException.ChecksumMismatch(e.localPath)
-                available.add(ctx)
-            }
-            for (ctx in require) if (ctx !in available) throw RecognizerException.ModelMissing("context $ctx is not downloaded")
-            if (available.isEmpty()) throw RecognizerException.ModelMissing("no context is downloaded in ${dir.path}")
+        }
 
-            val calibration = Calibration.read(File(dir, Calibration.FILE_NAME))
-            if (calibration.modelId != m.modelId) {
-                throw RecognizerException.CalibrationInvalid("model_id ${calibration.modelId} is not the manifest's ${m.modelId}")
+        /** The Model of a verified folder: the engine of [context] (null: the config's, else the default) opened and warmed. */
+        internal fun of(folder: ModelFolder, host: ModelHost, context: String? = null): TajweedModel {
+            val ctx = Recognizer.resolveContext(folder, context, host.configContext()).let { c ->
+                // a context whose files are not here yet falls back to one that is (the Session fetches the other on use)
+                if (c in folder.availableContexts) c else folder.availableContexts.first()
             }
-            val tsha = calibration.tokensSha256
-            if (tsha != null && Regex("^[0-9a-fA-F]{64}$").matches(tsha) && tsha.lowercase() != m.tokensSha256.lowercase()) {
-                throw RecognizerException.CalibrationInvalid("tokens_sha256 is not the manifest's tokens")
-            }
-            if (calibration.contexts.keys != m.contexts.toSet() || calibration.defaultContext != m.defaultContext) {
-                throw RecognizerException.CalibrationInvalid("contexts ${calibration.contexts.keys} / ${calibration.defaultContext} " +
-                    "are not the manifest's ${m.contexts} / ${m.defaultContext}")
-            }
-            val vocabulary = Vocabulary.read(File(dir, m.tokens), blank = BLANK)
-            if (vocabulary.size != VOCAB_SIZE) {
-                throw RecognizerException.ModelLoadFailed("${m.tokens} has ${vocabulary.size} tokens, V4 has $VOCAB_SIZE")
-            }
-            return TajweedModel(dir, m, calibration, vocabulary, available)
+            return TajweedModel(folder, host, openRecognizer(folder, host, ctx, host.forcedCpu(folder)))
+        }
+
+        private fun openRecognizer(folder: ModelFolder, host: ModelHost, context: String, cpuOnly: Boolean): Recognizer {
+            val acc = if (cpuOnly) null else host.accelerator(folder, context)
+            return Recognizer.open(folder, Recognizer.Options(
+                context = context, sampleRate = host.warmRate, backend = if (cpuOnly) BackendPreference.CPU else BackendPreference.AUTO,
+                accelerator = acc, soc = host.soc, selfTest = true, engine = host.engine,
+            )).also { it.maxTakeMs = host.maxTakeMs }
         }
     }
 }

@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * ETag: a resume after a cut, a resume refused by a changed ETag, a bad hash, gzip, the unmetered
  * gate for NPU files, concurrent fetches of one file, and the observer's events.
  */
-class DownloaderTest {
+class DownloaderTest : OpenChecked() {
     private val dirs = ArrayList<File>()
     private lateinit var server: HttpServer
     private lateinit var served: File
@@ -126,7 +126,8 @@ class DownloaderTest {
         assertEquals(listOf("c16_l64"), model.availableContexts)
         // only the CPU profile of c16_l64 was requested (plus the manifest), with the app key
         val asked = requests.map { it.substringBefore(" ") }.toSet()
-        assertEquals(setOf("manifest.json", "tokens.txt", "calibration.json.gz", "expected_tj3.zfx.gz", "layers.zfw.gz", "frontend.zfw.gz",
+        // the reference data (the expected units) is not in the CPU set: it is fetched only when the app asks
+        assertEquals(setOf("manifest.json", "tokens.txt", "calibration.json.gz", "layers.zfw.gz", "frontend.zfw.gz",
             "c16_l64/model_engine2.onnx.zfg.gz", "c16_l64/model_engine2.onnx.zfg.bin.gz", "c16_l64/frames.zfw.gz"), asked)
         assertTrue(requests.all { it.endsWith("key=k1") })
         assertTrue("a first install fetches no NPU file, though the manifest lists a build for this SoC: $requests",
@@ -135,7 +136,7 @@ class DownloaderTest {
         assertArrayEquals(files.first { it.path == "layers.zfw" }.bytes, File(root, "layers.zfw").readBytes())
         assertFalse(File(root, "layers.zfw.gz").exists())
         assertFalse(root.walk().any { it.name.endsWith(".part") || it.name.endsWith(".tmp") })
-        assertEquals(8, events.count { it.ok })
+        assertEquals(7, events.count { it.ok })   // the seven files of the CPU set (2.x had the expected table as an eighth)
         assertEquals(progress.last().total, progress.last().bytes)
         // a second call downloads nothing (the verified manifest on disk is used unless refreshed)
         requests.clear()

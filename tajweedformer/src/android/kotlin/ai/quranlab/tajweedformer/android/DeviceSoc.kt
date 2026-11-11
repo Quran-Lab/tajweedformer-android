@@ -4,13 +4,14 @@ import ai.quranlab.tajweedformer.SocIds
 import android.os.Build
 
 /** This device's SoC as a manifest `soc` id (see [SocIds] for the mapping and what is verified). */
-object DeviceSoc {
-    /** The SoC id, or null when this SoC has no NPU build or is not recognised. */
+internal object DeviceSoc {
+    /** The SoC id, or null when this SoC has no NPU build or is not recognised. Always null in an x86 process (the
+     *  emulator on an Intel or AMD PC, an x86 Chromebook): the CPU engine only. */
     @JvmStatic
     val id: String? by lazy {
         val man = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MANUFACTURER else null
         val model = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else null
-        SocIds.from(man, model, property("ro.soc.model"), Build.HARDWARE, property("ro.board.platform"))
+        SocIds.onArch(SocIds.from(man, model, property("ro.soc.model"), Build.HARDWARE, property("ro.board.platform")), System.getProperty("os.arch"))
     }
 
     /** The raw strings the id was made from, for logs. */

@@ -5,7 +5,7 @@ import org.junit.Test
 import java.nio.file.Files
 
 /** The default engine thread count from the core topology (big + mid cores, capped at 4). */
-class CoreTopologyTest {
+class CoreTopologyTest : OpenChecked() {
     @Test
     fun theDefaultIsTheBigAndMidCoresCappedAtFour() {
         // 4 little cores (the Alcatel 1: 4 x Cortex-A53, all one cluster): all 4

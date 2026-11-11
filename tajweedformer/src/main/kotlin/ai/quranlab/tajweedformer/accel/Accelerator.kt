@@ -2,10 +2,10 @@ package ai.quranlab.tajweedformer.accel
 
 import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.SelfTestSet
-import ai.quranlab.tajweedformer.TajweedBackend
+
 import ai.quranlab.tajweedformer.TajweedEngine
 import ai.quranlab.tajweedformer.TajweedEngineStream
-import ai.quranlab.tajweedformer.TajweedHead
+import ai.quranlab.tajweedformer.HeadId
 import java.io.File
 import java.io.FileOutputStream
 
@@ -13,7 +13,7 @@ import java.io.FileOutputStream
  * The accelerator's state. The exact CPU engine serves in every state; only [Ready] lets a NEW session run on
  * the accelerator.
  */
-sealed class AcceleratorState {
+internal sealed class AcceleratorState {
     /** No accelerator for this device, model, context or app (the CPU engine serves). [reason] says why. */
     data class Cpu(val reason: String) : AcceleratorState()
 
@@ -45,7 +45,7 @@ sealed class AcceleratorState {
 }
 
 /** The promotion pipeline's stages, in order (the record names the last one completed). */
-object Stages {
+internal object Stages {
     const val DOWNLOAD = "download"
     const val COMPILE = "compile"
     const val WARMUP = "warmup"
@@ -63,7 +63,7 @@ object Stages {
 }
 
 /** Stable reason codes: the CPU choices, and the pipeline's failure reasons (the `promotions` telemetry's `reasons`). */
-object Reasons {
+internal object Reasons {
     const val NO_BUILD = "no_npu_build"
     const val SOC_UNKNOWN = "soc_unknown"
     const val RUNTIME_MISSING = "runtime_missing"
@@ -103,7 +103,7 @@ object Reasons {
  * OS build (Android `Build.FINGERPRINT`) and the device model. A new revision or OS build is a new key: a fresh
  * pipeline with a fresh retry budget.
  */
-data class AcceleratorKey(val revision: String, val osBuild: String, val deviceModel: String, val soc: String?, val context: String) {
+internal data class AcceleratorKey(val revision: String, val osBuild: String, val deviceModel: String, val soc: String?, val context: String) {
     /** The accelerator build: `npu:<soc>`. */
     val build: String get() = "npu:${soc ?: "-"}"
 
@@ -113,7 +113,7 @@ data class AcceleratorKey(val revision: String, val osBuild: String, val deviceM
 
 /** The device conditions the pipeline runs in (section "conditions": not battery saver, battery 20 % or more or
  *  charging, thermal nominal or light). */
-data class Conditions(
+internal data class Conditions(
     val batteryPct: Int = 100,
     val charging: Boolean = true,
     val powerSave: Boolean = false,
@@ -130,7 +130,7 @@ data class Conditions(
 }
 
 /** The platform around the controller (Android: [ai.quranlab.tajweedformer.android.AndroidAccelerator]; tests: fakes). */
-interface AcceleratorEnvironment {
+internal interface AcceleratorEnvironment {
     /** The OS build of the key (Android: Build.FINGERPRINT). */
     val osBuild: String
     val deviceModel: String
@@ -144,6 +144,9 @@ interface AcceleratorEnvironment {
 
     /** For incident reports: the delegate or dispatch library and its version, when known. */
     val delegate: String? get() = null
+
+    /** The OS version as reports say it (`14`, `14.1`); null when unknown. */
+    val osVersion: String? get() = null
 
     /** Serious thermal state at a session start (Android: thermal status >= SEVERE): that session runs on the CPU. */
     fun thermalSevere(): Boolean = false
@@ -177,27 +180,39 @@ interface AcceleratorEnvironment {
 }
 
 /** A stage failed with a pipeline reason ([Reasons]); [cause] keeps the error for the incident report. */
-class StageFailure(val reason: String, message: String, cause: Throwable? = null, val clip: String? = null,
+internal class StageFailure(val reason: String, message: String, cause: Throwable? = null, val clip: String? = null,
                    val divergence: Divergence? = null) : Exception(message, cause)
 
-/** How far a golden clip diverged (incident `detail.divergence`). */
-data class Divergence(val tokensExpected: Int, val tokensDiffer: Int, val sitesDiffer: Int, val wordsDiffer: Int)
+/**
+ * How far the accelerator's raw outputs diverged from the CPU engine's (incident `detail.divergence`, the server's
+ * shape for SDK 3.0): the CPU run's greedy tokens over the clean clips, the measures per compared head (null for a
+ * head whose shapes differed), the attribute heads' pooled `p_mean` over [values] values, the build's signed
+ * tolerance (null when it signs none) and the measures out of tolerance as `<head>.<measure>`.
+ */
+internal data class Divergence(
+    val tokensExpected: Int,
+    val heads: Map<String, SelfTestSet.HeadMeasure?> = emptyMap(),
+    val pMean: Double? = null,
+    val values: Long = 0,
+    val tolerance: ai.quranlab.tajweedformer.ModelManifest.RawTolerance? = null,
+    val failed: List<String> = emptyList(),
+    /** The greedy token edits of `log_probs` against the CPU (a golden run's, or a blank check's): for logs and
+     *  decisions on the device; the report carries it only inside `heads`, where the run measured the head. */
+    val tokensDiffer: Int = 0,
+)
 
 /** The golden stage's observations: every clip through the accelerator path and through the CPU engine, in one run. */
-class GoldenRun(val accelerator: Map<String, SelfTestSet.ClipObserved>, val cpu: Map<String, SelfTestSet.ClipObserved>)
+internal class GoldenRun(val accelerator: Map<String, SelfTestSet.ClipObserved>, val cpu: Map<String, SelfTestSet.ClipObserved>)
 
 /** The golden stage stopped because a session started (not a failure: it runs again later). */
-class StageAborted : Exception("a session started")
+internal class StageAborted : Exception("a session started")
 
 /** An accelerator loaded for this key ([AcceleratorPreparer.compile]): warm-up, golden test, session streams. */
-interface PreparedAccelerator : AutoCloseable {
+internal interface PreparedAccelerator : AutoCloseable {
     /** Audio per chunk, ms. */
     val chunkMs: Int
 
-    /** The thresholds its heads are scored with ([TajweedBackend.FP32] for an NPU's). */
-    val headsBackend: TajweedBackend get() = TajweedBackend.FP32
-
-    /** The context's expected decisions (shipped in the model folder, `selftest/expected_<ctx>.json`). */
+    /** The context's expected tokens (shipped in the model folder, `selftest/expected_<ctx>.json`). */
     val expected: SelfTestSet.Expected
 
     /** Ids of the planted clips (their tokens are not compared). */
@@ -206,11 +221,9 @@ interface PreparedAccelerator : AutoCloseable {
     /** The values its heads can take; a chunk outside is a failed chunk (`out_of_range`). */
     val range: HeadRange get() = HeadRange()
 
-    /** The build's golden-test allowance (the signed manifest's `golden_tolerance`; exact when absent). */
-    val tolerance: ai.quranlab.tajweedformer.ModelManifest.GoldenTolerance get() = ai.quranlab.tajweedformer.ModelManifest.GoldenTolerance.EXACT
-
-    /** The planted site(s) of each planted clip, which the accelerator must flag whatever the tolerance. */
-    val plantedSites: Map<String, Set<Pair<Int, String>>> get() = emptyMap()
+    /** The build's golden-test allowance on raw outputs (the signed manifest's `golden_raw_tolerance`); null when
+     *  absent or not signed: the build is judged on tokens only. */
+    val tolerance: ai.quranlab.tajweedformer.ModelManifest.RawTolerance? get() = null
 
     /** Runs a second of silence and the first self-test clip through the accelerator path: lazy initialisation done.
      *  Throws [StageFailure] (`non_finite`, `load_error`). */
@@ -225,11 +238,11 @@ interface PreparedAccelerator : AutoCloseable {
     fun golden(abort: () -> Boolean): GoldenRun
 
     /** A raw accelerator stream for one take (no fallback inside: [FailoverEngine] watches it). */
-    fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream
+    fun stream(heads: Set<HeadId>, sampleRate: Int): TajweedEngineStream
 }
 
 /** Brings an accelerator to [PreparedAccelerator]: availability, download, compile. */
-interface AcceleratorPreparer {
+internal interface AcceleratorPreparer {
     /** Null when there is something to prepare; else why not (`no_npu_build`, `soc_unknown`, `runtime_missing`, ...).
      *  Not a failure: nothing is recorded. */
     fun unavailable(key: AcceleratorKey): String?
@@ -252,7 +265,7 @@ interface AcceleratorPreparer {
  * The persisted promotion record of one key: the last stage completed, the attempt and failure counts, the backoff,
  * and what the measure stage found. Written atomically after each stage.
  */
-data class PromotionRecord(
+internal data class PromotionRecord(
     /** The last stage completed in the current attempt ("" = none), or [Stages.PROMOTE] once promoted. */
     val stage: String = "",
     /** `pending` (an attempt to run or resume), `promoted`, `failed` (retryable at [nextAttemptAtMs]), `final` (never again). */
@@ -347,7 +360,7 @@ data class PromotionRecord(
  * the crash sentinel (`accelerator.sentinel`, written and synced before every compile, load, first inference and
  * golden run, removed after; found at launch, the process died there).
  */
-class AcceleratorStore(private val dir: File) {
+internal class AcceleratorStore(private val dir: File) {
     private val sentinel = File(dir, "accelerator.sentinel")
     private val records = File(dir, "accelerator.json")
     private val lock = Any()

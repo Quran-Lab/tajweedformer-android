@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit
  * that dependency; without it [create] returns null and sharing uses only what the server allows
  * unattested (nothing, at the default `attested` tier).
  */
-class PlayIntegrity private constructor(private val context: Context, private val cloudProjectNumber: Long) : IntegrityProvider {
+internal class PlayIntegrity private constructor(private val context: Context, private val cloudProjectNumber: Long) : IntegrityProvider {
     @Volatile private var provider: StandardIntegrityManager.StandardIntegrityTokenProvider? = null
 
     private fun provider(): StandardIntegrityManager.StandardIntegrityTokenProvider {

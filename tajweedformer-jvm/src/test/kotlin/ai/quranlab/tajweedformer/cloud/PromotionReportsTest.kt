@@ -3,6 +3,7 @@ package ai.quranlab.tajweedformer.cloud
 import ai.quranlab.tajweedformer.AcceleratorFailoverEvent
 import ai.quranlab.tajweedformer.AcceleratorIncident
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.OpenChecked
 import ai.quranlab.tajweedformer.PromotionEvent
 import ai.quranlab.tajweedformer.BlankConfirmedEvent
 import ai.quranlab.tajweedformer.accel.BlankCheck
@@ -26,7 +27,7 @@ import java.nio.file.Files
  * against the closed 7.1 schema, the path-stripped message, the first-report-per-revision rule across the dedupe
  * window, nothing identifying, and a 2.0.0 server's 400 dropping the report.
  */
-class PromotionReportsTest {
+class PromotionReportsTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private lateinit var dir: File
     private var now = 1_762_700_000_000L
@@ -126,9 +127,9 @@ class PromotionReportsTest {
         val spool = IncidentSpool(File(dir, "cloud"), clock)
         val offline = OfflineIncidents(spool)
         val ev = FailoverEvent("blank", 4, 90.0, 140.0, 0.0, null, warm = false, replayedChunks = 4, exact = true, demotion = Demotion.PAUSED,
-            divergence = Divergence(5, 5, 0, 0))
+            divergence = Divergence(5, tokensDiffer = 5))
         offline.onFailover(AcceleratorFailoverEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", ev,
-            incident(AcceleratorIncident.FAILOVER, "session", "blank", chunk = 4, stall = 90.0, divergence = Divergence(5, 5, 0, 0), error = thrower())))
+            incident(AcceleratorIncident.FAILOVER, "session", "blank", chunk = 4, stall = 90.0, divergence = Divergence(5, tokensDiffer = 5), error = thrower())))
         offline.onPromotion(promotion(false, "golden", "golden_mismatch"))
         offline.onPromotion(promotion(true, "promote", null))
         assertEquals(2, spool.pending().size)
@@ -148,8 +149,8 @@ class PromotionReportsTest {
         val sent = stub.seen("/v1/issues").map { it.json!! }
         sent.forEach { validate(it) }
         assertEquals(listOf("2025-11-09", "2025-11-09"), sent.map { it["day"] })
-        assertEquals(mapOf("tokens_expected" to 5.0, "tokens_differ" to 5.0, "sites_differ" to 0.0, "words_differ" to 0.0),
-            (sent[0]["detail"] as Map<String, Any?>)["divergence"])
+        // the 3.0 wire: a blank check has no raw measures, and the 2.x tokens_differ, sites_differ, words_differ are refused
+        assertEquals(mapOf("tokens_expected" to 5.0), (sent[0]["detail"] as Map<String, Any?>)["divergence"])
         assertTrue(c.issues.pending().isEmpty())
     }
 
@@ -217,8 +218,10 @@ class PromotionReportsTest {
             "elapsed_ms" to { v -> v is Double && v in 0.0..600_000.0 },
             "deadline_ms" to { v -> v is Double && v in 0.0..600_000.0 },
             "clip" to { v -> v is String && v.length <= 32 },
-            "divergence" to { v -> v is Map<*, *> && v.keys == setOf("tokens_expected", "tokens_differ", "sites_differ", "words_differ") &&
-                v.values.all { it is Double && it == Math.floor(it) && it in 0.0..100_000.0 } },
+            "divergence" to { v -> v is Map<*, *> && v.keys.all { it in setOf("tokens_expected", "heads", "tolerance", "failed") } &&
+                (v["tokens_expected"] as? Double)?.let { it == Math.floor(it) && it in 0.0..100_000.0 } != false &&
+                (v["heads"] as? Map<*, *>)?.all { (k, h) -> Regex("^[a-z][a-z0-9_]{0,31}$").matches(k as String) && (h == null || h is Map<*, *>) } != false &&
+                (v["failed"] as? List<*>)?.all { it is String && Regex("^[a-z][a-z0-9_]{0,31}\\.[a-z0-9_]+$").matches(it) } != false },
             "device_model" to { v -> v is String && Regex("^[A-Za-z0-9_.,-]{1,32}$").matches(v) },
             "os_build" to { v -> v is String && Regex("^[A-Za-z0-9_.:/-]{1,64}$").matches(v) },
             "chip" to { v -> v is String && Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$").matches(v) },
@@ -260,7 +263,10 @@ class PromotionReportsTest {
             c.onPromotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", false, stage, reason, 2, incident =
                 incident(AcceleratorIncident.PROMOTION_FAILED, stage, AcceleratorIncident.cause(reason), error = thrower(), attempt = 2,
                     clip = if (stage == "golden") "Husary_112001_vsub2" else null,
-                    divergence = if (stage == "golden") Divergence(16, 1, 2, 1) else null)))
+                    divergence = if (stage == "golden") Divergence(16,
+                        mapOf("log_probs" to ai.quranlab.tajweedformer.SelfTestSet.HeadMeasure(1, 0.07, 2.4, 310)), 0.03, 3100,
+                        ai.quranlab.tajweedformer.ModelManifest.RawTolerance(mapOf("log_probs" to ai.quranlab.tajweedformer.ModelManifest.HeadTolerance(0, 0.05, 1.5)), 0.02),
+                        listOf("log_probs.token_edits", "log_probs.lp_p99", "attr.p_mean"), tokensDiffer = 1) else null)))
         }
         // a promoted attempt is no incident
         c.onPromotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", true, "promote", null, 1))
@@ -281,7 +287,12 @@ class PromotionReportsTest {
         assertEquals("LiteRtRunCompiledModel failed (status 13) for _ at _, see _", f["message"])
         val g = sent[4]["detail"] as Map<String, Any?>
         assertEquals("Husary_112001_vsub2", g["clip"])
-        assertEquals(mapOf("tokens_expected" to 16.0, "tokens_differ" to 1.0, "sites_differ" to 2.0, "words_differ" to 1.0), g["divergence"])
+        // the server's shape for SDK 3.0: the raw measures per head, the tolerance they were judged against, what failed
+        assertEquals(mapOf("tokens_expected" to 16.0,
+            "heads" to mapOf("log_probs" to mapOf("token_edits" to 1.0, "lp_mean" to 0.07, "lp_p99" to 2.4, "frames" to 310.0),
+                "attr" to mapOf("p_mean" to 0.03, "values" to 3100.0)),
+            "tolerance" to mapOf("log_probs" to mapOf("token_edits" to 0.0, "lp_mean" to 0.05, "lp_p99" to 1.5), "attr" to mapOf("p_mean" to 0.02)),
+            "failed" to listOf("log_probs.token_edits", "log_probs.lp_p99", "attr.p_mean")), g["divergence"])
         assertEquals(2.0, g["attempt"])
     }
 

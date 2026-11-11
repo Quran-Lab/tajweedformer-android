@@ -3,7 +3,7 @@ package ai.quranlab.tajweedformer
 import java.io.File
 
 /** The model's tokens (tokens.txt: `<symbol> <id>` per line). V4's tj3 set has 38, blank 0. */
-class Vocabulary(private val symbols: Array<String>, val blank: Int) {
+internal class Vocabulary(private val symbols: Array<String>, val blank: Int) {
     val size: Int get() = symbols.size
 
     /** The symbol of [id], or `<id>` for an id outside the set. */

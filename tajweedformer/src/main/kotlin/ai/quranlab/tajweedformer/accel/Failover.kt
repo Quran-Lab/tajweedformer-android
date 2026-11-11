@@ -4,14 +4,11 @@ import ai.quranlab.tajweedformer.Backend
 import ai.quranlab.tajweedformer.HeadKind
 import ai.quranlab.tajweedformer.SelfTest
 import ai.quranlab.tajweedformer.SelfTestSet
-import ai.quranlab.tajweedformer.TajweedBackend
-import ai.quranlab.tajweedformer.TajweedConfig
+
 import ai.quranlab.tajweedformer.TajweedEngine
 import ai.quranlab.tajweedformer.TajweedEngineStream
-import ai.quranlab.tajweedformer.TajweedHead
-import ai.quranlab.tajweedformer.TajweedHeads
-import ai.quranlab.tajweedformer.TajweedResult
-import ai.quranlab.tajweedformer.ResolvedTajweedSettings
+import ai.quranlab.tajweedformer.HeadId
+import ai.quranlab.tajweedformer.HeadValues
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
@@ -50,7 +47,7 @@ import kotlin.math.sqrt
  *   the CPU for the rest of that take and demotes only when it happens in three sessions within a day (the
  *   controller counts them).
  */
-object Failover {
+internal object Failover {
     /** The warm limit's cap and its value before any warm measurement exists. */
     const val DEADLINE_CAP_MS = 300.0
 
@@ -116,7 +113,7 @@ object Failover {
 
     /** `non_finite`, `out_of_range` or null for a chunk's heads. */
     @JvmStatic
-    fun check(h: TajweedHeads, range: HeadRange): String? {
+    fun check(h: HeadValues, range: HeadRange): String? {
         for (head in h.available) for (x in h[head]!!) if (!x.isFinite()) return NON_FINITE
         for (head in h.available) {
             val v = h[head]!!
@@ -131,7 +128,7 @@ object Failover {
 
     /** Every 40 ms frame's best token is the blank (no token at all in the chunk). */
     @JvmStatic
-    fun allBlank(h: TajweedHeads): Boolean = h.has(TajweedHead.LOG_PROBS) && h.n40 > 0 && h.greedy().isEmpty()
+    fun allBlank(h: HeadValues): Boolean = h.has(HeadId.LOG_PROBS) && h.n40 > 0 && h.greedy().isEmpty()
 
     @JvmStatic
     fun rms(v: FloatArray, offset: Int, length: Int): Double {
@@ -143,7 +140,7 @@ object Failover {
 
     /** The greedy tokens of consecutive chunks (repeats across chunk boundaries collapsed). */
     @JvmStatic
-    fun tokens(chunks: List<TajweedHeads>): IntArray = if (chunks.isEmpty()) IntArray(0) else TajweedHeads.concat(chunks).greedy()
+    fun tokens(chunks: List<HeadValues>): IntArray = if (chunks.isEmpty()) IntArray(0) else HeadValues.concat(chunks).greedy()
 }
 
 /**
@@ -152,8 +149,15 @@ object Failover {
  * [baseP90Ms]) until [Failover.MIN_WARM_SAMPLES] warm session chunks exist, then the latest
  * [Failover.WARM_SAMPLES] of those. Shared by the session engines of one controller; thread safe.
  */
-class ChunkLimits(private val baseMedianMs: Double = Double.NaN, private val baseP90Ms: Double = Double.NaN) {
+internal class ChunkLimits(private val baseMedianMs: Double = Double.NaN, private val baseP90Ms: Double = Double.NaN) {
     private val live = ArrayDeque<Double>()
+
+    /**
+     * One limit for every chunk instead of the measured ones, ms (null: measured, as shipped). For the tests whose
+     * accelerator is the exact engine itself: on a busy desktop a chunk of it can miss a 50 ms limit by chance, and a
+     * take that plans another failure must not switch on that.
+     */
+    @Volatile var fixedMs: Double? = null
 
     /** A warm chunk's compute time, ms. */
     @Synchronized
@@ -173,17 +177,17 @@ class ChunkLimits(private val baseMedianMs: Double = Double.NaN, private val bas
         else baseMedianMs to baseP90Ms
 
     /** The limit of a warm chunk ([Failover.deadlineMs]). */
-    val warmMs: Double get() = stats().let { Failover.deadlineMs(it.first, it.second) }
+    val warmMs: Double get() = fixedMs ?: stats().let { Failover.deadlineMs(it.first, it.second) }
 
     /** The limit of a take's first chunk and of the first after activation ([Failover.firstChunkMs]). */
-    val firstChunkMs: Double get() = Failover.firstChunkMs(stats().second)
+    val firstChunkMs: Double get() = fixedMs ?: Failover.firstChunkMs(stats().second)
 }
 
 /** The values an accelerator's heads can take: log-probs at most [logProbMax] and at least [logProbFloor], probabilities
  * within [probEps] of 0..1, logits within +-[logitMax]. For an int16 NPU build: every logit is at most 32768 x its
  * output scale ([fromLogitBound]), so a log-prob over `w` classes is at least -(2 x bound + ln w).
  */
-data class HeadRange(val logitMax: Double = 64.0, val logProbMax: Double = 1e-3, val probEps: Double = 1e-3) {
+internal data class HeadRange(val logitMax: Double = 64.0, val logProbMax: Double = 1e-3, val probEps: Double = 1e-3) {
     fun logProbFloor(width: Int): Double = -(2 * logitMax + ln(width.toDouble())) - 1.0
 
     companion object {
@@ -195,7 +199,7 @@ data class HeadRange(val logitMax: Double = 64.0, val logProbMax: Double = 1e-3,
 
 /** The CPU engine kept as the standby: its weights may be released while the accelerator runs ([warm] false), and
  *  [createStream] then loads them again (the cold switch). */
-interface CpuStandby : TajweedEngine {
+internal interface CpuStandby : TajweedEngine {
     /** The weights are loaded (a stream starts without a load). */
     val warm: Boolean
 
@@ -205,7 +209,7 @@ interface CpuStandby : TajweedEngine {
 }
 
 /** What a failure did to the key ([FailoverEvent.demotion]). */
-object Demotion {
+internal object Demotion {
     /** Nothing: the next session may use the accelerator again (a single missed limit). */
     const val NONE = "none"
     /** A short pause ([PromotionTimeouts.transientBackoffMs]), then the same verified build serves again. */
@@ -217,7 +221,7 @@ object Demotion {
 }
 
 /** One in-session failover, for telemetry and the incident report. */
-data class FailoverEvent(
+internal data class FailoverEvent(
     val cause: String,
     /** The failed chunk (the first redone on the CPU), 0-based in the take. */
     val chunk: Int,
@@ -242,7 +246,7 @@ data class FailoverEvent(
 }
 
 /** A blank suspicion the CPU checked ([FailoverListener.blankChecked]). */
-data class BlankCheck(
+internal data class BlankCheck(
     /** The first and last suspicious chunk of the take. */
     val fromChunk: Int,
     val toChunk: Int,
@@ -259,7 +263,7 @@ data class BlankCheck(
 )
 
 /** What the session engine tells the controller. */
-interface FailoverListener {
+internal interface FailoverListener {
     /** Before the first accelerator call of a stream ([done] false) and after it returned ([done] true): the crash
      *  sentinel around a first inference. */
     fun firstCall(done: Boolean) {}
@@ -283,7 +287,7 @@ interface FailoverListener {
  * most one chunk. The take's audio is kept in a ring buffer of [Failover.RING_MS]. Blank checks run on a thread of
  * their own.
  */
-class FailoverEngine(
+internal class FailoverEngine(
     private val handle: AcceleratorHandle,
     private val cpu: CpuStandby,
     private val sampleRate: Int,
@@ -294,16 +298,15 @@ class FailoverEngine(
     /** Chunks replayed before the failed one ([Failover.REPLAY_WINDOW_MS] / chunk). */
     private val windowChunks: Int = Failover.REPLAY_WINDOW_MS / handle.accelerator.chunkMs,
     private val blankRunMs: Int = Failover.BLANK_RUN_MS,
-    /** Token edits the CPU may differ by over a blank window and still agree (the build's `golden_tolerance`). */
-    private val blankTokenTolerance: Int = handle.accelerator.tolerance.tokenDiffs,
+    /** Token edits the CPU may differ by over a blank window and still agree (the build's `golden_raw_tolerance`
+     *  for `log_probs`; 0 without one). */
+    private val blankTokenTolerance: Int = handle.accelerator.tolerance?.heads?.get(HeadId.LOG_PROBS.key)?.tokenEdits ?: 0,
     private val blankCheckEveryMs: Int = Failover.BLANK_CHECK_EVERY_MS,
 ) : TajweedEngine {
     private val prepared: PreparedAccelerator get() = handle.accelerator
     override val chunkMs: Int get() = prepared.chunkMs
     override val backend: Backend get() = if (handle.retired) Backend.CPU else Backend.NPU
 
-    /** The thresholds an accelerator take is scored with. */
-    val headsBackend: TajweedBackend get() = prepared.headsBackend
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "tajweedformer-accelerator").apply { isDaemon = true }
@@ -334,17 +337,11 @@ class FailoverEngine(
     fun belongsTo(p: PreparedAccelerator, standby: CpuStandby, rate: Int): Boolean =
         handle.accelerator === p && cpu === standby && rate == sampleRate && !handle.retired
 
-    override fun createStream(): TajweedEngineStream = createStream(TajweedHead.SCORER_HEADS)
+    override fun createStream(): TajweedEngineStream = createStream(HeadId.BASE_HEADS)
 
-    override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream =
+    override fun createStream(heads: Set<HeadId>): TajweedEngineStream =
         if (handle.retired) cpu.createStream(heads) else Stream(heads)
 
-    override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int): TajweedResult =
-        cpu.score(heads, config, settings, surah, ayah)
-
-    override fun expectedTokens(surah: Int, ayah: Int): IntArray = cpu.expectedTokens(surah, ayah)
-
-    override fun expectedWords(surah: Int, ayah: Int): IntArray = cpu.expectedWords(surah, ayah)
 
     /** The accelerator is the controller's ([AcceleratorHandle.retire]); the CPU standby the recognizer's. */
     override fun close() {}
@@ -385,7 +382,7 @@ class FailoverEngine(
         later {
             val t0 = System.nanoTime()
             try {
-                prepared.stream(TajweedHead.SCORER_HEADS, sampleRate).use { s ->
+                prepared.stream(HeadId.BASE_HEADS, sampleRate).use { s ->
                     val z = FloatArray(advance.toInt())
                     // pieces of silence until the network ran once (the front end's lookahead comes first)
                     var n = 0
@@ -455,7 +452,7 @@ class FailoverEngine(
         val check: BlankCheck,
         val replayFrom: Int,
         /** The CPU chunks from [replayFrom], in order. */
-        val chunks: List<TajweedHeads>,
+        val chunks: List<HeadValues>,
         /** The input sample (absolute in the take) the replay ended at. */
         val endSample: Long,
         val stream: TajweedEngineStream?,
@@ -464,12 +461,12 @@ class FailoverEngine(
 
     private val takes = AtomicLong(0)
 
-    private inner class Stream(private val heads: Set<TajweedHead>) : TajweedEngineStream {
+    private inner class Stream(private val heads: Set<HeadId>) : TajweedEngineStream {
         private val take = takes.incrementAndGet()
         @Volatile private var acc: TajweedEngineStream? = null
         private val ring = AudioRing(maxOf(advance * 4, Failover.RING_MS.toLong() * sampleRate / 1000).toInt())
-        private val accHeads = ArrayList<TajweedHeads>()
-        private val cpuHeads = ArrayList<TajweedHeads>()
+        private val accHeads = ArrayList<HeadValues>()
+        private val cpuHeads = ArrayList<HeadValues>()
         private var cpuStream: TajweedEngineStream? = null
         /** The first chunk taken from the CPU, and the CPU stream's next chunk index. */
         private var cpuFrom = 0
@@ -522,7 +519,7 @@ class FailoverEngine(
 
         override fun takeRedo(): Int = redo.also { redo = -1 }
 
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> {
             redo = -1
             ring.add(samples, offset, length)
             cpuStream?.let { return fromCpu(it.pushAudio(samples, offset, length)) }
@@ -532,7 +529,7 @@ class FailoverEngine(
                 val res = f.get()
                 if (!res.check.agreed) return adopt(res, finishing = false)
             }
-            val out = ArrayList<TajweedHeads>()
+            val out = ArrayList<HeadValues>()
             var at = offset
             val end = offset + length
             while (at < end) {
@@ -567,7 +564,7 @@ class FailoverEngine(
 
         /** Counts a run of energetic all-blank chunks; at [blankRunMs] it starts a CPU check (when allowed) and the run
          *  starts again. Never a failure by itself. */
-        private fun blankRule(h: TajweedHeads, energy: Double) {
+        private fun blankRule(h: HeadValues, energy: Double) {
             if (energy >= Failover.BLANK_RMS && Failover.allBlank(h)) {
                 if (blankStart < 0) blankStart = delivered - 1
                 blankMs += h.n40 * 40
@@ -641,7 +638,7 @@ class FailoverEngine(
             return try { f.get() } catch (_: Exception) { null }
         }
 
-        override fun finish(): List<TajweedHeads> {
+        override fun finish(): List<HeadValues> {
             redo = -1
             cpuStream?.let { return fromCpu(it.finish()) }
             awaitCheck()?.let { if (!it.check.agreed) return adopt(it, finishing = true) }
@@ -651,7 +648,7 @@ class FailoverEngine(
                 is Outcome.Failed -> failover(delivered, Failover.EXCEPTION, r.error, r.ms, budget, finishing = true)
                 is Outcome.Late -> failover(delivered, Failover.DEADLINE, null, r.ms, budget, finishing = true)
                 is Outcome.Ok -> {
-                    val out = ArrayList<TajweedHeads>()
+                    val out = ArrayList<HeadValues>()
                     for (h in r.value) {
                         // the flush has no input of its own: the blank rule does not apply to it
                         Failover.check(h, range)?.let { bad -> return out + failover(delivered, bad, null, r.ms, budget, finishing = true) }
@@ -665,8 +662,8 @@ class FailoverEngine(
         }
 
         /** CPU chunks after the switch: those from [cpuFrom] are the take's, those not yet delivered go out. */
-        private fun fromCpu(got: List<TajweedHeads>): List<TajweedHeads> {
-            val fresh = ArrayList<TajweedHeads>()
+        private fun fromCpu(got: List<HeadValues>): List<HeadValues> {
+            val fresh = ArrayList<HeadValues>()
             for (h in got) {
                 val i = cpuNext++
                 if (i >= cpuFrom) cpuHeads.add(h)
@@ -693,7 +690,7 @@ class FailoverEngine(
          * replay), the audio since the check is pushed, and the CPU's chunks from the first suspicious one are delivered
          * again ([takeRedo]): the learner gets what the accelerator left out.
          */
-        private fun adopt(res: CheckResult, finishing: Boolean): List<TajweedHeads> {
+        private fun adopt(res: CheckResult, finishing: Boolean): List<HeadValues> {
             val t0 = System.nanoTime()
             val s = res.stream ?: return emptyList()
             if (res.endSample < ring.start) {
@@ -727,7 +724,7 @@ class FailoverEngine(
          * for first (it holds the CPU engine's one stream); when it disagreed, its stream continues the take.
          */
         private fun failover(f: Int, cause: String, error: Throwable?, elapsedMs: Double, budgetMs: Double, finishing: Boolean,
-                             blank: BlankCheck? = null): List<TajweedHeads> {
+                             blank: BlankCheck? = null): List<HeadValues> {
             awaitCheck()?.let { if (!it.check.agreed) return adopt(it, finishing) }
             val t0 = System.nanoTime()
             dropAccelerator()
@@ -751,7 +748,7 @@ class FailoverEngine(
             return fresh
         }
 
-        override fun takeHeads(): List<TajweedHeads>? =
+        override fun takeHeads(): List<HeadValues>? =
             if (cpuStream == null) null else accHeads.subList(0, minOf(cpuFrom, accHeads.size)) + cpuHeads
 
         override fun reset() {
@@ -785,20 +782,21 @@ class FailoverEngine(
         }
     }
 
-    /** Whether [s] (a stream of this engine) ran mostly on the accelerator: its take is scored with [headsBackend]. */
+    /** Whether [s] (a stream of this engine) ran mostly on the accelerator. */
     fun mostlyAccelerator(s: TajweedEngineStream, chunks: Int): Boolean =
         (s as? Stream)?.let { 2 * it.acceleratorChunks > chunks } ?: false
 }
 
-/** The divergence of a blank check (incident `detail.divergence`: tokens only, the session is not scored mid-take). */
-internal fun BlankCheck.divergence(): Divergence = Divergence(cpuTokens, tokenDiffs, 0, 0)
+/** The divergence of a blank check (incident `detail.divergence`): the tokens the CPU wrote where the accelerator
+ *  wrote none. No raw measures: a blank check compares tokens over one window, not the self-test set. */
+internal fun BlankCheck.divergence(): Divergence = Divergence(cpuTokens, tokensDiffer = tokenDiffs)
 
 /**
  * The prepared accelerator shared by the session engines over it: closed once, when it is retired (demoted, or the
  * controller closed) and no call is running on it. A late call keeps it open until the call returns (closing a
  * runtime under a running call could crash the process).
  */
-class AcceleratorHandle(val accelerator: PreparedAccelerator) {
+internal class AcceleratorHandle(val accelerator: PreparedAccelerator) {
     private val inflight = AtomicInteger(0)
     private val retiredFlag = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)

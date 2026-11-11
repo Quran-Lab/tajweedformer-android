@@ -29,7 +29,7 @@ import javax.crypto.spec.GCMParameterSpec
  * every platform; what the key prevents is deletion from anywhere else: other devices, other apps,
  * the developer's servers, a stolen backup.)
  */
-class AndroidKeystoreContributorKeys(private val context: Context) : ContributorKeyStore {
+internal class AndroidKeystoreContributorKeys(private val context: Context) : ContributorKeyStore {
     private val ks: KeyStore get() = KeyStore.getInstance(STORE).apply { load(null) }
 
     override fun create(alias: String): ByteArray {
@@ -90,7 +90,7 @@ class AndroidKeystoreContributorKeys(private val context: Context) : Contributor
 }
 
 /** AES-256-GCM with a Keystore key (non-exportable): the recovery code is sealed at rest. Sealed = 12-byte IV || ciphertext. */
-class KeystoreSecretBox(private val alias: String = "quranlab.sharing.box") : SecretBox {
+internal class KeystoreSecretBox(private val alias: String = "quranlab.sharing.box") : SecretBox {
     private fun key(): SecretKey {
         val ks = KeyStore.getInstance(AndroidKeystoreContributorKeys.STORE).apply { load(null) }
         (ks.getKey(alias, null) as? SecretKey)?.let { return it }

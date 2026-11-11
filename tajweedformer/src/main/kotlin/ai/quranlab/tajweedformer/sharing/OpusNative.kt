@@ -3,7 +3,7 @@ package ai.quranlab.tajweedformer.sharing
 import java.io.File
 
 /** A failure of recitation sharing's local side: the codec, the resampler or the files. */
-class SharingException(val code: String, message: String) : Exception(message)
+internal class SharingException(val code: String, message: String) : Exception(message)
 
 /**
  * libtajweedformer_opus: libopus 1.6.1 (float, no DNN) through JNI. Loaded on first use from the
@@ -71,6 +71,6 @@ internal object OpusNative {
 }
 
 /** "libopus 1.6.1". */
-object OpusVersion {
+internal object OpusVersion {
     val string: String get() { OpusNative.require(); return OpusNative.version() }
 }

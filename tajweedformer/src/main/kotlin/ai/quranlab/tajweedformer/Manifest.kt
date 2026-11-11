@@ -14,7 +14,7 @@ import java.util.Base64
  * SDK 2.0.0 reads format 3 only: TajweedFormer V4 is the only model it hosts. Older formats (1.x SDKs,
  * v3.2) are refused with [RecognizerException.ManifestInvalid].
  */
-class ModelManifest(
+internal class ModelManifest(
     val format: Int,
     /** "v4.0": the folder name under sdk/ in the model's repository. */
     val modelId: String,
@@ -31,9 +31,100 @@ class ModelManifest(
     val contexts: List<String>,
     val files: List<FileEntry>,
     val signature: String? = null,
-    /** The `golden_tolerance` field as the JSON has it (null: absent). */
+    /** The `golden_tolerance` field as the JSON has it (null: absent). A 2.x field: signed, never applied by 3.0. */
     private val toleranceRaw: Any? = null,
+    /**
+     * The model's version, `x.y.z` (SDK 3.0: the weights and what they recognise; V4 is `4.0.0`). Null in a 2.x
+     * build's manifest, which 3.0 refuses ([ManifestVerifier]).
+     */
+    val version: String? = null,
+    /** The `golden_raw_tolerance` field as the JSON has it (null: absent). */
+    private val rawToleranceRaw: Any? = null,
+    /** The build id when the manifest was read from its file: the first 40 hex of the file's SHA-256. */
+    private val buildId: String? = null,
 ) {
+    /**
+     * The build this manifest is: the first 40 hex digits of the SHA-256 of the signed manifest.json (what the config
+     * names as `revision` and the CDN path carries). Diagnostics and keys only; an app selects by [version].
+     */
+    val build: String by lazy { buildId ?: hex(MessageDigest.getInstance("SHA-256").digest(toJson().toByteArray(Charsets.UTF_8))).take(40) }
+
+    /**
+     * `golden_raw_tolerance` (SDK 3.0, SPEC section 5): per accelerator build (`coreml`, `npu:<soc>:<context>`) what
+     * its raw outputs may differ from the CPU engine's by on the self-test set: the WELL-FORMED builds only
+     * ([RawTolerance.parse]). A malformed build has no signed line and no tolerance (it is judged on tokens only).
+     * In force only when the signature covers the lines ([rawToleranceFor]).
+     */
+    val rawTolerance: Map<String, RawTolerance> = (rawToleranceRaw as? Map<*, *>)?.entries
+        ?.mapNotNull { (k, v) -> (k as? String)?.takeIf { buildKey(it) }?.let { b -> RawTolerance.parse(v)?.let { b to it } } }?.toMap() ?: emptyMap()
+
+    /** Whether the manifest has a `golden_raw_tolerance` object. */
+    val hasRawTolerance: Boolean get() = rawToleranceRaw is Map<*, *>
+
+    /** The builds of `golden_raw_tolerance` that are not well formed: judged on tokens only. */
+    val tokensOnlyBuilds: List<String> get() = (rawToleranceRaw as? Map<*, *>)?.keys?.filterIsInstance<String>()?.filter { it !in rawTolerance } ?: emptyList()
+
+    /** The signature verified WITH the `golden_raw` lines; otherwise the raw tolerance counts as absent. */
+    @Volatile internal var rawToleranceSigned = false
+
+    /** The raw tolerance of [build] when the signature covers it, else null (tokens only). */
+    fun rawToleranceFor(build: String): RawTolerance? = if (rawToleranceSigned) rawTolerance[build] else null
+
+    /** The golden test's allowance for one CTC head: token edits over the clean clips, and the log-prob distances. */
+    data class HeadTolerance(val tokenEdits: Int, val lpMean: Double, val lpP99: Double)
+
+    /** One build's allowance: per CTC head, and `attr` (the pooled mean probability difference of the attribute heads). */
+    class RawTolerance(val heads: Map<String, HeadTolerance>, val pMean: Double?) {
+        /** The signed lines' tails by head key (`attr` included). */
+        internal val lines: Map<String, String>
+            get() = heads.mapValues { (_, t) -> "token_edits=${t.tokenEdits} lp_mean=${num(t.lpMean)} lp_p99=${num(t.lpP99)}" } +
+                (pMean?.let { mapOf("attr" to "p_mean=${num(it)}") } ?: emptyMap())
+
+        companion object {
+            private val HEAD = Regex("^[a-z][a-z0-9_]{0,31}$")
+
+            /** A value as the signed text writes it: 6 digits after the dot, trailing zeros removed, one digit kept. */
+            @JvmStatic
+            fun num(x: Double): String {
+                var s = String.format(java.util.Locale.ROOT, "%.6f", x)
+                while (s.endsWith("0") && !s.endsWith(".0")) s = s.dropLast(1)
+                return s
+            }
+
+            /** A number in [lo, hi] with at most 6 digits after the dot (it survives being written with 6), else null. */
+            private fun dec(v: Any?, lo: Double, hi: Double): Double? {
+                val d = v as? Double ?: return null
+                if (!d.isFinite() || d < lo || d > hi) return null
+                return d.takeIf { String.format(java.util.Locale.ROOT, "%.6f", d).toDouble() == d }
+            }
+
+            /**
+             * A well-formed build: an object whose keys are `attr` (exactly `{"p_mean"}`, a number 0 to 1) or a CTC head
+             * name (exactly `{"token_edits", "lp_mean", "lp_p99"}`: an integer value 0 to 1,000,000 and two numbers 0 to
+             * 30), every decimal with at most 6 digits after the dot. One bad head makes the build malformed: null.
+             */
+            @JvmStatic
+            fun parse(v: Any?): RawTolerance? {
+                val m = v as? Map<*, *> ?: return null
+                val heads = LinkedHashMap<String, HeadTolerance>()
+                var pMean: Double? = null
+                for ((k, x) in m) {
+                    val name = k as? String ?: return null
+                    val o = x as? Map<*, *> ?: return null
+                    if (name == "attr") {
+                        if (o.keys != setOf("p_mean")) return null
+                        pMean = dec(o["p_mean"], 0.0, 1.0) ?: return null
+                    } else {
+                        if (!HEAD.matches(name) || o.keys != setOf("token_edits", "lp_mean", "lp_p99")) return null
+                        val e = (o["token_edits"] as? Double)?.takeIf { it >= 0 && it <= 1_000_000 && it == Math.floor(it) } ?: return null
+                        heads[name] = HeadTolerance(e.toInt(), dec(o["lp_mean"], 0.0, 30.0) ?: return null, dec(o["lp_p99"], 0.0, 30.0) ?: return null)
+                    }
+                }
+                return RawTolerance(heads, pMean)
+            }
+        }
+    }
+
     /**
      * `golden_tolerance` (SDK 2.0.1): per accelerator build (`coreml`, `coreml-compact`, `npu:<soc>:<context>`) the
      * differences from the CPU engine its golden test may show; null when the field is absent. An entry whose values
@@ -43,18 +134,13 @@ class ModelManifest(
         (toleranceRaw as? Map<*, *>)?.entries?.filter { it.key is String }?.associate { (k, v) -> k as String to GoldenTolerance.parse(v) }
             ?: if (toleranceRaw != null) emptyMap() else null
 
-    /** Each entry's three values as the signed text writes them (a JSON integer as digits). */
-    private val toleranceText: Map<String, String> = (toleranceRaw as? Map<*, *>)?.entries
-        ?.filter { it.key is String && it.value is Map<*, *> }?.associate { (k, v) ->
-            val o = v as Map<*, *>
-            fun num(x: Any?): String = when (x) {
-                is Double -> if (x == Math.floor(x) && !x.isInfinite() && Math.abs(x) < 1e15) x.toLong().toString() else x.toString()
-                is Number -> x.toString()
-                null -> "-"
-                else -> x.toString()
-            }
-            k as String to "${num(o["token_diffs"])} ${num(o["site_flag_diffs"])} ${num(o["word_flag_diffs"])}"
-        } ?: emptyMap()
+    /** The three values of each WELL-FORMED entry as the signed text writes them (a build key of 1 to 64 printable
+     *  ASCII characters, three numbers with an integer value 0 to 1,000,000); any other entry has no line. */
+    private val toleranceText: Map<String, String> = (toleranceRaw as? Map<*, *>)?.entries?.mapNotNull { (k, v) ->
+        val key = (k as? String)?.takeIf { buildKey(it) } ?: return@mapNotNull null
+        val t = GoldenTolerance.parse(v) ?: return@mapNotNull null
+        key to "${t.tokenDiffs} ${t.siteFlagDiffs} ${t.wordFlagDiffs}"
+    }?.toMap() ?: emptyMap()
 
     /** The signature verified WITH the `golden_tolerance` lines ([ManifestVerifier]); otherwise the tolerance is ignored. */
     @Volatile internal var toleranceSigned = false
@@ -153,18 +239,28 @@ class ModelManifest(
     val signedMessage: ByteArray get() = signedMessage(withTolerance = true)
 
     /**
-     * The signed text; with [withTolerance] and a `golden_tolerance` field, one line per build after the header lines
-     * and before the first `file` line, sorted by the build's UTF-8 bytes:
-     * `golden_tolerance <build> <token_diffs> <site_flag_diffs> <word_flag_diffs>`. Without the field the text is the
-     * 2.0.0 one, byte for byte.
+     * The signed text. With a `version` field, one line `version x.y.z` right after the `revision` line. With
+     * [withTolerance] and a `golden_tolerance` field, one line per build after the header lines, sorted by the build's
+     * UTF-8 bytes: `golden_tolerance <build> <token_diffs> <site_flag_diffs> <word_flag_diffs>`. With [withRaw] and a
+     * `golden_raw_tolerance` field, after those and before the first `file` line, one line per build and head sorted
+     * by `<build> <head>` bytes: `golden_raw <build> <head> token_edits=<int> lp_mean=<num> lp_p99=<num>` and
+     * `golden_raw <build> attr p_mean=<num>`, the numbers exactly as the JSON wrote them. Without the three fields
+     * the text is the 2.0.0 one, byte for byte.
      */
-    fun signedMessage(withTolerance: Boolean): ByteArray {
+    @JvmOverloads
+    fun signedMessage(withTolerance: Boolean, withRaw: Boolean = true): ByteArray {
             val s = StringBuilder("quranlab-model-manifest $format\n")
-            s.append("model_id $modelId\nfamily $family\nrevision $revision\nmin_sdk_version $minSdkVersion\n")
+            s.append("model_id $modelId\nfamily $family\nrevision $revision\n")
+            if (version != null) s.append("version $version\n")
+            s.append("min_sdk_version $minSdkVersion\n")
             s.append("engine_format $engineFormat\ncoreml_format $coremlFormat\ntokens $tokens\n")
             s.append("tokens_sha256 ${tokensSha256.lowercase()}\ndefault_context $defaultContext\n")
             s.append("contexts ${contexts.joinToString(",")}\n")
             if (withTolerance) for (k in toleranceText.keys.sortedWith { a, b -> compareUtf8(a, b) }) s.append("golden_tolerance $k ${toleranceText[k]}\n")
+            if (withRaw) {
+                val lines = rawTolerance.flatMap { (b, t) -> t.lines.map { (h, tail) -> "$b $h" to tail } }
+                for ((k, tail) in lines.sortedWith { a, b -> compareUtf8(a.first, b.first) }) s.append("golden_raw $k $tail\n")
+            }
             for (f in files.sortedWith { a, b -> compareUtf8(a.path, b.path) }) {
                 val d = f.decoded
                 s.append("file ${f.sha256.lowercase()} ${f.size} ${f.path} ${platformsText(f.platforms)} ${f.soc} ")
@@ -182,6 +278,7 @@ class ModelManifest(
         m["model_id"] = modelId
         m["family"] = family
         m["revision"] = revision
+        if (version != null) m["version"] = version
         m["min_sdk_version"] = minSdkVersion
         m["engine_format"] = engineFormat
         m["coreml_format"] = coremlFormat
@@ -199,31 +296,44 @@ class ModelManifest(
             o
         }
         if (toleranceRaw != null) m["golden_tolerance"] = toleranceRaw
+        if (rawToleranceRaw != null) m["golden_raw_tolerance"] = rawToleranceRaw
         if (signature != null) m["signature"] = signature
         return Json.write(m)
     }
 
     fun withSignature(signature: String?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, signature, toleranceRaw,
+        defaultContext, contexts, files, signature, toleranceRaw, version, rawToleranceRaw,
     )
 
     /** The same manifest with another `golden_tolerance` field (null: none), unsigned. */
     fun withTolerance(raw: Any?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, null, raw,
+        defaultContext, contexts, files, null, raw, version, rawToleranceRaw,
+    )
+
+    /** The same manifest with another `golden_raw_tolerance` field (as [Json.parse] gives it; null: none), unsigned. */
+    fun withRawTolerance(raw: Any?) = ModelManifest(
+        format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
+        defaultContext, contexts, files, null, toleranceRaw, version, raw,
+    )
+
+    /** The same manifest with another `version` (null: a 2.x build's manifest), unsigned. */
+    fun withVersion(version: String?) = ModelManifest(
+        format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
+        defaultContext, contexts, files, null, toleranceRaw, version, rawToleranceRaw,
     )
 
     /** The model can run in this SDK: format 3, [minSdkVersion] at or below [sdkVersion], engine
      *  format 3. Throws [RecognizerException.ModelIncompatible]. */
-    fun checkCompatible(sdkVersion: String = TajweedFormer.VERSION) {
+    fun checkCompatible(sdkVersion: String = SdkInfo.VERSION) {
         if (!versionAtLeast(sdkVersion, minSdkVersion)) {
             throw RecognizerException.ModelIncompatible("$modelId $revision needs SDK $minSdkVersion or newer (this is $sdkVersion)", minSdkVersion)
         }
-        if (engineFormat != TajweedFormer.ENGINE_FORMAT) {
-            throw RecognizerException.ModelIncompatible("engine format $engineFormat is not supported by this SDK (it reads ${TajweedFormer.ENGINE_FORMAT})")
+        if (engineFormat != SdkInfo.ENGINE_FORMAT) {
+            throw RecognizerException.ModelIncompatible("engine format $engineFormat is not supported by this SDK (it reads ${SdkInfo.ENGINE_FORMAT})")
         }
-        if (coremlFormat !in TajweedFormer.SUPPORTED_COREML_FORMATS) {
+        if (coremlFormat !in SdkInfo.SUPPORTED_COREML_FORMATS) {
             throw RecognizerException.ModelIncompatible("CoreML format $coremlFormat is not supported by this SDK")
         }
     }
@@ -231,6 +341,29 @@ class ModelManifest(
     companion object {
         const val FILE_NAME = "manifest.json"
         const val FORMAT = 3
+
+        /** A tolerance build key: 1 to 64 printable ASCII characters (0x21 to 0x7E, so no space). */
+        internal fun buildKey(k: String): Boolean = k.length in 1..64 && k.all { it.code in 0x21..0x7e }
+
+        /**
+         * The acceptance checks of a manifest's bytes, in the order the four SDKs share; the first that fails decides
+         * the error: the bytes are the build the config named ([configBuild], the start of their SHA-256; else
+         * `checksum_mismatch`), they parse as a format 3 manifest (`model_invalid`), the signature verifies
+         * (`signature_invalid`), the manifest has a `version` and its `min_sdk_version` is not above this SDK's
+         * (`model_incompatible`), and the version is the one the config named ([configVersion]; else `model_invalid`).
+         * A folder opened without a config passes null for both.
+         */
+        @JvmStatic
+        fun accept(bytes: ByteArray, verifier: ManifestVerifier, configBuild: String? = null, configVersion: String? = null): ModelManifest {
+            val sha = hex(MessageDigest.getInstance("SHA-256").digest(bytes))
+            if (configBuild != null && !sha.startsWith(configBuild.lowercase())) throw RecognizerException.ChecksumMismatch(FILE_NAME)
+            val m = parse(String(bytes, Charsets.UTF_8), sha.take(40))
+            verifier.verify(m)
+            if (configVersion != null && m.version != configVersion) {
+                throw RecognizerException.ManifestInvalid("the manifest is version ${m.version}, the config named $configVersion")
+            }
+            return m
+        }
 
         /** The platform order of the signed text. */
         @JvmField val PLATFORMS = listOf("android", "apple", "web", "native")
@@ -273,20 +406,49 @@ class ModelManifest(
         fun read(dir: File): ModelManifest {
             val f = File(dir, FILE_NAME)
             if (!f.isFile) throw RecognizerException.ModelMissing("no $FILE_NAME in ${dir.path}")
-            return parse(f.readText(Charsets.UTF_8))
+            return parse(f.readBytes())
         }
+
+        /** A model version: `x.y.z`, no leading zeros, no suffix, at most 4, 4 and 6 digits. */
+        @JvmField val VERSION = Regex("^(0|[1-9]\\d{0,3})\\.(0|[1-9]\\d{0,3})\\.(0|[1-9]\\d{0,5})$")
+
+        /** Whether [v] is a model version ([VERSION]); anything else is refused, never ordered. */
+        @JvmStatic
+        fun isVersion(v: String?): Boolean = v != null && VERSION.matches(v)
+
+        /** Two versions compared part by part as integers (`4.10.0` is newer than `4.9.9`); null when either is not one. */
+        @JvmStatic
+        fun compareVersions(a: String, b: String): Int? {
+            if (!isVersion(a) || !isVersion(b)) return null
+            val x = a.split('.').map { it.toInt() }
+            val y = b.split('.').map { it.toInt() }
+            for (i in 0..2) if (x[i] != y[i]) return x[i].compareTo(y[i])
+            return 0
+        }
+
+        /** Parses the bytes of a manifest.json; the build id is the first 40 hex of their SHA-256. */
+        @JvmStatic
+        fun parse(bytes: ByteArray): ModelManifest =
+            parse(String(bytes, Charsets.UTF_8), hex(MessageDigest.getInstance("SHA-256").digest(bytes)).take(40))
 
         private val HEX64 = Regex("^[0-9a-fA-F]{64}$")
         private val TOKEN = Regex("^[^\\s]+$")
 
         /** Parses a format 3 manifest.json; throws [RecognizerException.ManifestInvalid]. */
         @JvmStatic
-        fun parse(text: String): ModelManifest = try {
+        @JvmOverloads
+        fun parse(text: String, buildId: String? = null): ModelManifest = try {
             val m = J.obj(Json.parse(text), FILE_NAME)
+            // the format first: an older format has other fields, and its refusal should name the format
             val format = J.int(m, "format")
             if (format != FORMAT) {
-                throw RecognizerException.ManifestInvalid("format $format is not supported (SDK ${TajweedFormer.VERSION} reads format $FORMAT)")
+                throw RecognizerException.ManifestInvalid("format $format is not supported (SDK ${SdkInfo.VERSION} reads format $FORMAT)")
             }
+            val rawTol = m["golden_raw_tolerance"]
+            val version = if (m.containsKey("version")) {
+                (m["version"] as? String)?.takeIf { isVersion(it) } ?: throw JsonException("version is not x.y.z")
+            } else null
+            if (!isVersion(m["min_sdk_version"] as? String)) throw JsonException("min_sdk_version is not x.y.z")
             fun tok(o: Map<String, Any?>, k: String, what: String): String {
                 val v = J.str(o, k, what)
                 if (!TOKEN.matches(v)) throw JsonException("$what has white space or is empty")
@@ -337,6 +499,9 @@ class ModelManifest(
                 files = files,
                 signature = m["signature"] as? String,
                 toleranceRaw = m["golden_tolerance"],
+                version = version,
+                rawToleranceRaw = rawTol,
+                buildId = buildId,
             )
         } catch (e: JsonException) {
             throw RecognizerException.ManifestInvalid(e.message ?: "not JSON")
@@ -376,9 +541,9 @@ class ModelManifest(
  * Checks a manifest before anything it lists is used: the signature (when signed, or always when
  * [requireSignature]), the structure (safe paths, nothing listed twice, the tokens file and its hash,
  * contexts), and the model's compatibility with this SDK. Files are checked one by one by
- * [ModelStore] and [TajweedModel] against the entries, and only the files of the profile in use.
+ * [ModelStore] and [ModelFolder] against the entries, and only the files of the profile in use.
  */
-class ManifestVerifier @JvmOverloads constructor(
+internal class ManifestVerifier @JvmOverloads constructor(
     /** Raw 32-byte Ed25519 public keys a signature may verify against. */
     val trustedKeys: List<ByteArray> = listOf(QURAN_LAB_PUBLIC_KEY),
     /** Refuse unsigned manifests. On by default: a manifest from the network must be signed. A
@@ -386,7 +551,9 @@ class ManifestVerifier @JvmOverloads constructor(
      *  either way. */
     val requireSignature: Boolean = true,
     /** The SDK version min_sdk_version is compared with (tests can pretend to be another). */
-    val sdkVersion: String = TajweedFormer.VERSION,
+    val sdkVersion: String = SdkInfo.VERSION,
+    /** Refuse a manifest without `version` (a 2.x build). On by default: SDK 3.0 runs 3.0 builds only. */
+    val requireVersion: Boolean = true,
 ) {
     /** The signature alone: it must verify when present, and be present when [required]. */
     fun verifySignature(m: ModelManifest, required: Boolean = requireSignature) {
@@ -401,21 +568,31 @@ class ManifestVerifier @JvmOverloads constructor(
             throw RecognizerException.SignatureInvalid("the signature is not base64")
         }
         fun ok(message: ByteArray) = trustedKeys.any { Ed25519.verify(it, message, raw) }
-        if (m.goldenTolerance == null) {
-            if (!ok(m.signedMessage(withTolerance = false))) throw RecognizerException.SignatureInvalid("no trusted key verifies it")
-            return
+        if (raw.size != 64) throw RecognizerException.SignatureInvalid("the signature is not 64 bytes")
+        // the tolerances are signed in their own lines; a manifest signed without a field's lines still verifies, that
+        // tolerance then counting as absent. Four texts in a fixed order: with both groups of lines, without the raw
+        // ones, without the 2.x ones, without both; a text equal to one already tried is skipped.
+        val tried = ArrayList<String>()
+        for ((t, r) in listOf(true to true, true to false, false to true, false to false)) {
+            val message = m.signedMessage(withTolerance = t, withRaw = r)
+            val text = String(message, Charsets.UTF_8)
+            if (text in tried) continue
+            tried.add(text)
+            if (ok(message)) {
+                m.toleranceSigned = t && m.goldenTolerance != null
+                m.rawToleranceSigned = r && m.hasRawTolerance
+                return
+            }
         }
-        // golden_tolerance is signed in its own lines; a manifest signed without them still verifies, its tolerance ignored
-        when {
-            ok(m.signedMessage(withTolerance = true)) -> m.toleranceSigned = true
-            ok(m.signedMessage(withTolerance = false)) -> m.toleranceSigned = false
-            else -> throw RecognizerException.SignatureInvalid("no trusted key verifies it")
-        }
+        throw RecognizerException.SignatureInvalid("no trusted key verifies it")
     }
 
     /** Signature, compatibility and structure. Throws a [RecognizerException]. */
     fun verify(m: ModelManifest) {
         verifySignature(m)
+        if (requireVersion && m.version == null) {
+            throw RecognizerException.ModelIncompatible("${m.modelId} ${m.revision} has no version: it is a build for SDK 2.x (this is $sdkVersion)")
+        }
         m.checkCompatible(sdkVersion)
         val seen = HashSet<String>()
         for (f in m.files) {
@@ -437,6 +614,7 @@ class ManifestVerifier @JvmOverloads constructor(
         if (m.contexts.isEmpty() || m.defaultContext !in m.contexts) {
             throw RecognizerException.ManifestInvalid("default_context ${m.defaultContext} is not one of ${m.contexts}")
         }
+        ModelIds.note(m)
     }
 
     companion object {

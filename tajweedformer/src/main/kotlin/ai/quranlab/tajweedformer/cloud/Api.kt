@@ -1,12 +1,12 @@
 package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.TajweedFormer
+import ai.quranlab.tajweedformer.SdkInfo
 import java.io.IOException
 import java.net.URLEncoder
 
 /** How a request authenticates: the app key (`x-qlab-key`) or an app token (`Bearer qlt_...`). Never both. */
-sealed class Credential {
+internal sealed class Credential {
     class Key(val key: QuranLabKey) : Credential()
     class Token(val token: String) : Credential()
 
@@ -23,11 +23,14 @@ sealed class Credential {
  * fields of each closed schema (an unknown field is a 400). Blocking; call off the main thread.
  * Every method returns the response or throws [CloudException].
  */
-class QuranLabApi(
+internal class QuranLabApi(
     val apiUrl: String = DEFAULT_API,
-    private val http: HttpTransport = UrlConnectionTransport(),
+    transport: HttpTransport = UrlConnectionTransport(),
 ) {
     private val base = apiUrl.trimEnd('/')
+
+    /** Every request goes through here: the system's refusal of the network is an IOException like no connection. */
+    private val http = HttpTransport { r -> ai.quranlab.tajweedformer.permitted { transport.send(r) } }
 
     private fun call(method: String, path: String, cred: Credential?, body: Map<String, Any?>? = null,
                      extra: Map<String, String> = emptyMap(), expectOk: Boolean = true): HttpResponse {
@@ -39,7 +42,7 @@ class QuranLabApi(
         val r = try {
             http.send(HttpRequest(method, base + path, h, bytes))
         } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}")
+            throw CloudException(null, "$method $path: ${e.message}", e)
         }
         if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}")
         return r
@@ -65,11 +68,15 @@ class QuranLabApi(
 
     /**
      * `GET /v1/config`. With a key, `platform` and `bundle_id` go in the query too. [etag] makes it
-     * conditional (304: no body). Returns the raw response for [ConfigStore] to verify.
+     * conditional (304: no body). [modelVersion] is the app's pin (`model_version=x.y.z`): the server answers that
+     * version's build for this SDK, or its normal choice plus `pin.status: unavailable`. Returns the raw response for
+     * [ConfigStore] to verify.
      */
-    fun config(cred: Credential, bucket: Int, app: AppIdentity, etag: String?): HttpResponse {
-        val q = StringBuilder("?bucket=$bucket&sdk=${enc(TajweedFormer.VERSION)}")
+    @JvmOverloads
+    fun config(cred: Credential, bucket: Int, app: AppIdentity, etag: String?, modelVersion: String? = null): HttpResponse {
+        val q = StringBuilder("?bucket=$bucket&sdk=${enc(SdkInfo.VERSION)}")
         if (cred is Credential.Key) q.append("&platform=${enc(app.platform)}&bundle_id=${enc(app.bundleId)}")
+        if (modelVersion != null) q.append("&model_version=${enc(modelVersion)}")
         val extra = if (etag != null) mapOf("if-none-match" to etag) else emptyMap()
         val r = call("GET", "/v1/config$q", cred, extra = extra, expectOk = false)
         if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}")
@@ -85,7 +92,7 @@ class QuranLabApi(
         b["bundle_id"] = app.bundleId
         app.name?.takeIf { it.isNotEmpty() }?.let { b["app_name"] = it.take(80) }
         b["app_version"] = app.version
-        b["sdk_version"] = TajweedFormer.VERSION
+        b["sdk_version"] = SdkInfo.VERSION
         modelRevision?.let { b["model_revision"] = it }
         b["new_install"] = newInstall
         return call("POST", "/v1/register", cred, b).json() ?: emptyMap()
@@ -127,6 +134,17 @@ class QuranLabApi(
         }
     }
 
+    /**
+     * `POST /v1/uploads/{id}/takes` with `x-qlab-contributor` (SDK 2.0.3): the take boundaries of a recording of two or
+     * more takes, `{"takes":[{"start_ms","gap_ms"},...]}`, after its last segment. Idempotent: the server replaces the list.
+     */
+    fun uploadTakes(token: String, id: String, contributor: String, body: ByteArray): HttpResponse {
+        val h = linkedMapOf("authorization" to "Bearer $token", "content-type" to "application/json", "x-qlab-contributor" to contributor)
+        return try { http.send(HttpRequest("POST", "$base/v1/uploads/$id/takes", h, body)) } catch (e: IOException) {
+            throw CloudException(null, "POST /v1/uploads/$id/takes: ${e.message}")
+        }
+    }
+
     /** A plain PUT of one segment to its presigned URL: `content-type: audio/ogg` and nothing else to sign. */
     fun putSegment(url: String, file: java.io.File): HttpResponse = try {
         http.send(HttpRequest("PUT", url, mapOf("content-type" to "audio/ogg"), bodyFile = file))
@@ -161,7 +179,7 @@ class QuranLabApi(
  * An app token `qlt_v1.<payload>.<sig>` (24 h). The payload fields the SDK reads: `app`, `att`,
  * `exp`, `k`, `via` (`pi` for Play Integrity).
  */
-class AppToken(val token: String, val expiresAt: Long, val attested: Boolean, val via: String?) {
+internal class AppToken(val token: String, val expiresAt: Long, val attested: Boolean, val via: String?) {
     /** Renewed when under an hour is left. */
     fun fresh(nowSec: Long): Boolean = expiresAt - nowSec > 3600
 

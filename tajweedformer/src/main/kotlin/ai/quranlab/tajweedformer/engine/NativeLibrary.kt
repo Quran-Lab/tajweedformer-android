@@ -4,7 +4,7 @@ package ai.quranlab.tajweedformer.engine
  * Loads libtajweedformer_jni: from the path in the system property `tajweedformer.library` when it is
  * set, otherwise from the library path (the APK's native libraries on Android).
  */
-object NativeLibrary {
+internal object NativeLibrary {
     @Volatile private var loaded = false
 
     @JvmStatic

@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 
 /** The pipeline's time limits and waits, in one place. */
-data class PromotionTimeouts(
+internal data class PromotionTimeouts(
     /** Building and loading the accelerator program (Android: LiteRT with the vendor dispatch). */
     val compileMs: Long = 5 * 60_000L,
     val warmupMs: Long = 60_000L,
@@ -73,7 +73,7 @@ data class PromotionTimeouts(
  * 6. Every attempt that ends, every failover and every blank the CPU confirmed goes to [SdkEvents] (`promotions`
  *    telemetry, incident reports).
  */
-class AcceleratorController @JvmOverloads constructor(
+internal class AcceleratorController @JvmOverloads constructor(
     private val env: AcceleratorEnvironment,
     private val store: AcceleratorStore,
     private val preparer: AcceleratorPreparer,
@@ -393,8 +393,11 @@ class AcceleratorController @JvmOverloads constructor(
                 val p = prepared ?: load("load").also { warmup(it) }
                 val t0 = env.nowMs()
                 val g = guarded(Stages.GOLDEN, timeouts.goldenMs, Reasons.HANG) { withEngine { p.golden { active.get() > 0 } } }
-                val v = SelfTestSet.judgeGolden(p.expected, g.cpu, g.accelerator, p.planted, p.tolerance, p.plantedSites)
-                SdkEvents.emit { it.onSelfTest(SelfTestResult(Backend.NPU, v.passed, "${v.reason}: ${v.detail}", env.nowMs() - t0, key.soc, key.context, key.revision)) }
+                val v = SelfTestSet.judgeGolden(p.expected, g.cpu, g.accelerator, p.planted, p.tolerance)
+                // the event's text ends with the measures as the record a device would report (nothing sends it)
+                val measures = try { ai.quranlab.tajweedformer.GoldenMeasures.record(key, env, p.expected, p.planted, v) } catch (_: Exception) { null }
+                val text = ai.quranlab.tajweedformer.GoldenMeasures.text("${v.reason}: ${v.detail}", measures)
+                SdkEvents.emit { it.onSelfTest(SelfTestResult(Backend.NPU, v.passed, text, env.nowMs() - t0, key.soc, key.context, key.revision)) }
                 if (!v.passed) throw StageFailure(v.reason, v.detail, null, v.clip, v.divergence)
                 // the limits come from WARM chunks only: never a clip's first chunk or its flush
                 val cpuMs = g.cpu.values.flatMap { it.warmMs() }
@@ -737,4 +740,4 @@ class AcceleratorController @JvmOverloads constructor(
 }
 
 /** The stage waits (no failure counted) for [what]: `unmetered_network`, ... */
-class StageWait(val what: String) : Exception(what)
+internal class StageWait(val what: String) : Exception(what)

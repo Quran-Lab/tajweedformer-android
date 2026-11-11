@@ -4,16 +4,16 @@ import ai.quranlab.tajweedformer.J
 import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.JsonException
 import ai.quranlab.tajweedformer.RecognizerException
-import ai.quranlab.tajweedformer.TajweedHead
+import ai.quranlab.tajweedformer.HeadId
 import java.io.File
 
 /** One integer tensor of the NPU model: `q = clamp(rint(v / scale) + zeroPoint)`. */
-data class NpuTensor(val name: String, val shape: List<Int>, val dtype: String, val scale: Double, val zeroPoint: Int) {
+internal data class NpuTensor(val name: String, val shape: List<Int>, val dtype: String, val scale: Double, val zeroPoint: Int) {
     val size: Int get() = shape.fold(1) { a, b -> a * b }
 }
 
 /** A state carried from output [output] of one chunk to input [input] of the next. */
-data class NpuState(val input: String, val output: String, val requantRatio: Double)
+internal data class NpuState(val input: String, val output: String, val requantRatio: Double)
 
 /**
  * One part of a chained build (`parts` in io.json): the LiteRT model [file] (a name next to io.json), run as the
@@ -22,12 +22,12 @@ data class NpuState(val input: String, val output: String, val requantRatio: Dou
  * runner relabels them to the part's shape). Intermediate tensors carry the scale of no graph tensor: their
  * [NpuTensor.scale] is NaN (the host never dequantises them).
  */
-data class NpuPart(val index: Int, val file: String, val inputs: Map<String, NpuTensor>, val outputs: Map<String, NpuTensor>)
+internal data class NpuPart(val index: Int, val file: String, val inputs: Map<String, NpuTensor>, val outputs: Map<String, NpuTensor>)
 
 /** What the host does to a head output: dequantise, then [op]. */
-data class NpuHeadSpec(val output: String, val head: TajweedHead, val op: HostOp)
+internal data class NpuHeadSpec(val output: String, val head: HeadId, val op: HostOp)
 
-enum class HostOp { LOG_SOFTMAX, SOFTMAX, NONE }
+internal enum class HostOp { LOG_SOFTMAX, SOFTMAX, NONE }
 
 /**
  * The host contract of an NPU build (`npu/<soc>/<ctx>/<name>.io.json`, written by the NPU compile tools):
@@ -49,7 +49,7 @@ enum class HostOp { LOG_SOFTMAX, SOFTMAX, NONE }
  * [NpuChainRunner]. Its host constants (`zf_cm*`, `zf_ck*`, `zf_zero_*`) are int16 codes folded into io.json by
  * the publisher ([constantCodes], key `constant_codes`, encoding `int16le-base64`).
  */
-class NpuContract(
+internal class NpuContract(
     val soc: String,
     val context: String,
     val windowFrames: Int,
@@ -109,7 +109,7 @@ class NpuContract(
             val heads = headsObj.map { (out, v) ->
                 val o = J.obj(v, "heads.$out")
                 val export = J.str(o, "export_output", "heads.$out.export_output")
-                val head = TajweedHead.fromKey(export) ?: throw JsonException("head $export is not a V4 head")
+                val head = HeadId.fromKey(export) ?: throw JsonException("head $export is not a V4 head")
                 val opText = J.str(o, "host_op", "heads.$out.host_op")
                 val op = when {
                     opText == "log_softmax" -> HostOp.LOG_SOFTMAX
@@ -255,7 +255,7 @@ class NpuContract(
  * arange(left)))` and `fill = -30 * (1 - keep)`, as the device runner was fed. The table is checked
  * against io.json (every keep / fill input, its shape, scale and zero point, the set count).
  */
-class NpuMasks(val sets: List<Map<String, ShortArray>>) {
+internal class NpuMasks(val sets: List<Map<String, ShortArray>>) {
     /** The inputs of chunk index [chunk]. */
     fun forChunk(chunk: Int): Map<String, ShortArray> = sets[minOf(chunk, sets.size - 1)]
 

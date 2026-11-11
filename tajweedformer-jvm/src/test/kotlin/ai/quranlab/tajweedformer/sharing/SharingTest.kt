@@ -1,5 +1,6 @@
 package ai.quranlab.tajweedformer.sharing
 
+import ai.quranlab.tajweedformer.OpenChecked
 import ai.quranlab.tajweedformer.cloud.CloudOptions
 import ai.quranlab.tajweedformer.cloud.Day
 import ai.quranlab.tajweedformer.cloud.QuranLabCloud
@@ -25,7 +26,7 @@ import java.security.MessageDigest
  * calls, the outbox against [StubQlab] (qlab-api and R2 on 127.0.0.1), plus the consent state machine,
  * the device-key deletion, and since 2.0.1 the adaptive bitrate, the app's own wording and own UI.
  */
-class SharingTest {
+class SharingTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private lateinit var storage: File
 
@@ -58,7 +59,7 @@ class SharingTest {
 
     /** A session over [seconds] of audio at [rate] through the observer hooks; [end]: finish, cancel or open. */
     private fun session(c: QuranLabCloud, seconds: Double, rate: Int = 48_000, end: String = "finish", feedback: Boolean = true) {
-        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", "balanced", "general", sampleRate = rate, inputRoute = "built_in",
+        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", sampleRate = rate, inputRoute = "built_in",
             decodeBackend = "mock"))
         feed(c, seconds, rate)
         if (end != "open") endSession(c, end == "finish", feedback)
@@ -77,8 +78,16 @@ class SharingTest {
         }
     }
 
+    /**
+     * Ends the session, and (2.0.3) lets the join window pass: a recording now stays open after a take so that the next
+     * take in a row continues it. The sessions of these tests are separate recordings, as they were in 2.0.2, so no
+     * take follows within the window: the clients' clock moves past it and the window's check (what its timer does)
+     * closes the recording. Takes in a row are SharingTakesTest's.
+     */
     private fun endSession(c: QuranLabCloud, completed: Boolean, feedback: Boolean = true) {
         c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = feedback))
+        stub.skewMs += TakeJoin.DEFAULT_WINDOW_MS + 1
+        c.sharing.checkJoinWindow()
         c.sharing.lastCapture?.await()
     }
 
@@ -120,7 +129,8 @@ class SharingTest {
         assertTrue("an attested (Play Integrity) token", start.headers["authorization"]!!.removePrefix("Bearer ") in stub.attestedTokens)
         assertEquals(item.id, start.headers["x-qlab-id"])
         val meta = start.json!!
-        assertEquals(setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major"), meta.keys)
+        assertEquals(setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major", "take_seq"), meta.keys)
+        assertEquals("the first shared recording of the install", 1.0, meta["take_seq"])
         assertEquals("share-2026-11-09", meta["consent_version"])
         assertFalse("the deck's own words: no wording hash", meta.containsKey("consent_text_sha256"))
         assertEquals("both segments at the top rate on a good network", listOf(192_000, 192_000), item.segmentBitrates)
@@ -648,7 +658,7 @@ class SharingTest {
             "2026-11-09", "Pixel8", 15, 44_100, "bluetooth"))
         assertEquals("{\"audio\":{\"channels\":1,\"codec\":\"opus\",\"container\":\"ogg\",\"input_route\":\"bluetooth\",\"input_sample_rate\":44100,\"sample_rate\":48000}," +
             "\"consent_version\":\"share-2026-11-09\",\"contributor\":\"00000000000000000000000000000000\",\"contributor_key\":\"K\"," +
-            "\"day\":\"2026-11-09\",\"decode\":{\"backend\":\"exact\",\"model_revision\":\"v4.0+abc\",\"sdk_version\":\"${ai.quranlab.tajweedformer.TajweedFormer.VERSION}\",\"weights_sha256\":\"${"a".repeat(64)}\"}," +
+            "\"day\":\"2026-11-09\",\"decode\":{\"backend\":\"exact\",\"model_revision\":\"v4.0+abc\",\"sdk_version\":\"${ai.quranlab.tajweedformer.SdkInfo.VERSION}\",\"weights_sha256\":\"${"a".repeat(64)}\"}," +
             "\"device_class\":\"Pixel8\",\"format\":1,\"os_major\":15,\"recovery_hash\":\"${"h".repeat(64)}\"}", j)
         // under the app's own wording: the hash next to the version, in key order
         val custom = String(ShareCapture.sessionJson(null, "exact", null, "custom-df8c4e50965be0005aaca5d6", "0".repeat(32), null, null,
@@ -666,7 +676,7 @@ class SharingTest {
         val c = cloud()
         val ladder = c.sharing.outbox.ladder
         stub.overrides["/v1/uploads"] = { _, _ -> StubQlab.Reply.error(500, "internal") }
-        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", "balanced", "general", sampleRate = 48_000, inputRoute = "built_in",
+        c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", sampleRate = 48_000, inputRoute = "built_in",
             decodeBackend = "mock"))
         feed(c, 12.0) // segment 1 closed at 192k, segment 2 open at 192k
         c.sharing.syncCapture()

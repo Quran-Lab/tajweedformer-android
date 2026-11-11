@@ -24,7 +24,7 @@ import java.util.zip.GZIPInputStream
  * its third chunk: the take continues on the CPU from the failed chunk, is scored as CPU, the key is demoted and the
  * next takes run on the CPU. Needs the JNI library (build/host) and the staged folder.
  */
-class BackendFallbackTest {
+class BackendFallbackTest : OpenChecked() {
     private val dirs = ArrayList<File>()
     private val choices = Collections.synchronizedList(ArrayList<BackendChoice>())
     private val tests = Collections.synchronizedList(ArrayList<SelfTestResult>())
@@ -33,7 +33,7 @@ class BackendFallbackTest {
         override fun onSelfTest(result: SelfTestResult) { tests.add(result) }
     }
     private lateinit var npuFiles: NpuFiles
-    private lateinit var model: TajweedModel
+    private lateinit var model: ModelFolder
 
     private fun dir() = Files.createTempDirectory("tj-fb-").toFile().also { dirs.add(it) }
 
@@ -50,7 +50,7 @@ class BackendFallbackTest {
         val md = dir()
         val files = TestKit.v4Files()
         TestKit.writeDecoded(md, files, TestKit.sign(TestKit.manifest(files)))
-        model = TajweedModel.open(md, TestKit.verifier)
+        model = ModelFolder.open(md, TestKit.verifier)
         SelfTest.clear()
         SdkEvents.add(observer)
     }
@@ -75,35 +75,27 @@ class BackendFallbackTest {
     /** CPU fake: 8 frames per 5120 samples, the flush's frames at finish up to 64 in all. */
     private class CpuFake : TajweedEngine {
         override val chunkMs: Int = 320
-        var scoredBackend: TajweedBackend? = null
         override fun createStream(): TajweedEngineStream = object : TajweedEngineStream {
             var pending = 0
             var made = 0
-            fun chunk(): TajweedHeads {
-                val m = HashMap<TajweedHead, FloatArray>()
-                for (h in TajweedHead.entries) m[h] = FloatArray((if (h.frameMs == 40) 8 else 16) * h.width)
-                val lp = m.getValue(TajweedHead.LOG_PROBS)
+            fun chunk(): HeadValues {
+                val m = HashMap<HeadId, FloatArray>()
+                for (h in HeadId.entries) m[h] = FloatArray((if (h.frameMs == 40) 8 else 16) * h.width)
+                val lp = m.getValue(HeadId.LOG_PROBS)
                 for (t in 0 until 8) for (k in 0 until 38) lp[t * 38 + k] = if (k == topAt(made * 8 + t)) -0.01f else -8f
                 made++
-                return TajweedHeads(8, m)
+                return HeadValues(8, m)
             }
-            override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+            override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> {
                 pending += length
-                val out = ArrayList<TajweedHeads>()
+                val out = ArrayList<HeadValues>()
                 while (pending >= 5120 && made < 7) { pending -= 5120; out.add(chunk()) }
                 return out
             }
-            override fun finish(): List<TajweedHeads> = (made until FRAMES / 8).map { chunk() }
+            override fun finish(): List<HeadValues> = (made until FRAMES / 8).map { chunk() }
             override fun reset() { pending = 0; made = 0 }
             override fun close() {}
         }
-        override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int): TajweedResult {
-            scoredBackend = settings.backend
-            return TajweedResult(surah, ayah, settings, emptyList(), emptyList(), emptyList(), emptyList(),
-                TajweedSummary(0, 0, 0, 0, 0, 0, 0, 0, 0.0, false))
-        }
-        override fun expectedTokens(surah: Int, ayah: Int) = TOKENS
-        override fun expectedWords(surah: Int, ayah: Int) = IntArray(TOKENS.size) { it / 4 }
         override fun close() {}
     }
 
@@ -115,7 +107,7 @@ class BackendFallbackTest {
             val chunk = runs++
             val out = HashMap<String, ShortArray>()
             for ((name, t) in c.outputs) out[name] = ShortArray(t.size)
-            val head = c.heads.first { it.head == TajweedHead.LOG_PROBS }.output
+            val head = c.heads.first { it.head == HeadId.LOG_PROBS }.output
             val lp = out.getValue(head)
             for (f in 0 until 8) {
                 val tok = if (wrong) 5 else topAt(chunk * 8 + f)
@@ -167,15 +159,15 @@ class BackendFallbackTest {
 
     private fun fallbackTake(contract: NpuContract, masks: NpuMasks, soc: String, runner: () -> NpuRunner) = runBlocking {
         val cpu = CpuFake()
-        val clips = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipExpected(1, listOf(1), emptySet(), emptySet(), emptyList()) }
-        val same = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipObserved(1, listOf(1), emptySet(), emptySet(), true, listOf(5.0)) }
+        val clips = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipExpected(listOf(1)) }
+        val same = SelfTestSet.REQUIRED.associateWith { SelfTestSet.ClipObserved(1, TestKit.headsOf(listOf(1)), listOf(5.0)) }
         val r = runner()
         val prepared = object : ai.quranlab.tajweedformer.accel.PreparedAccelerator {
-            override val expected = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", clips)
+            override val expected = SelfTestSet.Expected("c16_l64", clips)
             override val chunkMs = 320
             override fun warmup() {}
             override fun golden(abort: () -> Boolean) = ai.quranlab.tajweedformer.accel.GoldenRun(same, same)
-            override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream =
+            override fun stream(heads: Set<HeadId>, sampleRate: Int): TajweedEngineStream =
                 NpuTajweedEngine(contract, masks, r, sampleRate).createStream(heads)
             override fun close() {}
         }
@@ -195,7 +187,7 @@ class BackendFallbackTest {
             ai.quranlab.tajweedformer.accel.AcceleratorKey("r", "b", "m", soc, "c16_l64"))
         acc.start()
         assertTrue(acc.state.value is ai.quranlab.tajweedformer.accel.AcceleratorState.Ready)
-        val rec = TajweedRecognizer.open(model, TajweedRecognizer.Options(accelerator = acc, soc = soc, engine = { _, _, _ -> cpu }))
+        val rec = Recognizer.open(model, Recognizer.Options(accelerator = acc, soc = soc, engine = { _, _, _ -> cpu }))
         val s = rec.startSession()
         val chunks = async { s.chunks.toList() }
         val clip = SelfTestClip.builtIn().samples
@@ -205,16 +197,15 @@ class BackendFallbackTest {
             s.append(clip, at, k)
             at += k
         }
-        val res = s.finishAndScore(1, 1)
+        s.finish()
         val got = chunks.await()
         // the first two chunks came from the NPU, the failed third and the rest from the CPU (the take so far fits in the
-        // replay window, so the CPU replayed it from its first sample); scored as CPU (int8): most chunks are the CPU's
+        // replay window, so the CPU replayed it from its first sample)
         assertEquals(listOf(Backend.NPU, Backend.NPU), got.take(2).map { it.backend })
         assertTrue(got.drop(2).all { it.backend == Backend.CPU })
         assertEquals(8, got.size)
         assertEquals((0 until 8).toList(), got.map { it.index })
-        assertEquals(TajweedBackend.INT8, cpu.scoredBackend)
-        assertEquals(Backend.CPU, res.backend)
+        assertEquals(Backend.CPU, s.backend)
         assertEquals("failover_exception", rec.backendChoice.reason)
         assertEquals(ai.quranlab.tajweedformer.accel.Reasons.FAILOVER, (acc.state.value as ai.quranlab.tajweedformer.accel.AcceleratorState.Disabled).reason)
         // the next take runs on the CPU from the start

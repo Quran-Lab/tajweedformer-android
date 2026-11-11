@@ -4,10 +4,10 @@ import kotlin.math.exp
 import kotlin.math.sqrt
 
 /**
- * One 40 ms CTC frame of [TajweedHead.LOG_PROBS]: the best and second-best token and their
+ * One 40 ms CTC frame of [HeadId.LOG_PROBS]: the best and second-best token and their
  * log-probabilities. Ties go to the lower id.
  */
-data class CtcFrame(
+internal data class CtcFrame(
     /** Frame within the take. */
     val index: Int,
     val top: Int,
@@ -32,10 +32,9 @@ data class CtcFrame(
  *   [margin] is top-1 minus runner-up there.
  * - [conf]: the mean of sigmoid(conf) over the run's 20 ms frames, when the conf head is present.
  * - [confidence]: a display value in 0..1, the geometric mean of [conf] and sigmoid([margin]) (or
- *   sigmoid([margin]) alone without the conf head). It is not calibrated: verdicts come from the
- *   tajweed layer.
+ *   sigmoid([margin]) alone without the conf head). It is not calibrated.
  */
-data class DecodedToken(
+internal data class DecodedToken(
     val id: Int,
     val symbol: String,
     val firstFrame: Int,
@@ -50,8 +49,8 @@ data class DecodedToken(
     val endMs: Long get() = (lastFrame + 1) * CtcFrame.FRAME_MS
 }
 
-/** Tokens between two word boundaries ("|", [TajweedModel.WORD_BOUNDARY]) of the transcript. */
-data class DecodedWord(val index: Int, val tokens: List<DecodedToken>) {
+/** Tokens between two word boundaries ("|", [ModelFolder.WORD_BOUNDARY]) of the transcript. */
+internal data class DecodedWord(val index: Int, val tokens: List<DecodedToken>) {
     val startMs: Long get() = tokens.first().startMs
     val endMs: Long get() = tokens.last().endMs
     /** The lowest token confidence of the word. */
@@ -63,17 +62,16 @@ data class DecodedWord(val index: Int, val tokens: List<DecodedToken>) {
  * with per-token confidence, words, and times (frame k covers `[40 k, 40 (k + 1))` ms of the take,
  * the engine's frame grid; no model delay is subtracted).
  *
- * Words: the transcript split at the word boundary token when the model emits it. For a known ayah
- * the tajweed layer gives words from the expected text instead ([TajweedResult.words]).
+ * Words: the transcript split at the word boundary token when the model emits it.
  */
-class Decoded @JvmOverloads constructor(
+internal class Decoded @JvmOverloads constructor(
     val frames: List<CtcFrame>,
     val tokens: List<DecodedToken>,
     val words: List<DecodedWord>,
-    /** The ranked entries asked for per head ([TajweedRecognizer.Options.topK]), from the engine's top-K. */
-    val ranked: Map<TajweedHead, Ranked> = emptyMap(),
+    /** The ranked entries asked for per head ([Recognizer.Options.topK]), from the engine's top-K. */
+    val ranked: Map<HeadId, Ranked> = emptyMap(),
     /** boundary and conf as probabilities per 20 ms frame (sigmoid of their logits), when present. */
-    val probabilities: Map<TajweedHead, FloatArray> = emptyMap(),
+    val probabilities: Map<HeadId, FloatArray> = emptyMap(),
 ) {
     /** Token ids of the transcript (word boundaries included). */
     val ids: IntArray get() = tokens.map { it.id }.toIntArray()
@@ -87,20 +85,20 @@ class Decoded @JvmOverloads constructor(
  * (zf_tajweed_stream_top2 for the exact engine's own heads, zf_tajweed_top2 for heads from elsewhere):
  * one rule, ties to the lower id, the same as the engine's greedy decode.
  */
-object Decoder {
-    /** log_probs ranked 2 deep, the default of [TajweedRecognizer.Options.topK]. */
-    @JvmField val DEFAULT_TOP_K: Map<TajweedHead, Int> = mapOf(TajweedHead.LOG_PROBS to 2)
+internal object Decoder {
+    /** log_probs ranked 2 deep, the default of [Recognizer.Options.topK]. */
+    @JvmField val DEFAULT_TOP_K: Map<HeadId, Int> = mapOf(HeadId.LOG_PROBS to 2)
 
     @JvmStatic
     @JvmOverloads
-    fun decode(heads: TajweedHeads, vocabulary: Vocabulary, frameOffset: Int = 0, topK: Map<TajweedHead, Int> = DEFAULT_TOP_K): Decoded {
+    fun decode(heads: HeadValues, vocabulary: Vocabulary, frameOffset: Int = 0, topK: Map<HeadId, Int> = DEFAULT_TOP_K): Decoded {
         val ranked = topK.filterKeys { heads.has(it) }.mapValues { (h, k) -> Ranked.of(heads, h, k) }
-        val probabilities = listOf(TajweedHead.BOUNDARY, TajweedHead.CONF).mapNotNull { h ->
+        val probabilities = listOf(HeadId.BOUNDARY, HeadId.CONF).mapNotNull { h ->
             heads[h]?.let { v -> h to FloatArray(v.size) { sigmoid(v[it].toDouble()).toFloat() } }
         }.toMap()
-        val lp = heads[TajweedHead.LOG_PROBS] ?: return Decoded(emptyList(), emptyList(), emptyList(), ranked, probabilities)
-        val w = TajweedHead.LOG_PROBS.width
-        val conf = heads[TajweedHead.CONF]
+        val lp = heads[HeadId.LOG_PROBS] ?: return Decoded(emptyList(), emptyList(), emptyList(), ranked, probabilities)
+        val w = HeadId.LOG_PROBS.width
+        val conf = heads[HeadId.CONF]
         val t2 = heads.top2 ?: run {
             if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) {
                 throw RecognizerException.EngineNotAvailable("the decoded layer's top-2 is the engine's (zf_tajweed_top2)")
@@ -137,7 +135,7 @@ object Decoder {
         val words = ArrayList<DecodedWord>()
         var cur = ArrayList<DecodedToken>()
         for (tok in tokens) {
-            if (tok.id == TajweedModel.WORD_BOUNDARY) {
+            if (tok.id == ModelFolder.WORD_BOUNDARY) {
                 if (cur.isNotEmpty()) words.add(DecodedWord(words.size, cur))
                 cur = ArrayList()
             } else {
@@ -156,9 +154,9 @@ object Decoder {
  * value first, equal values by the lower id (a stable argsort), with each entry's margin to the next rank
  * (0 after the last class). Token heads (log_probs, inter1, inter4, id, timing) rank the 38 tokens, k up
  * to 38 (the full ranked list); class heads (gem, attr_*) rank their classes. Names:
- * [TajweedHead.classNames].
+ * [HeadId.classNames].
  */
-class Ranked(val head: TajweedHead, val frames: Int, val k: Int, val ids: IntArray, val values: FloatArray, val margins: FloatArray) {
+internal class Ranked(val head: HeadId, val frames: Int, val k: Int, val ids: IntArray, val values: FloatArray, val margins: FloatArray) {
     fun id(frame: Int, rank: Int): Int = ids[frame * k + rank]
     fun value(frame: Int, rank: Int): Float = values[frame * k + rank]
     fun margin(frame: Int, rank: Int): Float = margins[frame * k + rank]
@@ -170,7 +168,7 @@ class Ranked(val head: TajweedHead, val frames: Int, val k: Int, val ids: IntArr
         /** [head] of [heads] ranked [k] deep by the engine. Throws IllegalArgumentException for boundary
          *  or conf (single logits) and for k outside 1..the head's width. */
         @JvmStatic
-        fun of(heads: TajweedHeads, head: TajweedHead, k: Int): Ranked {
+        fun of(heads: HeadValues, head: HeadId, k: Int): Ranked {
             require(head.kind != HeadKind.LOGIT) { "${head.key} is a single logit: it has no ranking" }
             require(k in 1..head.width) { "k $k is not 1..${head.width} for ${head.key}" }
             val v = heads[head] ?: throw NoSuchElementException("${head.key} is absent")

@@ -8,10 +8,10 @@ import ai.quranlab.tajweedformer.NpuTajweedEngine
 import ai.quranlab.tajweedformer.RecognizerException
 import ai.quranlab.tajweedformer.SelfTestRunner
 import ai.quranlab.tajweedformer.SelfTestSet
-import ai.quranlab.tajweedformer.TajweedBackend
+
 import ai.quranlab.tajweedformer.TajweedEngineStream
-import ai.quranlab.tajweedformer.TajweedHead
-import ai.quranlab.tajweedformer.TajweedModel
+import ai.quranlab.tajweedformer.HeadId
+import ai.quranlab.tajweedformer.ModelFolder
 import ai.quranlab.tajweedformer.engine.ExactTajweedEngine
 import ai.quranlab.tajweedformer.npu.NpuChainOpener
 import ai.quranlab.tajweedformer.npu.NpuChainRunner
@@ -29,14 +29,14 @@ import java.io.File
  *   compiled ahead of time for each SoC, so the device step is LiteRT's CreateCompiledModel through the dispatch
  *   library: no on-device compiler runs, and LiteRT's compiler cache does not apply to them.
  * - `warmup`, `golden`: the host loop of [NpuTajweedEngine] (the exact engine's front end, the NPU per chunk), the
- *   golden clips also through the exact CPU engine in the same run, scored by the CPU engine's scorer.
+ *   golden clips also through the exact CPU engine in the same run; the raw outputs of both are compared.
  *
  * A chained build (io.json `parts`, the Exynos 2500) loads every part with [runnerFactory] and runs them as one
  * [NpuChainRunner]; everything else is the same over the whole chain.
  */
-class NpuPreparer(
+internal class NpuPreparer(
     private val store: ModelStore,
-    private val model: TajweedModel,
+    private val model: ModelFolder,
     private val network: NetworkPolicy,
     private val runnerFactory: ((File, NpuContract) -> NpuRunner)?,
 ) : AcceleratorPreparer {
@@ -113,24 +113,22 @@ class NpuPreparer(
         private val set = SelfTestSet.read(dir)
         override val expected: SelfTestSet.Expected = SelfTestSet.readExpected(dir, key.context)
         override val chunkMs: Int = contract.chunkMs
-        override val headsBackend: TajweedBackend = TajweedBackend.FP32
         override val planted: Set<String> = set.clips.filter { it.kind == SelfTestSet.PLANTED }.map { it.id }.toSet()
-        override val plantedSites = SelfTestSet.plantedSites(set, expected)
-        override val tolerance = store.manifest().toleranceFor("npu:${key.soc}:${key.context}")
+        override val tolerance = store.manifest().rawToleranceFor("npu:${key.soc}:${key.context}")
 
         /** The widest value any head of this build can take: int16 codes times the head output's scale. */
         override val range: HeadRange = HeadRange.fromLogitBound(contract.heads.maxOf { 32768.0 * contract.outputs.getValue(it.output).scale })
 
         private fun engine(rate: Int) = NpuTajweedEngine(contract, masks, runner, rate)
 
-        override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream = engine(sampleRate).createStream(heads)
+        override fun stream(heads: Set<HeadId>, sampleRate: Int): TajweedEngineStream = engine(sampleRate).createStream(heads)
 
         override fun warmup() {
             val clip = set.clips.first()
             val audio = FloatArray(16_000) + SelfTestSet.samples(File(dir, clip.file))
-            stream(TajweedHead.SCORER_HEADS, 16_000).use { s ->
+            stream(HeadId.BASE_HEADS, 16_000).use { s ->
                 var at = 0
-                val got = ArrayList<ai.quranlab.tajweedformer.TajweedHeads>()
+                val got = ArrayList<ai.quranlab.tajweedformer.HeadValues>()
                 while (at < audio.size) {
                     val k = minOf(SelfTestRunner.PIECE, audio.size - at)
                     got += s.pushAudio(audio, at, k)
@@ -144,20 +142,14 @@ class NpuPreparer(
         }
 
         override fun golden(abort: () -> Boolean): GoldenRun {
-            // the CPU engine first (it holds the process's one engine stream while it runs), then the NPU path,
-            // scored by a scoring-only handle (no weights)
-            val cpu = ExactTajweedEngine(model.dir, key.context, loadEngine = true)
+            // the CPU engine first (it holds the process's one engine stream while it runs), then the NPU path
+            val cpu = ExactTajweedEngine(model.dir, key.context)
             val cpuObs = try {
-                SelfTestRunner.run({ cpu.createStream() }, cpu, model.calibration, key.context, set, dir, TajweedBackend.INT8, abort)
+                SelfTestRunner.run({ cpu.createStream() }, set, dir, abort)
             } finally {
                 cpu.close()
             }
-            val scorer = ExactTajweedEngine(model.dir, key.context, loadEngine = false)
-            val accObs = try {
-                SelfTestRunner.run({ stream(TajweedHead.SCORER_HEADS, 16_000) }, scorer, model.calibration, key.context, set, dir, headsBackend, abort)
-            } finally {
-                scorer.close()
-            }
+            val accObs = SelfTestRunner.run({ stream(HeadId.BASE_HEADS, 16_000) }, set, dir, abort)
             return GoldenRun(accObs, cpuObs)
         }
 

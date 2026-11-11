@@ -1,3 +1,5 @@
+import java.time.Duration
+
 // The library's Kotlin sources (tajweedformer/src/main/kotlin) on the desktop JVM, against a host build
 // of the JNI library, so the whole wrapper is conformance-tested without a device.
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -9,6 +11,10 @@ plugins {
 kotlin {
     compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
     sourceSets["main"].kotlin.srcDir("../tajweedformer/src/main/kotlin")
+    // the desktop JVM's own part: TajweedClient(key, storage)
+    sourceSets["main"].kotlin.srcDir("../tajweedformer/src/jvm/kotlin")
+    // only the types of NAMING.md are public: every public declaration says so
+    explicitApi()
 }
 // the SDK's Java resources (the self-test clip, the sharing copy deck) on the desktop JVM too
 sourceSets["main"].resources.srcDir("../tajweedformer/src/main/resources")
@@ -49,18 +55,25 @@ val buildHostNative by tasks.registering(Exec::class) {
     onlyIf { !noNative }
 }
 
-tasks.test {
+// every test task of this module (test, and localProof below) is set up the same way
+tasks.withType<Test>().configureEach {
     dependsOn(buildHostNative)
     systemProperty("tajweedformer.version", rootProject.property("tajweedformer.version") as String)
-    // the V4 scorer against the reference vectors (ScorerVectorsTest; skipped without these):
-    // TAJWEEDFORMER_LIBRARY = a JNI library with zf_tajweed (scripts/build_scorer_host.sh),
-    // TJ_SCORER_TABLE = scripts/make_scorer_table.py's folder
+    // TAJWEEDFORMER_LIBRARY = a JNI library built beforehand (scripts/build_host.sh)
     System.getenv("TAJWEEDFORMER_LIBRARY")?.let { systemProperty("tajweedformer.library", it) }
-    System.getenv("TJ_SCORER_TABLE")?.let { systemProperty("TJ_SCORER_TABLE", it) }
-    // the layout-3 model folder (signed with a test key) and that key, for the engine and download tests
-    for (k in listOf("TJ_V4_DIR", "TJ_V4_TRANSPORT_DIR", "TJ_TEST_PUBLIC_KEY", "TJ_NPU_DIR", "TJ_NPU_GOLDEN", "TJ_NPU_WORK", "TJ_NPU_2500_GOLDEN", "TJ_SELFTEST_TOKENS_OUT")) {
+    // the layout-3 model folder (signed with a test key) and that key, for the engine and download tests; the shared
+    // 3.0 vectors (TJ_VECTORS_DIR: sdk_3.0.0/vectors of the contract; the tests that read them skip without it,
+    // except the copies kept in src/test/resources)
+    for (k in listOf("TJ_V4_DIR", "TJ_V4_TRANSPORT_DIR", "TJ_TEST_PUBLIC_KEY", "TJ_NPU_DIR", "TJ_NPU_GOLDEN", "TJ_NPU_WORK", "TJ_NPU_2500_GOLDEN",
+        "TJ_SELFTEST_TOKENS_OUT", "TJ_VECTORS_DIR", "TJ_ERRORS_JSON",
+        // the real reference table (ReferenceTableTest): the index of the local model folders, and the source table
+        "TJ_LOCAL30", "TJ_EXPECTED_TJ3")) {
         System.getenv(k)?.let { systemProperty(k, it) }
     }
+    // bounded before it starts: one test JVM of at most 2 GB (maxHeapSize below), at most 4 workers on a shared
+    // machine (the engine tests run one stream per process anyway), and a wall-clock limit for the whole task
+    maxParallelForks = 1
+    timeout.set(Duration.ofMinutes(30))
     // recitation sharing's codec tests: libtajweedformer_opus for this machine
     // (scripts/opus/build_opus_host.sh; TAJWEEDFORMER_OPUS_LIBRARY names another build)
     val opusLib = System.getenv("TAJWEEDFORMER_OPUS_LIBRARY")
@@ -78,4 +91,25 @@ tasks.test {
         showStandardStreams = true
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
+}
+
+// The proof that needs a model (LocalModelProofTest): the 35 conformance clips bit-exact through the public Session
+// API and every sample clip through listen(), against a real 3.0 model folder with the exact engine through JNI.
+//   ./gradlew :tajweedformer-jvm:localProof -PproofModel=<decoded 3.0 model folder> -PproofClips=<folder of .pcm clips>
+//       [-PproofKey=<the folder's public key, hex: a folder signed with a test key>] [-Pnative: build the JNI library]
+// One test JVM with a 2 GB heap and a 20 minute limit. Without the folders the test skips (as in `test`, and on CI).
+tasks.register<Test>("localProof") {
+    description = "The 35 conformance clips and the sample clips through the public API, against a local model folder."
+    group = "verification"
+    val test = tasks.named<Test>("test").get()
+    testClassesDirs = test.testClassesDirs
+    classpath = test.classpath
+    filter { includeTestsMatching("ai.quranlab.tajweedformer.LocalModelProofTest") }
+    timeout.set(Duration.ofMinutes(20))
+    // always run: its inputs are folders outside the build
+    outputs.upToDateWhen { false }
+    (project.findProperty("proofModel") as String?)?.let { systemProperty("TJ_PROOF_MODEL", it) }
+    (project.findProperty("proofClips") as String?)?.let { systemProperty("TJ_PROOF_CLIPS", it) }
+    (project.findProperty("proofKey") as String?)?.let { systemProperty("TJ_TEST_PUBLIC_KEY", it) }
+    systemProperty("TJ_PROOF_OUT", rootProject.layout.buildDirectory.file("local-proof.txt").get().asFile.path)
 }

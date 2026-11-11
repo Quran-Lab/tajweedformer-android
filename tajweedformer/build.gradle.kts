@@ -23,7 +23,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // x86_64 is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks, on the CPU engine only:
+            // the 35 conformance clips are bit-exact on it through this library (DeviceEndToEndTest on an x86_64
+            // emulator, scripts/emulator_proof.py). SdkInfo.ABIS says the same.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
         externalNativeBuild {
             cmake {
@@ -70,8 +73,14 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        // internal members carry the module's name in their JVM names: one name for every variant, so the Compose
+        // module (a friend of this one) links against debug and release alike
+        moduleName = "tajweedformer"
     }
 }
+
+// Only the types of NAMING.md are public: every public declaration says so, everything else is internal.
+kotlin { explicitApi() }
 
 publishing {
     publications {
@@ -83,8 +92,8 @@ publishing {
             pom {
                 name.set("TajweedFormer for Android")
                 description.set(
-                    "TajweedFormer V4 on Android: on-device tajweed feedback from the exact engine, word by word " +
-                        "while the learner recites, with the decoded layer, per-site verdicts and the Quran Lab platform client."
+                    "TajweedFormer V4 on Android: an on-device inference engine for Quran recitation. Audio in; the model's " +
+                        "raw heads, greedy tokens and the decoded layer out, chunk by chunk while the learner recites."
                 )
                 url.set("https://github.com/Quran-Lab/tajweedformer-android")
                 licenses {

@@ -3,11 +3,10 @@ package ai.quranlab.tajweedformer
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * What the SDK does, for code that watches it: the SDK's cloud module (anonymous telemetry, opt-in
- * recording sharing) and apps that want their own logs. Every method has an empty default, so an
- * observer overrides only what it needs.
+ * What the SDK does, for code inside the SDK that watches it: the client's cloud side (anonymous telemetry,
+ * opt-in recording sharing). Every method has an empty default, so an observer overrides only what it needs.
  *
- * Register with `TajweedFormer.events.add(observer)`. Calls come on the SDK's own threads (the
+ * Register with `SdkInfo.events.add(observer)`. Calls come on the SDK's own threads (the
  * recognizer's engine thread for audio and chunks, a download thread for downloads), in order per
  * source, and must return quickly: copy what you need and hand heavy work (encoding, uploading) to
  * your own thread. An observer that throws is ignored for that call; the SDK never fails because of
@@ -17,7 +16,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * [onAudio] carries the audio itself and is meant only for recording sharing behind the user's
  * consent.
  */
-interface SdkObserver {
+internal interface SdkObserver {
     /** A take started on a recognizer. */
     fun onSessionStart(session: SessionInfo) {}
 
@@ -28,8 +27,6 @@ interface SdkObserver {
      *  margins and confidences). [decoded] is computed only while an observer is registered. */
     fun onChunk(session: SessionInfo, chunk: ChunkStats, decoded: Decoded) {}
 
-    /** A take was scored ([TajweedSession.finishAndScore] or [TajweedRecognizer.score] during it). */
-    fun onScored(session: SessionInfo, result: TajweedResult) {}
 
     /** A recognizer opened its engines (the CPU engine, and the NPU when chosen). */
     fun onModelLoad(load: ModelLoadInfo) {}
@@ -71,9 +68,8 @@ interface SdkObserver {
     fun onError(where: String, error: Throwable) {}
 }
 
-/** Identifies one take for observers: a process-unique number, the model and context, the backend,
- *  and the settings in force when it started. */
-data class SessionInfo(
+/** Identifies one take for observers: a process-unique number, the model build and context, the backend. */
+internal data class SessionInfo(
     val id: Long,
     val modelId: String,
     val context: String,
@@ -82,31 +78,22 @@ data class SessionInfo(
     val sampleRate: Int,
     /** Wall-clock start, ms since the epoch. */
     val startedAtMs: Long,
-    /** The model folder's manifest revision. */
+    /** The model build (the manifest's build id; [ModelIds] gives its version). */
     val revision: String = "",
     /** The device's SoC id, when known. */
     val soc: String? = null,
-    /** The global site preset in force (`strict`, `balanced`, ...), or `custom` when a class has a raw threshold. */
-    val preset: String = "",
-    /** The per-word level (`strict`, `general`, `beginner`) or `custom`. */
-    val wordLevel: String = "",
-    val wordThreshold: Double = 0.0,
-    /** Classes with an app or portal override. */
-    val siteOverrides: Int = 0,
-    /** Checks on (`letters`, `vowels`, `length`, `madd`, `gemination`, `qalqalah`, `lazim`). */
-    val checksOn: Set<String> = emptySet(),
     /** SHA-256 of the decoded int8 weight file (layers.zfw). */
     val weightsSha256: String? = null,
 )
 
 /** One engine chunk's timing. */
-data class ChunkStats(val index: Int, val computeMs: Double, val audioMs: Double, val backend: Backend)
+internal data class ChunkStats(val index: Int, val computeMs: Double, val audioMs: Double, val backend: Backend)
 
 /** A recognizer's engines opened in [ms]; [cold] for the first open in this process. */
-data class ModelLoadInfo(val revision: String, val context: String, val backend: Backend, val ms: Double, val cold: Boolean, val soc: String? = null)
+internal data class ModelLoadInfo(val revision: String, val context: String, val backend: Backend, val ms: Double, val cold: Boolean, val soc: String? = null)
 
 /** A take's timing. RTF = compute time / audio time (below 1 is faster than real time). */
-data class SessionStats(
+internal data class SessionStats(
     val audioSeconds: Double,
     val computeSeconds: Double,
     val chunks: Int,
@@ -114,17 +101,22 @@ data class SessionStats(
     val outcome: String,
     /** The backend that produced the last chunk (an NPU take can end on the CPU after a fallback). */
     val backend: Backend,
-    /** The take was scored (its feedback was produced). */
-    val scored: Boolean = false,
-    /** The score flagged at least one site or word. */
-    val flagged: Boolean = false,
+    /** The take's 40 ms frames that are speech and silence ([SpeechFrames]), from the model's own output. */
+    val speechFrames: Int = 0,
+    val silenceFrames: Int = 0,
+    /** Greedy tokens emitted per selected CTC head (head name to count). */
+    val tokens: Map<String, Int> = emptyMap(),
+    /** floor(1000 * input samples / input rate). */
+    val audioMs: Long = 0,
+    /** The compute time of the take's chunks, each in whole microseconds, summed. */
+    val computeUs: Long = 0,
 ) {
     val rtf: Double get() = if (audioSeconds > 0) computeSeconds / audioSeconds else 0.0
     val meanChunkMs: Double get() = if (chunks > 0) 1000.0 * computeSeconds / chunks else 0.0
 }
 
 /** The compute backends of the Android SDK. */
-enum class Backend(val key: String) {
+internal enum class Backend(val key: String) {
     /** The exact C engine on the CPU: bit-exact on every device, always available, the fallback. */
     CPU("cpu"),
     /** The SoC's NPU through LiteRT with the vendor dispatch (int16 I/O), checked against the CPU. */
@@ -140,14 +132,14 @@ enum class Backend(val key: String) {
  * switched to the CPU: `exception`, `non_finite`, `out_of_range`, `blank`, `deadline`), `thermal`, `memory`,
  * `denylist`, `forced_cpu`; [detail] is free text for logs.
  */
-data class BackendChoice(
+internal data class BackendChoice(
     val backend: Backend,
     val reason: String,
     val detail: String = "",
     /** The device's SoC id (`tensor_g4`, `exynos2600`), or null when unknown. */
     val soc: String? = null,
     val context: String? = null,
-    /** The model revision. */
+    /** The model build. */
     val revision: String? = null,
 ) {
     /** A move away from a backend that was there (not a plain CPU choice): the NPU failed to load,
@@ -160,7 +152,7 @@ data class BackendChoice(
     }
 }
 
-data class DownloadProgress(
+internal data class DownloadProgress(
     /** The manifest path (stored bytes, `.gz` for compressed files). */
     val path: String,
     val role: String,
@@ -169,7 +161,7 @@ data class DownloadProgress(
     val total: Long,
 )
 
-data class DownloadResult(
+internal data class DownloadResult(
     val path: String,
     val role: String,
     /** Bytes moved over the network by this download (0 when the file was already in place). */
@@ -185,7 +177,7 @@ data class DownloadResult(
     val revision: String = "",
 )
 
-data class SelfTestResult(
+internal data class SelfTestResult(
     val backend: Backend,
     val passed: Boolean,
     /** What was compared and how it came out, for logs. */
@@ -196,8 +188,8 @@ data class SelfTestResult(
     val revision: String? = null,
 )
 
-/** The registry behind [TajweedFormer.events]. */
-object SdkEvents {
+/** The registry behind [SdkInfo.events]. */
+internal object SdkEvents {
     private val observers = CopyOnWriteArrayList<SdkObserver>()
 
     @JvmStatic fun add(observer: SdkObserver) {

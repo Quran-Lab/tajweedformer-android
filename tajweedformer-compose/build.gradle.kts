@@ -23,6 +23,17 @@ android {
     publishing { singleVariant("release") { withSourcesJar() } }
 }
 
+// Only the types of the public API are public, here as in the core.
+kotlin { explicitApi() }
+
+// The sheets are part of the SDK: they read the copy deck and record the learner's answer through the core's
+// internals, which no app can reach. So this module compiles as a friend of the core module (the same mechanism a
+// module's tests use), against the core's classes of the same variant.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    val core = project(":tajweedformer").layout.buildDirectory.get().asFile.invariantSeparatorsPath
+    friendPaths.from(libraries.filter { it.invariantSeparatorsPath.startsWith(core) })
+}
+
 publishing {
     publications {
         register<MavenPublication>("release") {

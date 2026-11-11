@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * promoted, the order (first install, sessions running at promotion, a later launch), and failovers at the first, a
  * middle and the last chunk for every cause.
  */
-class AcceleratorTest {
+class AcceleratorTest : OpenChecked() {
     private val dirs = ArrayList<File>()
     private fun dir() = Files.createTempDirectory("tj-acc-").toFile().also { dirs.add(it) }
     private val choices = Collections.synchronizedList(ArrayList<BackendChoice>())
@@ -72,11 +72,11 @@ class AcceleratorTest {
         dirs.forEach { it.deleteRecursively() }
     }
 
-    private val model: TajweedModel by lazy {
+    private val model: ModelFolder by lazy {
         val d = dir()
         val files = TestKit.v4Files()
         TestKit.writeDecoded(d, files, TestKit.sign(TestKit.manifest(files)))
-        TajweedModel.open(d, TestKit.verifier)
+        ModelFolder.open(d, TestKit.verifier)
     }
 
     // ------------------------------------------------------------------------------------------------- fakes
@@ -120,18 +120,18 @@ class AcceleratorTest {
     }
 
     /** One chunk of 8 frames whose log_probs peak on [tok] (0 = blank); [nan] puts a NaN in conf; [range] a log-prob of +3. */
-    private fun chunk(tok: Int, nan: Boolean = false, range: Boolean = false): TajweedHeads {
-        val m = HashMap<TajweedHead, FloatArray>()
-        for (h in TajweedHead.SCORER_HEADS + TajweedHead.CONF) m[h] = FloatArray((if (h.frameMs == 40) 8 else 16) * h.width)
-        for (h in listOf(TajweedHead.LOG_PROBS, TajweedHead.INTER1_LOG_PROBS, TajweedHead.TIMING_LOG_PROBS)) {
+    private fun chunk(tok: Int, nan: Boolean = false, range: Boolean = false): HeadValues {
+        val m = HashMap<HeadId, FloatArray>()
+        for (h in HeadId.BASE_HEADS + HeadId.CONF) m[h] = FloatArray((if (h.frameMs == 40) 8 else 16) * h.width)
+        for (h in listOf(HeadId.LOG_PROBS, HeadId.INTER1_LOG_PROBS, HeadId.TIMING_LOG_PROBS)) {
             val lp = m.getValue(h)
             val frames = lp.size / 38
             for (t in 0 until frames) for (k in 0 until 38) lp[t * 38 + k] = if (k == tok) -0.01f else -8f
         }
-        for (h in listOf(TajweedHead.GEM, TajweedHead.ATTR_QALQALAH)) { val v = m.getValue(h); for (i in v.indices step h.width) v[i] = 1f }
-        if (nan) m.getValue(TajweedHead.CONF)[3] = Float.NaN
-        if (range) m.getValue(TajweedHead.LOG_PROBS)[5] = 3f
-        return TajweedHeads(8, m)
+        for (h in listOf(HeadId.GEM, HeadId.ATTR_QALQALAH)) { val v = m.getValue(h); for (i in v.indices step h.width) v[i] = 1f }
+        if (nan) m.getValue(HeadId.CONF)[3] = Float.NaN
+        if (range) m.getValue(HeadId.LOG_PROBS)[5] = 3f
+        return HeadValues(8, m)
     }
 
     /** A stream that makes a chunk per 5120 samples with [tok] on even chunks; [fail] injects a failure at its chunk;
@@ -142,16 +142,16 @@ class AcceleratorTest {
         var pending = 0
         var made = 0
         override val backend: Backend get() = backendKind
-        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+        override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> {
             pending += length
-            val out = ArrayList<TajweedHeads>()
+            val out = ArrayList<HeadValues>()
             while (pending >= 5120) {
                 pending -= 5120
                 out.add(next())
             }
             return out
         }
-        private fun next(): TajweedHeads {
+        private fun next(): HeadValues {
             val i = made++
             b?.let { if (it.cold.getAndSet(false)) Thread.sleep(it.coldMs) }
             delay(i).takeIf { it > 0 }?.let { Thread.sleep(it) }
@@ -168,32 +168,26 @@ class AcceleratorTest {
             }
             return chunk(if (i % 2 == 0) tok else 0)
         }
-        override fun finish(): List<TajweedHeads> = if (pending > 0) listOf(next()).also { pending = 0 } else emptyList()
+        override fun finish(): List<HeadValues> = if (pending > 0) listOf(next()).also { pending = 0 } else emptyList()
         override fun reset() { pending = 0; made = 0 }
         override fun close() {}
     }
 
     data class Fail(val mode: String, val at: Int)
 
-    /** The CPU engine (tok 32), never released (a fake has no scoring-only handle). */
+    /** The CPU engine (tok 32). */
     private inner class CpuFake : TajweedEngine {
         override val chunkMs = 320
         var streams = 0
         override fun createStream(): TajweedEngineStream { streams++; return FakeStream(Backend.CPU, 32) }
-        override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int) =
-            TajweedResult(surah, ayah, settings, emptyList(), emptyList(), emptyList(), emptyList(), TajweedSummary(0, 0, 0, 0, 0, 0, 0, 0, 0.0, false))
-        override fun expectedTokens(surah: Int, ayah: Int) = intArrayOf(31)
         override fun close() {}
     }
 
     private val clips = SelfTestSet.REQUIRED
-    private val expected = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", clips.associateWith {
-        SelfTestSet.ClipExpected(4, listOf(3, 32, 13), if (it == SelfTestSet.PLANTED_CLIP) setOf(5 to "vowel_sub") else emptySet(),
-            if (it == SelfTestSet.PLANTED_CLIP) setOf(1) else emptySet(), listOf(1.0))
-    })
+    private val expected = SelfTestSet.Expected("c16_l64", clips.associateWith { SelfTestSet.ClipExpected(listOf(3, 32, 13)) })
 
-    private fun obs(tokens: List<Int> = listOf(3, 32, 13), finite: Boolean = true, ms: Double = 10.0, sitesOf: (String) -> Set<Pair<Int, String>> = { expected.clips.getValue(it).flaggedSites }) =
-        clips.associateWith { SelfTestSet.ClipObserved(4, tokens, sitesOf(it), expected.clips.getValue(it).flaggedWords, finite, List(4) { ms }) }
+    private fun obs(tokens: List<Int> = listOf(3, 32, 13), finite: Boolean = true, ms: Double = 10.0) =
+        clips.associateWith { SelfTestSet.ClipObserved(4, TestKit.headsOf(tokens, finite), List(4) { ms }) }
 
     /** The fake accelerator's behaviour per stage. */
     private inner class Behaviour {
@@ -226,7 +220,7 @@ class AcceleratorTest {
                 override val planted = setOf(SelfTestSet.PLANTED_CLIP)
                 override fun warmup() { b.calls.add(Stages.WARMUP); b.warmup() }
                 override fun golden(abort: () -> Boolean): GoldenRun { b.calls.add(Stages.GOLDEN); return b.golden(abort) }
-                override fun stream(heads: Set<TajweedHead>, sampleRate: Int): TajweedEngineStream {
+                override fun stream(heads: Set<HeadId>, sampleRate: Int): TajweedEngineStream {
                     b.streams.incrementAndGet()
                     return FakeStream(Backend.NPU, 31, b.fail, b.hang, b.delay, b)
                 }
@@ -246,19 +240,19 @@ class AcceleratorTest {
     }
 
     private fun recognizer(acc: AcceleratorController?, cpu: TajweedEngine = CpuFake()) =
-        TajweedRecognizer.open(model, TajweedRecognizer.Options(accelerator = acc, soc = "tensor_g5", engine = { _, _, _ -> cpu }))
+        Recognizer.open(model, Recognizer.Options(accelerator = acc, soc = "tensor_g5", engine = { _, _, _ -> cpu }))
 
     /** A take of [chunks] chunks of audio at [amp] (energy for the blank rule); [between] runs after the first append. */
-    private fun take(rec: TajweedRecognizer, chunks: Int = 3, amp: Float = 0f, between: (() -> Unit)? = null): Triple<List<TajweedChunk>, TajweedHeads, TajweedResult> = runBlocking {
+    private fun take(rec: Recognizer, chunks: Int = 3, amp: Float = 0f, between: (() -> Unit)? = null): Triple<List<EngineChunk>, HeadValues, HeadValues> = runBlocking {
         val s = rec.startSession()
         val got = async { s.chunks.toList() }
         repeat(chunks) { i ->
             s.append(FloatArray(5120) { amp * (if (it % 2 == 0) 1 else -1) })
             if (i == 0) between?.invoke()
         }
-        val r = s.finishAndScore(1, 1)
+        val r = s.finish()
         val c = got.await()
-        Triple(c, TajweedHeads.concat(emptyList<TajweedHeads>()), r)
+        Triple(c, HeadValues.concat(emptyList<HeadValues>()), r)
     }
 
     private fun record(store: File, k: AcceleratorKey = key()) = AcceleratorStore(store).record(k)
@@ -290,9 +284,9 @@ class AcceleratorTest {
         assertEquals(4.0, e.speedup!!, 1e-9)
         assertEquals(1, e.attempt)
         val rec = recognizer(acc)
-        val (chunks, _, res) = take(rec)
+        val (chunks, _, _) = take(rec)
         assertTrue(chunks.all { it.backend == Backend.NPU })
-        assertEquals(Backend.NPU, res.backend)
+        assertEquals(Backend.NPU, rec.backend)
         rec.close()
     }
 
@@ -323,7 +317,7 @@ class AcceleratorTest {
             Case(Stages.WARMUP, Reasons.LOAD_ERROR) { warmup = { throw IllegalStateException("no buffers") } },
             Case(Stages.WARMUP, Reasons.HANG) { warmup = { Thread.sleep(6000) } },
             Case(Stages.GOLDEN, Reasons.CPU_MISMATCH) { golden = { GoldenRun(obs(), obs(tokens = listOf(3, 32))) } },
-            Case(Stages.GOLDEN, Reasons.GOLDEN_MISMATCH) { golden = { GoldenRun(obs(sitesOf = { emptySet() }), obs()) } },
+            Case(Stages.GOLDEN, Reasons.GOLDEN_MISMATCH) { golden = { GoldenRun(obs(tokens = listOf(3, 32)), obs()) } },
             Case(Stages.GOLDEN, Reasons.NON_FINITE) { golden = { GoldenRun(obs(finite = false), obs()) } },
             Case(Stages.GOLDEN, Reasons.HANG) { golden = { Thread.sleep(6000); GoldenRun(obs(), obs()) } },
         )
@@ -351,8 +345,10 @@ class AcceleratorTest {
             assertEquals("${c.stage}:${AcceleratorIncident.cause(c.reason)}", e.incident!!.code)
             assertEquals(AcceleratorIncident.PROMOTION_FAILED, e.incident!!.kind)
             if (c.reason == Reasons.GOLDEN_MISMATCH) {
-                assertEquals(SelfTestSet.PLANTED_CLIP, e.incident!!.clip)
-                assertEquals(1, e.incident!!.divergence!!.sitesDiffer.coerceAtLeast(e.incident!!.divergence!!.tokensDiffer).coerceAtMost(1))
+                // the first clean clip whose tokens differ (a planted clip's tokens are not compared)
+                assertEquals(clips.first(), e.incident!!.clip)
+                assertEquals(1, e.incident!!.divergence!!.tokensDiffer.coerceAtMost(1))
+                assertEquals(listOf("log_probs.token_edits"), e.incident!!.divergence!!.failed)
             }
             // nothing else is scheduled in this launch
             env.now += 48 * 3_600_000L
@@ -363,17 +359,12 @@ class AcceleratorTest {
 
     @Test
     fun theFiveGoldenClipsAreRequiredThePlantedOneIncluded() {
-        val partial = SelfTestSet.Expected("c16_l64", "x", "balanced", "general", expected.clips - SelfTestSet.PLANTED_CLIP)
+        val partial = SelfTestSet.Expected("c16_l64", expected.clips - SelfTestSet.PLANTED_CLIP)
         val v = SelfTestSet.judgeGolden(partial, obs(), obs(), setOf(SelfTestSet.PLANTED_CLIP))
         assertEquals(Reasons.CPU_MISMATCH, v.reason)
         assertTrue(v.detail, v.detail.contains("missing_clip"))
         assertEquals(5, SelfTestSet.REQUIRED.size)
         assertTrue(SelfTestSet.PLANTED_CLIP in SelfTestSet.REQUIRED)
-        // and a missed planted flag is a golden mismatch on that clip
-        val missed = SelfTestSet.judgeGolden(expected, obs(), obs(sitesOf = { emptySet() }), setOf(SelfTestSet.PLANTED_CLIP))
-        assertEquals(Reasons.GOLDEN_MISMATCH, missed.reason)
-        assertEquals(SelfTestSet.PLANTED_CLIP, missed.clip)
-        assertEquals(1, missed.divergence!!.sitesDiffer)
     }
 
     // ------------------------------------------------------------------------------------------------- restarts
@@ -889,13 +880,13 @@ class AcceleratorTest {
         val streams = AtomicInteger(0)
         val releases = AtomicInteger(0)
         val threads: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
-        override fun createStream(): TajweedEngineStream = createStream(TajweedHead.SCORER_HEADS)
-        override fun createStream(heads: Set<TajweedHead>): TajweedEngineStream {
+        override fun createStream(): TajweedEngineStream = createStream(HeadId.BASE_HEADS)
+        override fun createStream(heads: Set<HeadId>): TajweedEngineStream {
             warm = true
             streams.incrementAndGet()
             val inner = FakeStream(Backend.CPU, tok, if (blankFrom == Int.MAX_VALUE) null else Fail("blank", blankFrom))
             return object : TajweedEngineStream by inner {
-                override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<TajweedHeads> {
+                override fun pushAudio(samples: FloatArray, offset: Int, length: Int): List<HeadValues> {
                     threads.add(Thread.currentThread().name)
                     if (pushMs > 0) Thread.sleep(pushMs)
                     return inner.pushAudio(samples, offset, length)
@@ -903,9 +894,6 @@ class AcceleratorTest {
             }
         }
         override fun release(): Boolean { releases.incrementAndGet(); warm = false; return true }
-        override fun score(heads: TajweedHeads, config: TajweedConfig, settings: ResolvedTajweedSettings, surah: Int, ayah: Int) =
-            CpuFake().score(heads, config, settings, surah, ayah)
-        override fun expectedTokens(surah: Int, ayah: Int) = intArrayOf(31)
         override fun close() {}
     }
 
@@ -994,7 +982,7 @@ class AcceleratorTest {
         val store = dir()
         val (acc, b) = promoted(Fail("blank", 2), store, env)
         val rec = recognizer(acc)
-        fun blankTake(): Pair<List<TajweedChunk>, TajweedHeads> {
+        fun blankTake(): Pair<List<EngineChunk>, HeadValues> {
             val s = rec.startSession()
             return runBlocking {
                 val g = async { s.chunks.toList() }
@@ -1100,7 +1088,7 @@ class AcceleratorTest {
      *  over more than 24 h, demote nothing. */
     @Test
     fun missesInThreeSessionsWithinADayPauseTheKeyNeverOffForGood() {
-        fun missingTake(rec: TajweedRecognizer) {
+        fun missingTake(rec: Recognizer) {
             failovers.clear()
             val (chunks, _, _) = take(rec, chunks = 6, amp = 0.1f)
             assertEquals(Failover.DEADLINE, failovers.single().failover.cause)
@@ -1168,7 +1156,7 @@ class AcceleratorTest {
     }
 
     private fun obsTimes(ms: List<Double>) = clips.associateWith {
-        SelfTestSet.ClipObserved(4, listOf(3, 32, 13), expected.clips.getValue(it).flaggedSites, expected.clips.getValue(it).flaggedWords, true, ms)
+        SelfTestSet.ClipObserved(4, TestKit.headsOf(listOf(3, 32, 13)), ms)
     }
 
     /** The limits come from warm chunks only: neither the golden run's first chunks nor a slow first chunk of a take
