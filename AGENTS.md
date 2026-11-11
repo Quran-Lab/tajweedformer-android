@@ -107,6 +107,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:2.0.2") }
 ```
 
+Maven Central serves 2.0.2 today. 2.0.3 is tagged in this repository and follows there; the quick start below is the same for both.
+
 ## Before you start
 
 | | |
@@ -265,6 +267,10 @@ cumulative FNV-1a of log_probs and the FNV-1a of all 12 outputs of every chunk (
 outputs) with the engine's `v4_c16_l64_audio_expected.jsonl`: 35 of 35 on the desktop JVM, and
 35 of 35 on the Alcatel 1, armeabi-v7a, Android 11 (`DeviceEndToEndTest`, after a ModelStore download over adb reverse with a cut and a Range resume). The 1.x history (v3.2 and v3.1 passes) is in
 docs/engineering-notes.md.
+
+The JVM's verifier does not have Android's rule about monitors, so unit tests cannot see a class that every phone
+refuses to load: `scripts/check_monitor_handlers.py` applies that rule to every class of the AAR, in CI and before
+every upload, and is what stands between a change and a crash at launch on every phone.
 
 ## Performance
 

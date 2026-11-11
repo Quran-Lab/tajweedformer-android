@@ -40,8 +40,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools
-        run: sudo apt-get install -y ninja-build
+      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
+        run: |
+          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
       - name: JVM tests with the engine (V4; the model-dependent ones skip without the model)
         run: |
           ./gradlew --no-daemon :tajweedformer-jvm:test -Pnative \
@@ -51,6 +52,12 @@ jobs:
             --tests 'ai.quranlab.tajweedformer.LayersTest'
       - name: AAR (arm64-v8a, armeabi-v7a)
         run: ./gradlew --no-daemon :tajweedformer:assembleRelease
+      - name: Android's verifier rule on monitors, on every class of the AAR (first the proof that the check still rejects the class 2.0.2 shipped)
+        run: |
+          python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
+          python3 scripts/check_monitor_handlers.py tajweedformer/build/outputs/aar/*.aar
+      - name: The sample app as a release build shrunk with R8 and no rule of its own (the AAR's consumer rules must be enough)
+        run: ./gradlew --no-daemon :samples:quickstart:assembleRelease
       - uses: actions/upload-artifact@v4
         with:
           name: aar

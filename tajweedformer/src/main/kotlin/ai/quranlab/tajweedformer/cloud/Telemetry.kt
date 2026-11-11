@@ -205,7 +205,16 @@ class Telemetry(
         persist(force = true)
     }
 
-    private inline fun rec(body: (DayAggregate) -> Unit) {
+    /**
+     * Runs [body] on today's sums, under the lock. Telemetry never disturbs recognition: whatever it throws is dropped.
+     *
+     * A plain function, never `inline`: the copy Kotlin keeps of an inline function's own body puts a call between the
+     * end of the lock's catch-all range and its `monitorexit`, inside this `try`. Android's verifier rejects a class
+     * with such a method (`VerifyError: ... expected to be within a catch-all for an instruction where a monitor is
+     * held`), and the app dies when Quran Lab is configured. SDK 2.0.0 to 2.0.2 shipped it.
+     * scripts/check_monitor_handlers.py fails the build on any method of that shape.
+     */
+    private fun rec(body: (DayAggregate) -> Unit) {
         if (!enabled) return
         try {
             synchronized(lock) {

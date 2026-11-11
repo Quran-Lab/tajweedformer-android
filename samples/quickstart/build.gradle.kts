@@ -22,6 +22,18 @@ android {
         }
     }
 
+    buildTypes {
+        // The release build shrinks, as an app that ships does: R8 with the default rules and no rule of this app's
+        // own. It builds only because the SDK's AAR brings every rule it needs (tajweedformer/consumer-rules.pro).
+        // CI assembles it (:samples:quickstart:assembleRelease), so a missing rule fails the build there. Signed
+        // with the debug key: it is never published.
+        release {
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

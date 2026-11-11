@@ -31,8 +31,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools
-        run: sudo apt-get install -y ninja-build
+      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
+        run: |
+          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
       - name: JVM tests (no engine)
         run: ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
       - name: JVM tests with the engine (V4; the model-dependent ones skip without the model)
@@ -49,6 +50,12 @@ jobs:
           [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
           ./gradlew --no-daemon :tajweedformer:centralBundle
           unzip -l tajweedformer/build/distributions/central-bundle-*.zip
+      - name: Android's verifier rule on monitors, on the AAR inside the bundle (nothing is uploaded when a class would be rejected on a phone)
+        run: |
+          python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
+          rm -rf build/monitor-check && mkdir -p build/monitor-check
+          unzip -o -q tajweedformer/build/distributions/central-bundle-*.zip '*.aar' -d build/monitor-check
+          python3 scripts/check_monitor_handlers.py build/monitor-check
       - name: Upload to the Central Portal (USER_MANAGED) and wait for validation
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}

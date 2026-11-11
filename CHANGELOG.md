@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.0.3
+
+Two fixes, so that an app on 2.0.x hits neither. Update to 2.0.3: 2.0.0, 2.0.1 and 2.0.2 crash an app at launch
+when the app does not shrink its code, and stop its build when it does.
+
+- The SDK crashed the app at its first call (`QuranLabAndroid.configure`) with
+  `java.lang.VerifyError: Verifier rejected class ai.quranlab.tajweedformer.cloud.Telemetry ... expected to be within
+  a catch-all for an instruction where a monitor is held`. Every Android version is affected (the verifier has had
+  this rule in every release), in every debug build and in a release build that does not shrink its code. A release
+  build that shrinks with R8 drops the method, because nothing calls it, and starts: that is how the fault stayed
+  unseen. No call has to change.
+- The cause was one private `inline` function with `synchronized` inside `try/catch`. The copy Kotlin keeps of such
+  a function is bytecode the JVM accepts and Android refuses, so no unit test on the JVM could see it. It is a plain
+  function now.
+- `scripts/check_monitor_handlers.py` applies Android's rule to every class of the AAR and fails the build on a
+  method Android would refuse. It runs in CI and before every upload to Maven Central, and CI first proves that it
+  still rejects the class 2.0.2 shipped (`scripts/testdata/Telemetry-2.0.2.class`).
+- An app that shrinks its code with R8 no longer needs rules of its own. Before, R8 stopped the build with
+  "Missing classes detected while running R8" for ten classes of optional libraries the SDK refers to (Play
+  Integrity and the Google Play services tasks API) until the app added `-dontwarn` lines itself. The AAR's
+  consumer rules now carry exactly those ten lines, and no keep rule:
+  `com.google.android.gms.tasks.Task`, `com.google.android.gms.tasks.Tasks`,
+  `com.google.android.play.core.integrity.IntegrityManagerFactory`,
+  `com.google.android.play.core.integrity.StandardIntegrityManager` and its nested classes
+  `PrepareIntegrityTokenRequest`, `PrepareIntegrityTokenRequest$Builder`, `StandardIntegrityToken`,
+  `StandardIntegrityTokenProvider`, `StandardIntegrityTokenRequest`, `StandardIntegrityTokenRequest$Builder`.
+  CI builds the sample app as a release build with R8 and no rule of its own, so the rules cannot go stale.
+- Nothing else changed in 2.0.3.
+
 ## 2.0.2
 
 The in-session failover no longer punishes a healthy accelerator (a developer measured two 2.0.1 rules firing on
