@@ -168,7 +168,7 @@ class ReferenceTableTest : OpenChecked() {
     @Test
     fun everyAyahOfAFolderThatHasTheTable() = runBlocking {
         withTimeout(300_000) {
-            val model = TajweedModel.open(local.fullDecoded, ModelHost(verifier = ManifestVerifier(listOf(local.key)))).also { models.add(it) }
+            val model = TajweedModel.openVerifiedFolder(local.fullDecoded, ModelHost(verifier = ManifestVerifier(listOf(local.key)))).also { models.add(it) }
             assertEquals(local.build, model.build)
             val reference = model.reference!!
             assertTrue(reference.isDownloaded)
@@ -234,7 +234,7 @@ class ReferenceTableTest : OpenChecked() {
     @Test
     fun aBuildWithoutTheTableHasNoReference() = runBlocking {
         withTimeout(120_000) {
-            val model = TajweedModel.open(local.bareDecoded, ModelHost(verifier = ManifestVerifier(listOf(local.key)))).also { models.add(it) }
+            val model = TajweedModel.openVerifiedFolder(local.bareDecoded, ModelHost(verifier = ManifestVerifier(listOf(local.key)))).also { models.add(it) }
             assertNull(model.reference)
             assertTrue("the bare build has reference data in its manifest", model.folder.manifest.files.none { it.role == "reference" })
         }

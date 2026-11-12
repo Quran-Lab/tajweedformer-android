@@ -78,9 +78,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.0.1` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.0.1"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.0"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.0.1 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.0 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -100,6 +100,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:3.0.1") }
 ```
 
+Maven Central serves 3.0.1 today. 3.1.0 follows there once it is released; the quick start below is the same for both.
+
 ## Before you start
 
 | | |
@@ -108,7 +110,8 @@ dependencies { implementation("ai.quranlab:tajweedformer:3.0.1") }
 | **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. On another ABI the SDK fails with `runtime_unsupported`. An app that does not ship to Chromebooks keeps `x86_64` out of its release build with one `abiFilters` line. |
 | **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
 | **Download** | The first run downloads the model: 56.5 MB, once (73.5 MB on disk), on any network. `client.prefetch()` does it before the learner taps, and `prefetch(unmeteredOnly = true)` waits for Wi-Fi. A phone with a supported NPU fetches its build later, on an unmetered network only. |
-| **Sharing** | Recognition needs nothing more. If Quran Lab offers recording sharing to your app, uploads need Play Integrity: add `com.google.android.play:integrity` and put Quran Lab's project number in your manifest. |
+| **Model** | A model comes only from Quran Lab's server, through the Client: the SDK opens only a model it downloaded itself on this device. An app that updates from an SDK before 3.1.0 downloads the model once more. |
+| **Play Integrity** | Since 3.1.0 the SDK depends on Google's Play Integrity library (`com.google.android.play:integrity`; with the ten libraries it brings it adds 33,594 bytes to the example app's release APK shrunk with R8, and 34,420 bytes to its debug APK). Quran Lab can ask for proof that a model download or a shared recording comes from your app as Google Play delivered it, on a real device; the SDK asks Play only when Quran Lab's signed config says so, and continues without it where Play services are missing. You add and set nothing. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
 | **Takes** | A Model runs one take (one Session) at a time; a take holds at most 20 minutes of audio. |
 
@@ -238,7 +241,20 @@ error `client_exists`). Options are always last and optional:
   device and whether it verified, the context, the backend and its stage, the microphone permission, storage, the
   last error, the chunks dropped for a collector that did not read, and the connection (`unmetered`, `metered`,
   `none`, or `unknown` on the desktop JVM). It never throws and works offline.
-- `TajweedModel.open(folder)` opens a verified model folder the app ships or keeps itself, with no Client.
+- A model comes only from Quran Lab's server, through the Client (`client.model()`, `client.prefetch()`). There is
+  no call that opens a model folder the app ships or keeps itself: the model is Quran Lab's to deliver, verify and
+  update, and an app that carries its own copy cannot be told of a newer or a withdrawn build.
+- When Quran Lab refuses the key or the app (a revoked key, a paused or blocked app), the SDK stops running the
+  model and removes the downloaded model from the device. Once the key is accepted again the model is downloaded
+  again. The refusals that do it: a revoked or unknown key,
+  `app_not_allowed`, `origin_not_allowed`, `key_type_mismatch`, `app_blocked`, `developer_not_approved`.
+  `client.model()` and `prefetch` fail with that refusal (`invalid_key`, or `server_rejected` with its message and
+  fix), also at the next start without a network, until a later answer of the server accepts the key. The SDK
+  removes every model build it holds (what `removeModels()` removes) in the call that received the refusal; a file
+  the system does not let go of then is removed when the open Model is closed, or at the next start. A missing
+  connection, a server error and every other answer never stop or remove a model. A Model that is already open keeps
+  running until the app closes it. What the SDK cannot remove: a cache that a phone maker's accelerator runtime keeps
+  by itself of a program the SDK loaded into it.
 
 ### Without a microphone
 
@@ -268,6 +284,33 @@ this phone's accelerator build when there is one, and the reference data only wh
 then moved into place atomically; any mismatch deletes it. Models are kept by build under
 `<storage>/models/<model id>/<build>/`, so a new version never overwrites the one in use, and an app that goes
 offline keeps working with the last verified build.
+
+Every request for the model (its manifest, each file, each resumed range) carries the app key (`x-qlab-key`) and
+the install's token (`authorization: Bearer ...`), the token the SDK already uses for its other calls to Quran Lab;
+it never follows a redirect. Where Quran Lab's signed config asks for it, the token is attested with Play Integrity
+(see "Play Integrity" below). A refusal of the model request has its own message and fix under `server_rejected`
+(`model_attestation_required`, `model_not_allowed`), and Quran Lab's daily limit for model downloads is
+`download_failed` and is not retried in a loop.
+
+**The Client opens only a model it downloaded itself.** When it starts downloading a build it keeps an install
+record for it, bound to this device, and completes the record when every file is verified. A build folder in the
+SDK's storage without a valid record (shipped in the app and copied into place, or copied from another device) is
+deleted and the model is downloaded. On Android the record's key is an HMAC key in the Android Keystore, which
+never leaves it; on the desktop JVM, which has no such store, it is derived from the machine's id and the user name
+(a machine without an id keeps a key file in the storage folder), so it is not a secret from a program that runs
+as the same user. When the key store fails (locked, unavailable), nothing is opened, deleted or downloaded and the
+call fails with `storage_failed`. **An app that updates from an earlier SDK downloads the model once more**, because
+the model it holds has no record; without a connection at that first start `client.model()` fails with
+`needs_connection`.
+
+### Play Integrity
+
+Since 3.1.0 the SDK depends on Google's Play Integrity library (`com.google.android.play:integrity`), so an app
+gets it through the SDK. Why: Quran Lab can ask, before it sends the model or takes a shared recording, for proof
+that the request comes from the app as Google Play delivered it, on a real device. The SDK asks Play for an
+integrity token only when Quran Lab's signed config gives it Quran Lab's Cloud project number for that; without it
+the SDK asks Play for nothing and its token is unattested, as before. Where Play services are missing or Play
+cannot answer, the SDK continues unattested. The app sets nothing: there is no manifest entry for it any more.
 
 ### CPU first, then the accelerator
 
@@ -307,6 +350,11 @@ learner taps "Share" on the consent sheet, and a learner who never answers never
 each recitation the SDK listens to is uploaded in the background as Opus in one Ogg stream, from a queue on disk
 that survives process death and reboots.
 
+No human ever listens to a shared recording: only software learns from them. The sheet and "What is shared" say
+so in every language (copy deck `2026-11-12.1`, consent version `share-2026-11-12`). A learner who said yes under
+an earlier wording keeps that yes and the version they agreed to, and is not asked again. An app that words
+`sheet.who` or `what.detail` itself (`setWording`) keeps that sentence's meaning in its words.
+
 - `client.sharing` (`TajweedSharing`): `isAvailable`, `isOn`, `setOn(false)` (ends the upload in progress and deletes the
   unsent queue; what the system had already taken of the segment being sent may still go out), `ask()` (shows the sheet at the app's moment; it counts as one of the three showings an install
   ever gets), `items`, `summary()`, `delete()` (deletes what this install shared), `recoveryCode`, and
@@ -320,9 +368,8 @@ that survives process death and reboots.
   sampleRate)`) so that a recording keeps the half second before a take starts and the half second after it ends;
   the SDK keeps at most one second of fed audio in memory, only while sharing is on, and drops it when the app
   goes to the background, when sharing goes off and on delete.
-- Uploads need Play Integrity on Android: add `com.google.android.play:integrity` and put Quran Lab's project
-  number in the manifest (`<meta-data android:name="ai.quranlab.tajweedformer.PLAY_INTEGRITY_PROJECT"
-  android:value="..."/>`).
+- Uploads at Quran Lab's `attested` tier need an attested token: the SDK asks Play Integrity for it when Quran Lab's
+  signed config gives the project number (see "Play Integrity"). The app adds nothing.
 
 ### Telemetry
 
@@ -350,7 +397,7 @@ What an app that uses the SDK sends to Quran Lab, for the app's data-safety form
 | Usage statistics: daily sums and histograms (takes, seconds, model version, backend, device class, chip, OS major, RAM tier, the app's own reported counts) | App activity, App info and performance (diagnostics) | Yes, unless the app turns analytics off | The app decides (`Analytics.OFF`); no prompt is needed | No: no identifier of the device, the install or the user; no time finer than the day | Analytics |
 | Issue reports: an error's kind and code, SDK and app version, OS version, device model and chip for accelerator incidents | App info and performance (diagnostics, crash logs) | Yes, when a failure happens | No | No | Diagnostics |
 | Recitation audio (voice recordings) with the take's sample rate, input route, model version and backend | Audio (voice or sound recordings) | Only after the learner agrees on the consent sheet | Yes: the learner can decline, stop and delete at any time | A random contributor id made for sharing, of which Quran Lab stores only a keyed hash; no account, name or contact | Improving Quran Lab's models |
-| Play Integrity verdict | App info and performance (other) | Only while sharing is on | With sharing | No | Fraud prevention (uploads come from a genuine install) |
+| Play Integrity verdict | App info and performance (other) | Only when Quran Lab's signed config asks for it: for the model download, and while sharing is on | No | No | Fraud prevention (the model and uploads go to a genuine install) |
 
 Everything is sent over HTTPS. No data is sold, and none is passed on to anyone else. Location, contacts, messages,
 photos, files and advertising ids are never read. A learner deletes what they shared in the app (`SharingSettingsView`)
@@ -495,7 +542,7 @@ engine/                     tajweedformer-engine, pinned
 
 3.0.0 is inference only: the scorer, the tajweed settings and the verdict types of 2.x are gone, and the
 public API is the five concepts above with the same names on every platform ([docs/api.md](docs/api.md) lists it).
-See [CHANGELOG.md](CHANGELOG.md).
+In 3.1.0 a model comes only from Quran Lab's server, through the Client. See [CHANGELOG.md](CHANGELOG.md).
 
 What is proven where: the shared vectors of SDK 3.0, the Client against a stub server and the sharing rules run on
 every push in CI without a model; the engine through JNI builds and runs there too. No public runner has a model,
@@ -505,6 +552,10 @@ emulator (`scripts/emulator_proof.py`). The release gate is `scripts/phone_gate.
 the AAR as a file, on an attached phone with a development key; it must start, download and verify the model, give
 the model build's expected tokens on every sample clip, and leave `diagnose()` and the phone's own verifier with
 nothing to say. Not run yet with 3.0: the 35 conformance clips on a phone, and an accelerator inside an app.
+3.1.0's rules (the install record, the refusals that stop and remove a model, the token on model requests) run in CI
+against the stub servers with stand-ins for the key store and for Play. The Android Keystore's key of the install
+record ran on a phone, an Alcatel 1 with Android 11 (`InstallKeyDeviceTest`, not run by CI); the Play Integrity call
+did not run on a device.
 
 ## Download size
 

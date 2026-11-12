@@ -166,6 +166,12 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
          * 0 to 10000; absent or anything else 3000; 0 never joins takes.
          */
         val shareJoinMs: Int = ai.quranlab.tajweedformer.sharing.TakeJoin.DEFAULT_WINDOW_MS,
+        /**
+         * `play_integrity_project_number` (SDK 3.1.0, SPEC 15.4): Quran Lab's Google Cloud project number for Play
+         * Integrity, a string of decimal digits. Absent or anything else: null, and the SDK asks Play for no integrity
+         * token at all.
+         */
+        val playIntegrityProjectNumber: Long? = null,
     ) {
         /** The tier for a platform: the flag, else the documented default (`attested` for android). */
         fun trust(platform: String): String = uploadTrust[platform] ?: when (platform) {
@@ -174,6 +180,9 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
         }
 
         companion object {
+            /** A project number: decimal digits (Google's are 12; a Long holds 18). */
+            private val DIGITS = Regex("^[0-9]{1,18}$")
+
             @Suppress("UNCHECKED_CAST")
             fun parse(v: Any?): Flags {
                 val m = v as? Map<String, Any?> ?: return Flags()
@@ -187,6 +196,7 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
                     uploadTrust = trust,
                     cappedLimits = m["capped_limits"] as? Map<String, Any?> ?: emptyMap(),
                     shareJoinMs = ai.quranlab.tajweedformer.sharing.TakeJoin.window(m["share_join_ms"]),
+                    playIntegrityProjectNumber = (m[ModelGate.PLAY_INTEGRITY_FLAG] as? String)?.takeIf { DIGITS.matches(it) }?.toLongOrNull(),
                 )
             }
         }

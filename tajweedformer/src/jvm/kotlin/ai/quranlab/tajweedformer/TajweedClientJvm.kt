@@ -34,5 +34,7 @@ public fun TajweedClient(key: String, storage: File, options: TajweedClientOptio
         contributorKeys = FileContributorKeyStore(File(dir, "keys")),
         secretBox = PlainSecretBox,
     )
-    return TajweedClient(key, options, ClientPlatform(cloud = env))
+    // the install records' key: derived from the machine id and the user name; a machine without an id keeps a key
+    // file in the storage folder (SPEC 15.2)
+    return TajweedClient(key, options, ClientPlatform(cloud = env, installKeys = MachineInstallKey(File(File(dir, "cloud"), "install.key"))))
 }

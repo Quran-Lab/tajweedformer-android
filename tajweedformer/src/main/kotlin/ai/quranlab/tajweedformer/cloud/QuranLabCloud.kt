@@ -27,11 +27,6 @@ internal data class CloudOptions @JvmOverloads constructor(
      * bitrate, less where uploads struggle: the bitrate steps down to 32 kbit/s, about 16 MB an hour).
      */
     val uploadsOnUnmeteredOnly: Boolean = false,
-    /**
-     * Quran Lab's Google Cloud project number for Play Integrity (attested uploads). Null: Play
-     * Integrity is not used and sharing uploads only where the server allows unattested installs.
-     */
-    val playIntegrityCloudProjectNumber: Long? = null,
     val apiUrl: String = QuranLabApi.DEFAULT_API,
     /** The Ed25519 keys the signed config may be signed with (raw 32 bytes). */
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
@@ -100,10 +95,21 @@ internal interface CloudScheduler {
  */
 internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironment) : TajweedObserver {
     val key: QuranLabKey? = QuranLabKey.parse(options.key)
-    val api = QuranLabApi(options.apiUrl, env.http)
     private val cloudDir = File(env.storage, "cloud")
+
+    /** The refusal that stops a model on this device, remembered across launches (SPEC 15.3). */
+    val refusals = Refusals(cloudDir)
+
+    /** Every API answer: one whose body carries a stop reason is remembered as a refusal of the API. */
+    val api = QuranLabApi(options.apiUrl, env.http) { r ->
+        if (!r.ok) r.error.reason?.let { if (ModelGate.stops(it)) refusals.stop(it, Refusals.API) }
+    }
     val config = ConfigStore(cloudDir, options.trustedKeys, env.clock)
-    val tokens: TokenProvider? = key?.let { TokenProvider(api, it, env.app, cloudDir, env.integrity, env.clock) }
+    val tokens: TokenProvider? = key?.let {
+        TokenProvider(api, it, env.app, cloudDir, env.integrity, env.clock,
+            projectNumber = { currentConfig?.flags?.playIntegrityProjectNumber },
+            issued = { refusals.apiAccepted(freshConfig = false) })
+    }
     val telemetry = Telemetry(File(env.storage, "telemetry"), env.clock)
     val issues = IssueQueue(cloudDir, env.clock)
     val sharing = Sharing(this)
@@ -178,16 +184,54 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         return false
     }
 
-    /** A call with the token, a new token once after 401 `invalid_token`. */
+    /** A call with the token, a new token once after 401 `invalid_token` (never when it carries a stop reason: the key
+     *  was revoked after the token was issued, SPEC 15.3). */
     private fun <T> authed(route: String, body: (String) -> T): T {
         val t = tokens ?: throw CloudException(ApiError(401, "unauthorized"), "no key")
         if (stopped.get()) throw CloudException(ApiError(403, stopReason ?: "stopped"), "network stopped this launch")
         return try {
             body(t.token().token)
         } catch (e: CloudException) {
-            if (e.api?.action != ErrorAction.RENEW_TOKEN) { refused(e, route); throw e }
+            if (e.api?.action != ErrorAction.RENEW_TOKEN || ModelGate.stops(e.api.reason)) { refused(e, route); throw e }
             t.invalidate()
             try { body(t.token().token) } catch (e2: CloudException) { refused(e2, route); throw e2 }
+        }
+    }
+
+    /**
+     * The token of a model request (SPEC 15.4): attested where the signed config gives Quran Lab's Play Integrity
+     * project number and the platform has Play Integrity, unattested otherwise and whenever attestation fails (the
+     * rules of PLATFORM_CLIENT.md section 2). While the network is stopped for this launch only a fresh cached token
+     * is used. Throws the catalogue error of a refusal (a stop reason's when the answer carries one), or
+     * `download_failed` with the IOException as its cause when there is no connection.
+     */
+    fun modelToken(): String {
+        val t = tokens ?: throw ai.quranlab.tajweedformer.RecognizerException.InvalidKey()
+        if (stopped.get()) {
+            t.cachedFresh()?.let { return it.token }
+            throw refusals.current?.let { ModelGate.error(it.reason, env.app.bundleId) }
+                ?: ai.quranlab.tajweedformer.TajweedError.ofServerCode(stopReason, sdkRequired, refused = true, appId = env.app.bundleId)
+                ?: ai.quranlab.tajweedformer.RecognizerException.InvalidKey()
+        }
+        return try {
+            if (t.canAttest()) {
+                try {
+                    return t.token(attested = true).token
+                } catch (e: CloudException) {
+                    // no attested token can be had: continue unattested
+                    if (e.api?.code != "attestation_required") throw e
+                }
+            }
+            t.token(attested = false).token
+        } catch (e: CloudException) {
+            refused(e, "attest")
+            val a = e.api
+            throw when {
+                a == null -> ai.quranlab.tajweedformer.RecognizerException.DownloadFailed(ai.quranlab.tajweedformer.ModelManifest.FILE_NAME,
+                    "network: ${e.message}", e.cause as? java.io.IOException ?: java.io.IOException(e.message))
+                ModelGate.stops(a.reason) -> ModelGate.error(a.reason!!, env.app.bundleId)
+                else -> ai.quranlab.tajweedformer.TajweedError.ofCloud(e)
+            }
         }
     }
 
@@ -268,6 +312,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         val newInstall = pendingNew.exists()
         return try {
             authed("register") { api.register(Credential.Token(it), env.app, modelRevision, newInstall) }
+            refusals.apiAccepted(freshConfig = false)
             pendingNew.delete()
             try { registerDay.writeText(today) } catch (_: Exception) {}
             true
@@ -287,6 +332,8 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             val etag = if (pin == pinOfStored()) config.etagToSend() else null
             val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, etag, pin) }
             val c = config.apply(r)
+            // a verified config (or the server's 304 for the one in force) accepts the key
+            refusals.apiAccepted(freshConfig = true)
             rememberPin(pin)
             lastConfigError = null
             lastConfigAt = env.clock()

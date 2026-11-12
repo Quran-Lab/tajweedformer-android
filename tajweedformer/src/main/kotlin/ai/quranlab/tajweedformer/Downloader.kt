@@ -55,11 +55,77 @@ internal class HttpResponse(
 }
 
 /**
- * Headers added to every model request (the app key `x-qlab-key`, and anything the portal client
- * adds). The SDK's cloud module provides it; null means none.
+ * Headers added to every model request. The Client's is [ModelAuth] (the key and the install's token, SPEC 15.4); null
+ * means none (the device speed check app, which serves a folder of its own).
  */
 internal fun interface HeaderProvider {
     fun headers(url: String): Map<String, String>
+}
+
+/**
+ * The Client's side of a model request (SPEC 15.3, 15.4), made in one place
+ * ([ai.quranlab.tajweedformer.cloud.ModelRequestHeaders]): the headers, the token's renewal, and what an answer that is
+ * not the file means.
+ */
+internal interface ModelAuth : HeaderProvider {
+    /** Whether the answer asks for a new token (401 `invalid_token` without a stop reason): renewed once, repeated once. */
+    fun renewal(status: Int, body: ByteArray): Boolean
+
+    /** The next [headers] carries a new token. */
+    fun renew()
+
+    /** The error a request fails with for this answer (a refusal is remembered there), or null: a plain HTTP failure. */
+    fun refusal(status: Int, body: ByteArray): TajweedError?
+
+    /** The CDN served a model request. */
+    fun served()
+}
+
+/** The most of an error answer's body that is read. */
+private const val MAX_ERROR_BODY = 64 * 1024
+
+private fun readSome(input: InputStream, max: Int): ByteArray {
+    val out = java.io.ByteArrayOutputStream()
+    val buf = ByteArray(8192)
+    while (out.size() < max) {
+        val n = input.read(buf, 0, minOf(buf.size, max - out.size()))
+        if (n < 0) break
+        out.write(buf, 0, n)
+    }
+    return out.toByteArray()
+}
+
+/**
+ * One request for a model's file ([path] inside the build's folder, at [url]): the provider's headers and [extra]. An
+ * answer whose status is in [ok] is returned (the caller closes it). Otherwise, with a [ModelAuth]: a 401
+ * `invalid_token` renews the token once and repeats the request once; a refusal is the provider's error; anything else
+ * is `download_failed` with the status. No connection is `download_failed` with the IOException as its cause.
+ */
+internal fun modelRequest(transport: HttpTransport, url: String, path: String, extra: Map<String, String>, headers: HeaderProvider?, ok: Set<Int>): HttpResponse {
+    val auth = headers as? ModelAuth
+    var renewed = false
+    while (true) {
+        val h = HashMap<String, String>()
+        headers?.headers(url)?.let { h.putAll(it) }
+        h.putAll(extra)
+        val r = try {
+            permitted { transport.get(url, h) }
+        } catch (x: IOException) {
+            throw RecognizerException.DownloadFailed(path, "network: ${x.message}", x)
+        }
+        if (r.code in ok) {
+            auth?.served()
+            return r
+        }
+        val body = try { readSome(r.body, MAX_ERROR_BODY) } catch (_: IOException) { ByteArray(0) } finally { r.close() }
+        if (auth != null && !renewed && auth.renewal(r.code, body)) {
+            auth.renew()
+            renewed = true
+            continue
+        }
+        auth?.refusal(r.code, body)?.let { throw it }
+        throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}")
+    }
 }
 
 /** Whether the device is on an unmetered network now. Android: [ai.quranlab.tajweedformer.android.AndroidNetwork]. */
@@ -85,7 +151,8 @@ internal fun interface NetworkPolicy {
     }
 }
 
-/** `HttpURLConnection`, no redirects across protocols, 15 s connect and 30 s read timeouts. */
+/** `HttpURLConnection`, never following a redirect (a model request never leaves the host it was made to, SPEC 15.4),
+ *  15 s connect and 30 s read timeouts. */
 internal class UrlConnectionTransport @JvmOverloads constructor(
     private val connectTimeoutMs: Int = 15_000,
     private val readTimeoutMs: Int = 30_000,
@@ -94,7 +161,7 @@ internal class UrlConnectionTransport @JvmOverloads constructor(
         val c = URL(url).openConnection() as HttpURLConnection
         c.connectTimeout = connectTimeoutMs
         c.readTimeout = readTimeoutMs
-        c.instanceFollowRedirects = true
+        c.instanceFollowRedirects = false
         for ((k, v) in headers) c.setRequestProperty(k, v)
         val code = c.responseCode
         val h = HashMap<String, String>()
@@ -184,8 +251,9 @@ internal class ModelDownloader @JvmOverloads constructor(
             if (isInPlace(e)) return DownloadResult(e.path, e.role, 0, e.size, 0, true, revision = revision)
             val result = try {
                 download(e, cancel, onProgress, t0).copy(revision = revision)
-            } catch (x: RecognizerException.DownloadFailed) {
-                val r = DownloadResult(e.path, e.role, 0, e.size, 0, false, x.reason, (System.nanoTime() - t0) / 1_000_000, revision)
+            } catch (x: TajweedError) {
+                val why = (x as? RecognizerException.DownloadFailed)?.reason ?: x.code
+                val r = DownloadResult(e.path, e.role, 0, e.size, 0, false, why, (System.nanoTime() - t0) / 1_000_000, revision)
                 SdkEvents.emit { it.onDownloadFinished(r) }
                 throw x
             }
@@ -211,17 +279,12 @@ internal class ModelDownloader @JvmOverloads constructor(
         var network = 0L
         if (start < e.size) {
             val h = HashMap<String, String>()
-            headers?.headers(baseUrl + e.path)?.let { h.putAll(it) }
             h["Accept-Encoding"] = "identity"
             if (start > 0) {
                 h["Range"] = "bytes=$start-"
                 h["If-Range"] = validator.readText().trim()
             }
-            val r = try {
-                permitted { transport.get(baseUrl + e.path, h) }
-            } catch (x: IOException) {
-                fail(e, "network: ${x.message}", x)
-            }
+            val r = modelRequest(transport, baseUrl + e.path, e.path, h, headers, setOf(200, 206, 416))
             r.use { resp ->
                 val append = when (resp.code) {
                     206 -> {

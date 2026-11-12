@@ -91,6 +91,8 @@ public class TajweedReference internal constructor(
         } catch (e: Exception) {
             // the system does not let the app use the network: that, not a missing file, is what to fix
             if (e.cause is NetworkNotPermitted) throw RecognizerException.NetworkNotPermitted(e)
+            // Quran Lab refused the key or the app (SPEC 15.3, 15.4): that refusal, with its fix
+            if (e is TajweedError && (e.code == "invalid_key" || e.code == "server_rejected")) throw e
             throw RecognizerException.ReferenceMissing(e)
         }
     }

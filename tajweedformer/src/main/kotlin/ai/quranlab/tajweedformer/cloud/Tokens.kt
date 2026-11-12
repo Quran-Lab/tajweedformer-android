@@ -5,18 +5,19 @@ import java.io.File
 /**
  * Play Integrity for the attested token (PLATFORM_CLIENT.md section 2): given the request hash
  * (base64url SHA-256 of the server's challenge, 43 characters), a STANDARD integrity token request
- * with Quran Lab's Cloud project number. Blocking; throws when Play cannot answer. The Android
- * implementation is `PlayIntegrity` (it needs `com.google.android.play:integrity` in the app);
- * tests pass their own.
+ * with Quran Lab's Cloud project number, which the signed config gives (`flags.play_integrity_project_number`,
+ * SPEC 15.4). Blocking; throws when Play cannot answer. The Android implementation is `PlayIntegrity` (the AAR
+ * depends on `com.google.android.play:integrity` since 3.1.0); tests pass their own.
  */
 internal fun interface IntegrityProvider {
-    fun token(requestHash: String): String
+    fun token(requestHash: String, cloudProjectNumber: Long): String
 }
 
 /**
  * The app token: cached on disk (`<storage>/cloud/token.json`), renewed when under an hour is left
  * or on 401 `invalid_token`. An attested token (Play Integrity, `via: pi`) is asked for only when
- * [token] is called with `attested = true` (recitation sharing); a refusal pauses attestation for
+ * [token] is called with `attested = true` (recitation sharing, model requests) and the signed config gives the
+ * Cloud project number ([projectNumber]); without the number Play is never asked. A refusal pauses attestation for
  * this launch and the SDK continues unattested.
  */
 internal class TokenProvider(
@@ -26,6 +27,10 @@ internal class TokenProvider(
     dir: File,
     private val integrity: IntegrityProvider?,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** Quran Lab's Cloud project number for Play Integrity, from the signed config in force; null: none. */
+    private val projectNumber: () -> Long? = { null },
+    /** The server issued a token: it accepted the key. */
+    private val issued: () -> Unit = {},
 ) {
     private val file = File(dir, "token.json")
     private var cached: AppToken? = null
@@ -46,7 +51,12 @@ internal class TokenProvider(
     }
 
     /** True when an attested token can be had this launch (or is cached). */
-    fun canAttest(): Boolean = cached?.let { it.attested && it.fresh(clock() / 1000) } == true || (integrity != null && !attestationPaused)
+    fun canAttest(): Boolean = cached?.let { it.attested && it.fresh(clock() / 1000) } == true ||
+        (integrity != null && projectNumber() != null && !attestationPaused)
+
+    /** The cached token while it is fresh, without asking the server; null otherwise. */
+    @Synchronized
+    fun cachedFresh(): AppToken? = cached?.takeIf { it.fresh(clock() / 1000) }
 
     /** A fresh token; attested when asked (throws `attestation_required` when none can be had). */
     @Synchronized
@@ -55,6 +65,7 @@ internal class TokenProvider(
         cached?.let { if (it.fresh(now) && (!attested || it.attested)) return it }
         val t = if (attested) attestedToken() else api.attest(key, app)
         save(t)
+        try { issued() } catch (_: Exception) {}
         return t
     }
 
@@ -64,6 +75,10 @@ internal class TokenProvider(
             attestationProblem = "no_provider"
             throw CloudException(ApiError(403, "attestation_required"), "no Play Integrity provider in this app")
         }
+        val project = projectNumber() ?: run {
+            attestationProblem = "no_project"
+            throw CloudException(ApiError(403, "attestation_required"), "the signed config gives no Play Integrity project number")
+        }
         if (attestationPaused) throw CloudException(ApiError(403, "attestation_required"), "attestation paused this launch: $attestationProblem")
         var tries = 0
         while (true) {
@@ -71,7 +86,7 @@ internal class TokenProvider(
             val challenge = api.challenge(key)
             val hash = b64url(sha256(challenge.toByteArray(Charsets.UTF_8)))
             val integrityToken = try {
-                provider.token(hash)
+                provider.token(hash, project)
             } catch (e: Exception) {
                 pause("integrity_unavailable")
                 throw CloudException(ApiError(403, "attestation_required"), "Play Integrity: ${e.message}")

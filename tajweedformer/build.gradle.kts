@@ -171,8 +171,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     // the portal link: telemetry, issues and the sharing outbox run as WorkManager jobs (survive process death and reboots)
     implementation("androidx.work:work-runtime:2.9.1")
-    // Play Integrity for attested sharing uploads: compiled against, not shipped (an app that wants it adds the dependency)
-    compileOnly("com.google.android.play:integrity:1.4.0")
+    // Play Integrity (SDK 3.1.0, SPEC 15.4): a real dependency of the AAR. The SDK asks Play for an integrity token only
+    // when Quran Lab's signed config gives the Cloud project number (flags.play_integrity_project_number), for model
+    // downloads and attested sharing; without it, or where Play services are missing, the token is unattested
+    implementation("com.google.android.play:integrity:1.4.0")
 
     androidTestImplementation("androidx.test:runner:1.5.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

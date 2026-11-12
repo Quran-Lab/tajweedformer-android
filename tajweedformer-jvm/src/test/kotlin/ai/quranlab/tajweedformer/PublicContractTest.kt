@@ -87,7 +87,7 @@ class PublicContractTest : OpenChecked() {
         val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         // recorded from the contract's errors.json; the
         // copy in the SDK is never typed by hand
-        assertEquals("9d692efed682a65f5b1d2fb0afbe0df37aad790884a0cb9cf5479ca77889e631", sha)
+        assertEquals("04b264b9d820f865a0bfd4d695e17a07b2ae6b1be318324c91f3177d322cd510", sha)
         // where the contract folder is at hand (not on CI), byte for byte
         val contract = (System.getProperty("TJ_ERRORS_JSON") ?: "").let(::File)
         if (contract.isFile) assertArrayEquals("the embedded catalogue differs from ${contract.path}", contract.readBytes(), bytes)

@@ -37,7 +37,7 @@ class CloudTest : OpenChecked() {
     }
 
     private fun cloud(options: CloudOptions = CloudOptions(stub.key, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
-                      integrity: IntegrityProvider? = IntegrityProvider { stub.integrityToken(it) }) =
+                      integrity: IntegrityProvider? = IntegrityProvider { h, n -> stub.play(h, n) }) =
         QuranLabCloud(options, stub.environment(dir, integrity = integrity, clock = clock))
 
     @Test fun keyFormat() {
@@ -518,10 +518,13 @@ class CloudTest : OpenChecked() {
 
     @Test fun playIntegrityGivesAnAttestedTokenAndARefusalPausesIt() {
         val c = cloud()
+        // the project number comes from the signed config (SPEC 15.4)
+        assertNotNull(c.refreshConfig())
         val t = c.tokens!!.token(attested = true)
         assertTrue(t.attested)
         assertEquals("pi", t.via)
-        val att = stub.seen("/v1/attest").single().json!!
+        assertEquals("Play was asked with the config's project number", listOf(StubQlab.PROJECT_NUMBER.toLong()), stub.integrityAsked)
+        val att = stub.seen("/v1/attest").filter { it.json?.containsKey("integrity_token") == true }.single().json!!
         assertEquals(setOf("platform", "bundle_id", "challenge", "integrity_token"), att.keys)
         // requestHash = base64url(SHA-256(utf8(challenge))), 43 characters, no padding
         val hash = (att["integrity_token"] as String).removePrefix("pi.")
@@ -531,7 +534,8 @@ class CloudTest : OpenChecked() {
         stub.integrityRefuses = true
         val d2 = Files.createTempDirectory("tj-pi").toFile()
         val c2 = QuranLabCloud(CloudOptions(stub.key, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
-            stub.environment(d2, integrity = { stub.integrityToken(it) }, clock = clock))
+            stub.environment(d2, integrity = { h, n -> stub.play(h, n) }, clock = clock))
+        assertNotNull(c2.refreshConfig())
         try { c2.tokens!!.token(attested = true); throw AssertionError("attested after a refusal") } catch (e: CloudException) {
             assertEquals("attestation_required", e.api!!.code)
         }

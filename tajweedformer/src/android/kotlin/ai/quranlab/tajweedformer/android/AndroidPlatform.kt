@@ -14,6 +14,7 @@ import ai.quranlab.tajweedformer.cloud.CloudScheduler
 import ai.quranlab.tajweedformer.cloud.DeviceProfile
 import ai.quranlab.tajweedformer.cloud.QuranLabCloud
 import ai.quranlab.tajweedformer.cloud.android.AndroidKeystoreContributorKeys
+import ai.quranlab.tajweedformer.cloud.android.KeystoreInstallKey
 import ai.quranlab.tajweedformer.cloud.android.KeystoreSecretBox
 import ai.quranlab.tajweedformer.cloud.android.PlayIntegrity
 import ai.quranlab.tajweedformer.npu.LiteRtRunner
@@ -23,7 +24,6 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.ConnectivityManager
@@ -46,7 +46,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * What `TajweedClient(context, key)` is made of on Android: the app's identity and the device profile, the SDK's
- * private storage (`noBackupFilesDir/quranlab`), the Keystore, Play Integrity when the app ships it, the network
+ * private storage (`noBackupFilesDir/quranlab`), the Keystore, Play Integrity (when the signed config asks for it), the network
  * state, the SoC and the LiteRT runtime for the NPU, the microphone, and the process's foreground and background.
  *
  * From there everything is silent and in the background: registration once a UTC day (at the first opening of the
@@ -56,9 +56,6 @@ import java.util.concurrent.TimeUnit
  * activity and an upload queue that survives process death and reboots.
  */
 internal object AndroidPlatform {
-    /** The meta-data name of Quran Lab's Google Cloud project number for Play Integrity (attested sharing uploads). */
-    const val PLAY_INTEGRITY_PROJECT = "ai.quranlab.tajweedformer.PLAY_INTEGRITY_PROJECT"
-
     private val uploads = Executors.newSingleThreadExecutor { r -> Thread(r, "quranlab-uploads").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
     private var ticker: Handler? = null
     private var started = 0
@@ -102,6 +99,8 @@ internal object AndroidPlatform {
             lifecycle = { c -> register(app, c) },
             sheets = { sharing, request -> Handler(Looper.getMainLooper()).post { show(sharing, request) } },
             extraObserver = { cloud -> thermal(app, cloud) },
+            // the install records' key: an HMAC key in the Android Keystore (SPEC 15.2)
+            installKeys = KeystoreInstallKey(),
         )
     }
 
@@ -162,18 +161,14 @@ internal object AndroidPlatform {
             DeviceProfile.ramTier(mem.totalMem),
         )
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        // Quran Lab's Cloud project number for Play Integrity, from the app's manifest meta-data when it sets one
-        val project = try {
-            val md = pm.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA).metaData
-            md?.get(PLAY_INTEGRITY_PROJECT)?.toString()?.toLongOrNull()
-        } catch (_: Exception) { null }
         return CloudEnvironment(
             storage = storage,
             app = app,
             device = device,
             contributorKeys = AndroidKeystoreContributorKeys(context),
             secretBox = KeystoreSecretBox(),
-            integrity = PlayIntegrity.create(context, project),
+            // asked only when Quran Lab's signed config gives the Cloud project number (SPEC 15.4)
+            integrity = PlayIntegrity.create(context),
             scheduler = WorkScheduler(context),
             inputRoute = { inputRoute(context) },
             locale = { context.resources.configuration.locales[0].toLanguageTag() },

@@ -36,6 +36,9 @@ internal sealed class RecognizerException(code: String, params: Map<String, Stri
     class DownloadFailed(val path: String, val reason: String, cause: Throwable? = null) :
         RecognizerException("download_failed", mapOf("detail" to "$path ($reason)"), cause)
 
+    /** The CDN answered a model request with 429 `model_limit` (SPEC 15.4): not retried in a loop, never a refusal. */
+    class ModelLimit : RecognizerException("download_failed", mapOf("detail" to "Quran Lab's daily limit for model downloads is reached; try again later"))
+
     /** The model is not on this device and there is no connection to download it with. */
     class NeedsConnection(cause: Throwable? = null) : RecognizerException("needs_connection", cause = cause)
 

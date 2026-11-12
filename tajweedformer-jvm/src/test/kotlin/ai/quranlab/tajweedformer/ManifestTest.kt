@@ -136,7 +136,7 @@ class ManifestTest : OpenChecked() {
         }
         val files = TestKit.v4Files()
         for ((m, why) in listOf(
-            TestKit.manifest(files, minSdk = "3.1.0") to "needs SDK 3.1.0",
+            TestKit.manifest(files, minSdk = "3.2.0") to "needs SDK 3.2.0",
             TestKit.manifest(files, version = null) to "has no version",
             TestKit.manifest(files, engineFormat = 2) to "engine format 2",
         )) {
@@ -209,8 +209,8 @@ class ManifestTest : OpenChecked() {
         assertFalse(ModelManifest.versionAtLeast("0.9.9", "1.0.0"))
         assertTrue(ModelManifest.versionAtLeast("1.2.0-beta", "1.2.0"))
         assertFalse(ModelManifest.versionAtLeast("x", "1.0.0"))
-        assertTrue(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.1"))
-        assertFalse(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.2"))
+        assertTrue(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.1.0"))
+        assertFalse(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.1.1"))
     }
 
     @Test

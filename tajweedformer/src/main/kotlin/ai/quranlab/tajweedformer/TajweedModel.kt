@@ -10,7 +10,7 @@ import java.io.File
 
 /**
  * What a [TajweedModel] gets from where it was made: a [TajweedClient] (which can download more of the build, has
- * the signed config and may have an accelerator) or a folder opened by hand (which has none of that).
+ * the signed config and may have an accelerator), or in the tests a verified folder (which has none of that).
  */
 internal class ModelHost(
     /** Fetches what is not in the folder yet (another context, the reference data, the sample clips); null: nothing can be fetched. */
@@ -38,8 +38,8 @@ internal class ModelHost(
 
 /**
  * One verified model build on this device: its version, contexts, tokens, calibration and reference data, sample
- * clips, and the engine that runs it (the CPU engine, and an accelerator once it passed its test). Made by
- * `client.model()` (download, verify, open, warm), or opened from a folder already on disk with [open].
+ * clips, and the engine that runs it (the CPU engine, and an accelerator once it passed its test). Made only by
+ * `client.model()` (download, verify, open, warm): a model comes from Quran Lab's server, through the Client.
  *
  * ```
  * val model = client.model()
@@ -264,17 +264,13 @@ public class TajweedModel internal constructor(
         OpenObjects.closed(this)
     }
 
-    public companion object {
+    internal companion object {
         /**
-         * Opens a model folder already on disk (a folder with the build's `manifest.json` and files), verified the same
-         * way as a downloaded one: the manifest's signature, then every file's size and SHA-256. No download, no
-         * accelerator. Errors: `model_missing`, `model_invalid`, `signature_invalid`, `checksum_mismatch`,
-         * `model_incompatible`.
+         * A verified model folder opened with no Client, for the tests and the local proof only (SPEC 15.1: no public
+         * call hands the SDK a model; an app gets one from `client.model()`). Verified as a downloaded one is: the
+         * manifest's signature with [ModelHost.verifier], then every file's size and SHA-256.
          */
-        @JvmStatic
-        public suspend fun open(folder: File): TajweedModel = open(folder, ModelHost(microphone = { TajweedClient.current?.platform?.microphone }))
-
-        internal suspend fun open(dir: File, host: ModelHost, context: String? = null): TajweedModel = guard {
+        suspend fun openVerifiedFolder(dir: File, host: ModelHost, context: String? = null): TajweedModel = guard {
             withContext(Dispatchers.IO) {
                 val folder = ModelFolder.open(dir, host.verifier)
                 of(folder, host, context)

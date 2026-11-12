@@ -83,4 +83,8 @@ internal class ClientPlatform(
     val freeSpace: ((File) -> Long?)? = { f -> try { generateSequence(f) { it.parentFile }.first { it.exists() }.usableSpace } catch (_: Exception) { null } },
     /** More observers of the cloud events (Android: the thermal listener's target). */
     val extraObserver: ((TajweedObserver) -> (() -> Unit))? = null,
+    /** The device key of the install records: the Android Keystore on Android, [MachineInstallKey] on the desktop JVM. */
+    val installKeys: InstallKeyStore = MachineInstallKey(),
+    /** Removes a folder and everything in it; false when something could not be removed (tests make it fail). */
+    val deleteTree: (File) -> Boolean = { f -> f.deleteRecursively() },
 )
