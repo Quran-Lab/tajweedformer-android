@@ -74,10 +74,8 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:3.0.0") }
+dependencies { implementation("ai.quranlab:tajweedformer:3.0.1") }
 ```
-
-Maven Central serves 3.0.0 today. 3.0.1 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 
