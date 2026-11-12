@@ -1,5 +1,74 @@
 # Changelog
 
+## 3.0.1
+
+One fix: sharing turned off, or what was shared deleted, while a recording is being uploaded, or just before the
+app's process ends.
+
+When a learner turns sharing off, or deletes what they shared, the SDK ends the upload in progress and deletes
+the recordings it has not sent yet. Since 2.0.0 that did not hold for what was in flight at that moment. A test
+written after 3.0.0 was released showed it, in every one of 20 runs of each situation:
+
+- A segment that was being sent when the learner said no was sent to its end. The SDK could not end a request
+  that was in flight: not a segment, not the start of an upload, not a request for upload addresses, not a take
+  list.
+- With a recording still open (a recording stays open between takes since 2.0.3), the uploader went on to the
+  recording's next segment after the call had returned, and the open recording's folder was still on the device
+  when the call returned.
+- "Delete what I shared" asked the server before it stopped the uploads: an upload that began in between sent
+  recordings under the contributor that was being deleted.
+- A take list that had not been sent stayed on the device. On a desktop JVM on Windows the segment that was being
+  sent stayed too, until the next upload.
+- When the app's process ended between the write of the learner's no and the delete of the queue (a kill, a crash,
+  a battery that ran out), nothing on the device said which recordings were from before the no. They stayed on the
+  device while sharing was off, and when the learner turned sharing on again they were uploaded: nine of nine in
+  the test, in every one of 20 runs. "Delete what I shared" wrote its no last, after the device's deletes, so the
+  same end of the process left sharing on.
+
+In production the sharing sheet has been on for iOS and macOS only.
+
+Fixed, by the five rules every Quran Lab SDK holds from 3.0.1, and tested with the situations the SDKs share
+(`vectors30/sharing_off.json`, 20 runs of each, in `SharingOffTest`):
+
+- From the moment `client.sharing.setOn(false)` or `client.sharing.delete()` returns, the SDK hands nothing more
+  to the system and has ended the request that was in flight, whichever it is. What the system had already taken
+  into its send buffer may still go out. Measured on a phone (Android 11): when sharing is turned off while a
+  segment is being sent, the SDK ends the request within about 100 ms and hands over nothing more; what the
+  system had already taken into its send buffer still goes out, up to 2,220,032 bytes in the test, which is more
+  than one segment. So the segment being sent at that moment can still arrive whole; nothing after it is sent.
+  (The same measure on a desktop JVM, over a loopback connection: up to 245,760 bytes on Windows and 4,268,032
+  bytes on Linux.)
+- The call returns within 3 seconds, also when a request hangs. It never waits for the network.
+- Nothing unsent is left on the device: no recording, no segment, no state of the queue, no unsent take list;
+  also after the request that was in flight has come back.
+- Turning sharing on again works at once: the next recording is uploaded, and the one that was in flight is gone.
+- "Delete what I shared" stops the uploads before it asks the server. Accepted, it turns sharing off, as before.
+  A deletion the server did not take changes nothing: sharing stays on, nothing on the device is deleted, and the
+  uploads go on.
+- A recording made under an earlier consent is never uploaded, whatever happened in between: off and on again, the
+  process ending between the no and the delete of the queue, any number of recordings (`SharingRestartTest`, the
+  shared restart situations, nine recordings, 20 runs of each). The device keeps a count of the learner's changes
+  of mind, written in the same write as the answer, and every recording carries the count it was begun under, on
+  the device only and never in what is uploaded. A recording with another count, and every unsent recording while
+  the learner's yes is not in force, is deleted at the next launch and before every upload pass. The signed
+  config's pause is not the learner's no: it keeps the queue, as before.
+- "Delete what I shared" writes the no to the device before it asks the server and writes the earlier state back
+  when the server does not take the deletion; while the server is asked nothing changes for the learner or the
+  app. A process that ends during the ask finds sharing off at its next launch and deletes the queue. A launch
+  after a process that ended in the middle of an accepted deletion finishes it before anything else: the queue,
+  the status of what was shared, the contributor. When the device cannot store the no (a full disk), the server
+  is asked all the same; an accepted deletion then turns sharing off in the running app, deletes the queue, and
+  the no is stored as soon as the device can.
+- One case stays as it is and is said here: when the process ends after the server took the deletion and before
+  the device heard its answer, the device cannot know. Sharing is off at the next launch and no earlier recording
+  is uploaded; the status of what was shared stays listed, and when sharing comes on again the first new
+  recording is refused by the server once, after which the SDK takes a new contributor and the next recording is
+  uploaded.
+- A second case stays as it is: the no was stored, the server refuses the deletion, the write that puts the
+  earlier state back fails, and the process ends before a retry succeeds. Sharing is off at the next launch and
+  nothing is ever uploaded from the queue; the learner turns sharing on again with the switch and is not asked
+  again.
+
 ## 3.0.0
 
 A breaking release. The SDK is inference only: it downloads and verifies the model, runs it on the device and gives

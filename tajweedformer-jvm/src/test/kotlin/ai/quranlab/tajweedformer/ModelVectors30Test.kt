@@ -36,7 +36,11 @@ class ModelVectors30Test : OpenChecked() {
     @Test
     fun manifests() {
         val v = vector("manifest_30.json")
-        assertEquals(v["sdk_version"], SdkInfo.VERSION)
+        // the file is for the 3.0 line (vectors README 4.5): `sdk_version` is the version it was built with, and this
+        // SDK is that version or a later 3.0.x. The cases are run as this SDK.
+        val sdk = v["sdk_version"] as String
+        assertTrue("this SDK (${SdkInfo.VERSION}) is not $sdk or a later 3.0.x",
+            ModelManifest.versionAtLeast(SdkInfo.VERSION, sdk) && SdkInfo.VERSION.startsWith("3.0.") && sdk.startsWith("3.0."))
         val verifier = ManifestVerifier(listOf(TestKit.hex(v["public_key_hex"] as String)))
         val cases = v["cases"] as List<Map<String, Any?>>
         assertTrue(cases.size >= 30)

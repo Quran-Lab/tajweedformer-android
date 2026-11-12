@@ -106,7 +106,8 @@ class TelemetryVectorsTest : OpenChecked() {
         val body = t.peek(ctx)!!
         assertEquals(emptySet<String>(), body.keys - example.keys)
         assertEquals(emptySet<String>(), cohorts.flatMap { it.keys }.toSet() - (example["cohorts"] as List<Map<String, Any?>>)[0].keys)
-        assertEquals(example["sdk_version"], SdkInfo.VERSION)
+        // the example is the vector's own version's; the body names this SDK's (the next line)
+        assertTrue(ai.quranlab.tajweedformer.ModelManifest.versionAtLeast(SdkInfo.VERSION, example["sdk_version"] as String))
         assertEquals(SdkInfo.VERSION, body["sdk_version"])
         assertEquals(2.0, body["v"])
         // a day on which the app called neither API: none of the six fields and no `reported`

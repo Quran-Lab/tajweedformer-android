@@ -42,6 +42,22 @@ internal class ConsentState internal constructor(private val file: File, private
     var consentTextSha256: String? = null; private set
     var guardian = false; private set
 
+    /**
+     * How often the learner's answer changed between a yes and not a yes (SPEC 11.7): counted up when sharing goes
+     * off, when a deletion is accepted, and when sharing comes on. Saved in the same write as the answer. Every
+     * recording carries the count of its creation, so one made before a no is known as such after any restart.
+     */
+    @Volatile var changes = 0; private set
+
+    /** The count at the last accepted "delete what I shared": whatever carries a lower one goes, its status too. */
+    @Volatile var deletedBelow = 0; private set
+
+    /** An accepted deletion is saved and its work on the device (the queue, the take count, the contributor) is not known to be done. */
+    @Volatile var deletionUnfinished = false; private set
+
+    /** "Delete what I shared" is asking the server ([deletionAsked]): whatever is written meanwhile already says no. */
+    private var asking = false
+
     init { load() }
 
     val granted: Boolean get() = consent == Consent.GRANTED
@@ -58,16 +74,86 @@ internal class ConsentState internal constructor(private val file: File, private
         consentVersion = o["consentVersion"] as? String
         consentTextSha256 = o["consentTextSha256"] as? String
         guardian = o["guardian"] as? Boolean ?: false
+        // a state from before 3.0.1 has no count: 0, as the recordings made then
+        changes = (o["changes"] as? Double)?.toInt() ?: 0
+        deletedBelow = (o["deletedBelow"] as? Double)?.toInt() ?: 0
+        deletionUnfinished = o["deletionUnfinished"] as? Boolean ?: false
         // 2.0.0 recorded the deck version at every grant; a grant without one is read as 2.0.0's bundled deck
         if (consent == Consent.GRANTED && consentVersion == null) consentVersion = LEGACY_CONSENT_VERSION
     }
 
+    /**
+     * The device is behind the state in force: the last write failed (a full disk, a storage that refuses). The
+     * state in force is the one in this process; every later change writes the whole state again, and [store] tries.
+     */
+    @Volatile var unsaved = false; private set
+
+    /**
+     * Stores the state. A write that fails changes nothing of the state in force and is not thrown at the learner's
+     * tap: [unsaved] says so and the write is tried again at the next change of the state at the latest.
+     */
     @Synchronized
-    private fun save() {
+    private fun save(): Boolean = try {
+        write()
+        unsaved = false
+        true
+    } catch (_: Exception) {
+        unsaved = true
+        false
+    }
+
+    /** The state is stored when the last write failed: tried again now. True when the device has the state in force. */
+    @Synchronized
+    fun store(): Boolean = if (unsaved) save() else true
+
+    @Synchronized
+    private fun write() {
         file.parentFile?.mkdirs()
-        ShareFiles.writeJson(file, linkedMapOf("v" to 1, "consent" to consent.key, "asks" to asks, "lastAskSession" to lastAskSession,
+        val o = linkedMapOf<String, Any?>("v" to 1, "consent" to consent.key, "asks" to asks, "lastAskSession" to lastAskSession,
             "sessions" to sessions, "thanked" to thanked, "decidedAt" to decidedAt, "consentVersion" to consentVersion,
-            "consentTextSha256" to consentTextSha256, "guardian" to guardian))
+            "consentTextSha256" to consentTextSha256, "guardian" to guardian,
+            "changes" to changes, "deletedBelow" to deletedBelow, "deletionUnfinished" to deletionUnfinished)
+        if (asking) {
+            // the server is being asked to delete: a process that ends before its answer finds sharing off and every
+            // recording from before it, because the file says so already. This process goes on as it was.
+            o["consent"] = Consent.FINAL.key
+            o["decidedAt"] = clock() / 1000
+            o["changes"] = changes + 1
+        }
+        ShareFiles.writeJson(file, o)
+    }
+
+    /**
+     * "Delete what I shared" is about to ask the server (SPEC 11.7, R5: the change of consent is on the device before
+     * anything else is done about it). Until [afterDeletion] or [deletionRefused], everything this writes says that
+     * sharing is off, one count on. Nothing changes in this process: the learner and the app see sharing as it was
+     * while the server is asked.
+     *
+     * False when the device could not store it (a full disk, a storage that refuses the write). The server is asked
+     * all the same (the learner's wish to have their recordings deleted outranks the order of a local write), and
+     * nothing is left behind that a later write would store: the off is stored when the server took the deletion,
+     * by [afterDeletion], by [deletionFinished], or by the next write that succeeds.
+     */
+    @Synchronized
+    fun deletionAsked(): Boolean {
+        asking = true
+        return try {
+            write()
+            true
+        } catch (_: Exception) {
+            asking = false
+            false
+        }
+    }
+
+    /**
+     * The server did not take the deletion: the earlier state is written back, as if nothing had been asked. When
+     * that write fails, the earlier state is still what this process has and what its next write stores.
+     */
+    @Synchronized
+    fun deletionRefused() {
+        asking = false
+        save()
     }
 
     /** The sheet that may be shown now under the cap, or null: a yes, an off switch, or [MAX_ASKS] showings end asking. */
@@ -121,6 +207,8 @@ internal class ConsentState internal constructor(private val file: File, private
     @Synchronized
     @JvmOverloads
     fun grant(consentVersionNow: String, byGuardian: Boolean, textSha256: String? = null) {
+        // sharing comes on from a no or from no answer: whatever is on disk now is from before
+        if (consent != Consent.GRANTED) changes++
         consent = Consent.GRANTED
         decidedAt = clock() / 1000
         consentVersion = consentVersionNow
@@ -132,7 +220,11 @@ internal class ConsentState internal constructor(private val file: File, private
     /** "Not now" or the sheet dismissed: declined, or final after the last re-ask. */
     @Synchronized
     fun decline() {
-        if (consent == Consent.GRANTED) return save() // a "Not now" from the app's own UI after a yes keeps the yes
+        // a "Not now" from the app's own UI after a yes keeps the yes
+        if (consent == Consent.GRANTED) {
+            save()
+            return
+        }
         consent = if (asks >= 3) Consent.FINAL else Consent.DECLINED
         decidedAt = clock() / 1000
         save()
@@ -145,10 +237,15 @@ internal class ConsentState internal constructor(private val file: File, private
     @Synchronized
     @JvmOverloads
     fun setFromSettings(on: Boolean, consentVersionNow: String, byGuardian: Boolean = guardian, textSha256: String? = null) {
-        if (on && consent == Consent.GRANTED) return save()
+        if (on && consent == Consent.GRANTED) {
+            save()
+            return
+        }
         if (on) grant(consentVersionNow, byGuardian, textSha256) else {
             consent = Consent.FINAL
             decidedAt = clock() / 1000
+            // in the same write as the no: every recording made so far is from before it
+            changes++
             save()
         }
     }
@@ -162,12 +259,35 @@ internal class ConsentState internal constructor(private val file: File, private
         return true
     }
 
-    /** After "Delete what I shared": off, and a new contributor if the learner shares again. */
+    /**
+     * The server accepted "Delete what I shared": off, and a new contributor if the learner shares again. One write,
+     * made before the device deletes anything: the no, the count (everything on the device is from before it, the
+     * status of what was shared too) and the mark that the device's part is still to do ([deletionFinished]). The
+     * count is the one [deletionAsked] already wrote.
+     *
+     * The state in this process is set first, whatever becomes of the write: sharing is off from here on, and every
+     * later write stores it. A write that fails does not stop the deletion: the server took it.
+     */
     @Synchronized
     fun afterDeletion() {
+        asking = false
         consent = Consent.FINAL
         decidedAt = clock() / 1000
         thanked = false
+        changes++
+        deletedBelow = changes
+        deletionUnfinished = true
+        save()
+    }
+
+    /**
+     * The device's part of an accepted deletion is done: the queue, the take count, the contributor. This is the
+     * write after the queue was deleted: where the off could not be stored before (a full disk), it may be now that
+     * the queue's files are gone. When it fails too, the next write that succeeds stores the off.
+     */
+    @Synchronized
+    fun deletionFinished() {
+        deletionUnfinished = false
         save()
     }
 

@@ -209,8 +209,8 @@ class ManifestTest : OpenChecked() {
         assertFalse(ModelManifest.versionAtLeast("0.9.9", "1.0.0"))
         assertTrue(ModelManifest.versionAtLeast("1.2.0-beta", "1.2.0"))
         assertFalse(ModelManifest.versionAtLeast("x", "1.0.0"))
-        assertTrue(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.0"))
-        assertFalse(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.1"))
+        assertTrue(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.1"))
+        assertFalse(ModelManifest.versionAtLeast(SdkInfo.VERSION, "3.0.2"))
     }
 
     @Test

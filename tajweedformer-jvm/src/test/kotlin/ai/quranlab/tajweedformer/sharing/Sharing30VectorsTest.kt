@@ -134,6 +134,8 @@ class Sharing30VectorsTest : OpenChecked() {
                         if (!w.on) w.recorder.stop()
                     }
                     "delete" -> {
+                        // an accepted "Delete what I shared": sharing goes off with it (the case turns it on again)
+                        w.on = false
                         w.recorder.stop()
                         w.recorder.forget()
                     }

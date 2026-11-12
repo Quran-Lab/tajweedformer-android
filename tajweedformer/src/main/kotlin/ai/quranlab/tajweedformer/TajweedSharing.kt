@@ -25,8 +25,11 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
     public val isOn: Boolean get() = inner.isOn
 
     /**
-     * The settings switch. Off stops uploads at once and deletes the queue of recordings not sent yet; the SDK then
-     * never asks again. On, while sharing is not available for this app, is the error `sharing_unavailable`.
+     * The settings switch. Off ends the upload in progress and deletes the queue of recordings not sent yet; the SDK
+     * then never asks again. From the moment the call returns the SDK hands nothing more to the system; what the
+     * system had already taken into its send buffer may still go out, which can be the whole segment that was being
+     * sent. Nothing after it is sent. The call returns within three seconds, also when a request hangs.
+     * On, while sharing is not available for this app, is the error `sharing_unavailable`.
      */
     public fun setOn(on: Boolean) {
         if (on && !inner.available) throw RecognizerException.SharingUnavailable()
@@ -76,9 +79,10 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
 
     /**
      * "Delete what I shared": everything this learner shared from this app is deleted from Quran Lab's servers, the
-     * queue is emptied and sharing is turned off. Returns true when the request was accepted (or nothing had been
-     * shared), false when there was no connection or the server refused it: then nothing changed and it can be
-     * tried again.
+     * queue is emptied and sharing is turned off. The upload in progress is ended before the server is asked (as
+     * with `setOn(false)`: what the system had already taken of the segment being sent may still go out). Returns
+     * true when the request was accepted (or nothing had been shared), false when there was no connection or the
+     * server refused it: then nothing changed and it can be tried again.
      */
     public suspend fun delete(): Boolean = withContext(Dispatchers.IO) {
         when (inner.deleteEverything()) {

@@ -64,9 +64,15 @@ internal object ShareFiles {
         writeJson(File(folder, name(n) + ".json"), o)
     }
 
-    /** `capture.json`: the pre-skip and the bit rate of each segment opened so far. */
-    fun writeCapture(folder: File, preSkip: Int, bitrates: List<Int>) =
-        writeJson(File(folder, CAPTURE), linkedMapOf("preSkip" to preSkip, "bitrates" to bitrates))
+    /**
+     * `capture.json`: the pre-skip, the bit rate of each segment opened so far, and [consent], the count of consent
+     * changes at the recording's creation ([ConsentState.changes]). The file stays on the device; it is never sent.
+     */
+    fun writeCapture(folder: File, preSkip: Int, bitrates: List<Int>, consent: Int = 0) =
+        writeJson(File(folder, CAPTURE), linkedMapOf("preSkip" to preSkip, "bitrates" to bitrates, "consent" to consent))
+
+    /** The count of consent changes a recording was made under; 0 for one made before SDK 3.0.1. */
+    fun stamp(folder: File): Int = (readJson(File(folder, CAPTURE))?.get("consent") as? Double)?.toInt() ?: 0
 
     /** Seconds of audio in [markers] (from their granule positions; segment 1 from 0), those [skip] says not to count left out. */
     fun seconds(markers: List<Marker>, skip: (Marker) -> Boolean = { false }): Double {

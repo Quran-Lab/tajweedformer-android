@@ -6,6 +6,7 @@ import ai.quranlab.tajweedformer.cloud.ApiError
 import ai.quranlab.tajweedformer.cloud.CloudException
 import ai.quranlab.tajweedformer.cloud.Day
 import ai.quranlab.tajweedformer.cloud.ErrorAction
+import ai.quranlab.tajweedformer.cloud.HttpAbort
 import ai.quranlab.tajweedformer.cloud.HttpResponse
 import ai.quranlab.tajweedformer.cloud.QuranLabApi
 import java.io.File
@@ -58,6 +59,12 @@ internal interface SharingGate {
     fun badRequest(route: String) {}
     /** A line for the developer's log (debuggable builds). */
     fun log(message: String) {}
+    /** The learner's own yes is in force, whatever the signed config says now (its pause is not a no). */
+    fun consentInForce(): Boolean = true
+    /** The count of consent changes now ([ConsentState.changes]); a recording carries the count of its creation. */
+    fun consentCount(): Int = 0
+    /** The count at the last accepted "delete what I shared" ([ConsentState.deletedBelow]). */
+    fun deletedBelow(): Int = 0
 }
 
 /**
@@ -78,6 +85,8 @@ internal class ShareCapture(
     private val stillOn: () -> Boolean,
     /** How long a caller waits for the encoder when [MAX_WAITING_MS] of audio already waits for it, ms. */
     private val catchUpMs: Long = CATCH_UP_MS,
+    /** The count of consent changes when this recording was made ([ConsentState.changes]): written into its folder. */
+    private val consent: Int = 0,
 ) : Recording {
     /** Samples copied for the encoder that it has not taken yet. */
     private val waiting = java.util.concurrent.atomic.AtomicLong()
@@ -96,8 +105,8 @@ internal class ShareCapture(
     private var preSkip = -1
     private val bitrates = ArrayList<Int>()
     private var abandoned = false
-    /** Sharing went off ([abandon]): nothing of the capture is kept. */
-    private var off = false
+    /** Sharing went off ([abandon]): nothing of the capture is kept, and audio that still waits is not encoded. */
+    @Volatile private var off = false
 
     init { ACTIVE.add(id) }
 
@@ -158,7 +167,7 @@ internal class ShareCapture(
     /** On the encoder's thread. */
     private fun encode(copy: FloatArray, sampleRate: Int) {
         run {
-            if (failed) return
+            if (failed || off) return
             if (!stillOn()) { abandonNow(); return }
             try {
                 if (writer == null) {
@@ -168,7 +177,7 @@ internal class ShareCapture(
                     val w = OggOpusWriter({ File(folder, ShareFiles.name(it) + ".opus") }, SegmentPlan.SECONDS, sampleRate,
                         bitrateFor = ::opened) { closed(it) }
                     preSkip = w.preSkip
-                    ShareFiles.writeCapture(folder, w.preSkip, bitrates)
+                    ShareFiles.writeCapture(folder, w.preSkip, bitrates, consent)
                     writer = w
                 }
                 if (sampleRate == rate) writer?.append(copy)
@@ -183,7 +192,7 @@ internal class ShareCapture(
         val b = outbox.ladder.bitrate
         bitrates.add(b)
         // segment 1 opens inside the writer's constructor: capture.json is written right after it
-        if (preSkip >= 0) try { ShareFiles.writeCapture(folder, preSkip, bitrates) } catch (_: Exception) {}
+        if (preSkip >= 0) try { ShareFiles.writeCapture(folder, preSkip, bitrates, consent) } catch (_: Exception) {}
         return b
     }
 
@@ -233,8 +242,9 @@ internal class ShareCapture(
     override fun abandon() {
         if (ended) return
         ended = true
+        // at once, not behind the audio that waits for the encoder: the folder goes as soon as the encoder is free
+        off = true
         worker.execute {
-            off = true
             abandonNow()
             outbox.poke()
         }
@@ -323,6 +333,15 @@ internal class ShareCapture(
  * item's state: it is retried with the same backoff until it is accepted or dropped, across relaunches.
  *
  * Blocking; [drain] runs one pass at a time (a call during a pass runs one more after it).
+ *
+ * Sharing turned off, or what was shared deleted, while a pass runs (SPEC 11.7, SDK 3.0.1): [whileStopped] marks the
+ * uploader stopped before anything else, ends the request it has in flight (every request of a pass can be ended:
+ * the start, the URLs, a segment's PUT, the take list, the token's), and waits, at most [PASS_LEAVES_MS], until the
+ * pass has left; only then is anything deleted. The pass asks [mayGoOn] before every request, also between two
+ * segments of one recording, and a halted pass writes nothing. No pass starts while the uploader is stopped. A
+ * removed recording is remembered ([gone]): it is never written back and never picked up again, also by a pass
+ * that could not be ended in time; a folder that cannot be deleted at once (a file of it is open) is marked and
+ * goes at the next scan.
  */
 internal class ContributionOutbox internal constructor(
     val root: File,
@@ -356,6 +375,8 @@ internal class ContributionOutbox internal constructor(
         var takesNextAttempt: Long = 0,
         /** The server answered 400 to this list and the issue was reported: it is reported once. */
         var takesRefused: Boolean = false,
+        /** The count of consent changes the recording was made under ([ShareFiles.stamp]); 0 before SDK 3.0.1. */
+        var consent: Int = 0,
     ) {
         /** Something is still to send: segments, or the take list of an uploaded recording. */
         val waiting: Boolean get() = state == "active" || takes == TAKES_PENDING
@@ -367,6 +388,23 @@ internal class ContributionOutbox internal constructor(
     private val lock = Object()
     private var running = false
     private var again = false
+
+    /** How many [whileStopped] are at work. Guarded by [lock]; [stopped] is the same for the pass to read. */
+    private var stops = 0
+    @Volatile private var stopped = false
+
+    /** True on a thread that is inside [whileStopped]. */
+    private val stopping = ThreadLocal<Boolean>()
+
+    /** The pass that runs now: its thread, and what ends its requests. Guarded by [lock]. */
+    private var passThread: Thread? = null
+    private var passAbort: HttpAbort? = null
+
+    /**
+     * Recordings removed for good (sharing went off, a deletion, expiry): never written back, never picked up again.
+     * The newest [GONE_KEPT]; guarded by [records].
+     */
+    private val gone = LinkedHashSet<String>()
     private val takesRouteLogged = java.util.concurrent.atomic.AtomicBoolean(false)
 
     init { root.mkdirs() }
@@ -393,21 +431,136 @@ internal class ContributionOutbox internal constructor(
     /** A network failure of an upload request: no answer, or HTTP 408 or 5xx. */
     private fun networkFailure(status: Int?): Boolean = status == null || status == 408 || status in 500..599
 
-    /** Sharing was turned off: every session not fully uploaded goes, and nothing else is sent (a take list neither). */
-    fun cancelQueued() = synchronized(records) {
-        scan()
-        for (r in records.values.toList()) {
-            if (r.state == "active" && r.id !in ShareCapture.ACTIVE) remove(r.id)
-            else if (r.takes == TAKES_PENDING) endTakes(r, TAKES_DROPPED)
+    /**
+     * The uploader may go on: nobody stopped it, and sharing is still on. Asked before every request of a pass (the
+     * token's, the start, a batch of URLs, every segment's PUT, the take list).
+     */
+    private fun mayGoOn(): Boolean = !halted() && gate.uploadsAllowed()
+
+    /**
+     * This pass was told to stop: the uploader is stopped now, or was while this pass ran (its requests are ended
+     * for good, also when the stop is over by the time the pass notices). A halted pass writes nothing.
+     */
+    private fun halted(): Boolean = stopped || HttpAbort.current()?.aborted == true
+
+    /**
+     * [work] with the uploader stopped (SPEC 11.7): the learner turns sharing off or deletes what they shared,
+     * perhaps in the middle of an upload. First of all the uploader is marked stopped: it makes no further request,
+     * writes nothing more, and no pass starts. The request it has in flight is ended. Then this waits until the pass
+     * has left, at most [PASS_LEAVES_MS] (never for the network: a request that could not be ended is left behind,
+     * and what it brings back later is thrown away). So nothing of a recording is open or half written when [work]
+     * deletes it, and the SDK hands nothing more of it to the system afterwards (what the system had already taken
+     * of the request that was ended may still go out). The uploader stays stopped while [work] runs ("delete what
+     * I shared" asks the server in there); whoever stops it asks for a pass again where sharing is still on.
+     */
+    internal fun <T> whileStopped(work: () -> T): T {
+        // a stop inside a stop on the same thread ("delete what I shared" empties the queue inside its own stop)
+        if (stopping.get() == true) return work()
+        stopping.set(true)
+        // what runs in here is not the pass's work, also when a callback of the pass came here on the pass's thread
+        val bound = HttpAbort.bind(null)
+        val inFlight = synchronized(lock) {
+            stops++
+            stopped = true
+            passAbort
         }
-        // folders the outbox has not picked up yet
-        for (f in root.listFiles() ?: emptyArray()) if (f.isDirectory && f.name !in ShareCapture.ACTIVE && records[f.name] == null) f.deleteRecursively()
+        try {
+            inFlight?.abort()
+            synchronized(lock) {
+                if (passThread !== Thread.currentThread()) {
+                    val until = System.nanoTime() + PASS_LEAVES_MS * 1_000_000
+                    while (running) {
+                        val left = (until - System.nanoTime()) / 1_000_000
+                        if (left <= 0) break
+                        lock.wait(left)
+                    }
+                }
+            }
+            return work()
+        } finally {
+            synchronized(lock) {
+                stops--
+                stopped = stops > 0
+            }
+            HttpAbort.bind(bound)
+            stopping.remove()
+        }
     }
 
-    /** Everything, uploaded or not (after a deletion). */
-    internal fun clearAll() = synchronized(records) {
-        records.clear()
-        for (f in root.listFiles() ?: emptyArray()) if (f.name !in ShareCapture.ACTIVE) f.deleteRecursively()
+    /** The recording is not the outbox's any more, for good. Caller holds [records]. */
+    private fun forget(id: String) {
+        records.remove(id)
+        gone.add(id)
+        while (gone.size > GONE_KEPT) gone.remove(gone.first())
+    }
+
+    /**
+     * Deletes a recording's folder for good. One that cannot be deleted now (a file of it is still open somewhere;
+     * some systems refuse that) gets a marker and goes at the next scan: it is never recovered and never sent.
+     * Caller holds [records].
+     */
+    private fun erase(folder: File) {
+        forget(folder.name)
+        if (!delete(folder) && folder.isDirectory) try { File(folder, GONE).createNewFile() } catch (_: Exception) {}
+    }
+
+    /** The deletion of a recording's folder ([deleteForTests] stands in for it in the tests of a storage that refuses). */
+    private fun delete(folder: File): Boolean = deleteForTests?.invoke(folder) ?: folder.deleteRecursively()
+
+    /**
+     * Sharing was turned off: every session not fully uploaded goes, and the SDK sends nothing else (a take list
+     * neither).
+     * The uploader is stopped first ([whileStopped]); [first] then ends the open recording, before the queue is
+     * deleted.
+     */
+    fun cancelQueued(first: () -> Unit = {}): Unit = whileStopped {
+        first()
+        encodersLeave()
+        synchronized(records) { dropUnsent() }
+        // a second look: what an uploader or an encoder on its way out put back
+        synchronized(records) { dropUnsent() }
+    }
+
+    /**
+     * A recording that was just ended, or closed a moment ago, is still its encoder's (which deletes the folder of an
+     * ended one on its own thread): waited for, at most [ENCODERS_LEAVE_MS], so nothing of it is left when sharing
+     * has gone off. One that takes longer is forgotten here and goes at the next scan.
+     */
+    private fun encodersLeave() {
+        val until = System.nanoTime() + ENCODERS_LEAVE_MS * 1_000_000
+        while ((root.listFiles() ?: emptyArray()).any { it.name in ShareCapture.ACTIVE } && System.nanoTime() < until) Thread.sleep(5)
+    }
+
+    private fun dropUnsent() {
+        scan()
+        for (r in records.values.toList()) {
+            if (r.state == "active") {
+                // a recording whose encoder has not let go of it yet deletes its own folder; it is forgotten here
+                if (r.id in ShareCapture.ACTIVE) forget(r.id) else remove(r.id)
+            } else if (r.takes == TAKES_PENDING) {
+                endTakes(r, TAKES_DROPPED)
+                // the list was never sent: it does not stay on the device
+                try { File(File(root, r.id), ShareFiles.TAKES).delete() } catch (_: Exception) {}
+            }
+        }
+        // folders the outbox has not picked up yet
+        for (f in root.listFiles() ?: emptyArray()) {
+            if (!f.isDirectory || records[f.name] != null) continue
+            if (f.name in ShareCapture.ACTIVE) forget(f.name) else erase(f)
+        }
+    }
+
+    /** Everything, uploaded or not (after a deletion). The uploader is stopped first ([whileStopped]). */
+    internal fun clearAll(): Unit = whileStopped {
+        synchronized(records) { dropAll() }
+        synchronized(records) { dropAll() }
+    }
+
+    private fun dropAll() {
+        for (id in records.keys.toList()) forget(id)
+        for (f in root.listFiles() ?: emptyArray()) {
+            if (f.name in ShareCapture.ACTIVE) forget(f.name) else if (f.isDirectory) erase(f) else f.delete()
+        }
     }
 
     /** The earliest retry due (ms), or null when nothing waits. */
@@ -418,23 +571,41 @@ internal class ContributionOutbox internal constructor(
 
     /** One upload pass. [ignoringBackoff] is for tests and an explicit retry. Returns false when the pass stopped offline. */
     fun drain(ignoringBackoff: Boolean = false): Boolean {
+        val abort = HttpAbort()
         synchronized(lock) {
+            // no pass starts while the uploader is stopped (whoever stopped it asks for one afterwards)
+            if (stops > 0) return true
             if (running) { again = true; return true }
             running = true
+            passThread = Thread.currentThread()
+            passAbort = abort
         }
+        // every request made on this thread during the pass can be ended from the thread that stops the uploader
+        val bound = HttpAbort.bind(abort)
         var online = true
+        var more = false
         try {
             do {
                 synchronized(lock) { again = false }
                 online = pass(ignoringBackoff)
-            } while (synchronized(lock) { again } && online)
+                more = synchronized(lock) { again }
+            } while (more && online && !halted())
         } finally {
-            synchronized(lock) { running = false }
+            HttpAbort.bind(bound)
+            synchronized(lock) {
+                running = false
+                passThread = null
+                passAbort = null
+                lock.notifyAll()
+            }
         }
+        // a pass that was ended does not go on; the one that was asked for while it ran is asked for again
+        if (more && abort.aborted) onWork()
         return online
     }
 
     private fun pass(ignoringBackoff: Boolean): Boolean {
+        if (halted()) return true
         val due = synchronized(records) {
             scan()
             expireOld()
@@ -448,9 +619,12 @@ internal class ContributionOutbox internal constructor(
         }
         if (!gate.networkAllowed()) return true
         for (id in due) {
+            if (!mayGoOn()) return true
             val token = try {
                 gate.uploadToken()
             } catch (e: CloudException) {
+                // ended because the uploader was stopped: nothing is written
+                if (halted()) return true
                 if (synchronized(records) { records[id] }?.state == "active") retry(id, "token: ${e.message}", longWait = !e.retryable)
                 else retryTakes(id, longWait = !e.retryable)
                 return !e.offline
@@ -471,6 +645,7 @@ internal class ContributionOutbox internal constructor(
         if (!rec.started) {
             if (markers.isEmpty()) return true
             val session = try { File(folder, ShareFiles.SESSION).readBytes() } catch (_: Exception) { return true }
+            if (!mayGoOn()) return true
             rec.attempts++
             save(rec)
             val r = send(id, "uploads") { api.uploadStart(token, id, session) } ?: return !lastOffline
@@ -490,13 +665,18 @@ internal class ContributionOutbox internal constructor(
                 rec = synchronized(records) { records[id] } ?: return true
             }
             val url = rec.urls[m.n] ?: return true
+            // before every segment: the recording may still be open, with more closed segments behind this one
+            if (!mayGoOn()) return true
             val r = try {
                 api.putSegment(url.first, File(folder, name))
             } catch (e: CloudException) {
+                // ended because the uploader was stopped: not a failure of the network, and nothing is written
+                if (halted()) return true
                 ladder.uploadFailed()
                 retry(id, "PUT $name: ${e.message}")
                 return false
             }
+            if (halted()) return true
             rec = synchronized(records) { records[id] } ?: return true
             if (rec.state != "active") return true
             if (r.ok) {
@@ -523,6 +703,7 @@ internal class ContributionOutbox internal constructor(
         }
         rec = synchronized(records) { records[id] } ?: return true
         if (end == null || !rec.started || markers.isEmpty() || !markers.all { ShareFiles.name(it.n) + ".opus" in rec.uploaded }) return true
+        if (halted()) return true
         rec.state = "uploaded"
         rec.lastError = null
         rec.nextAttempt = 0
@@ -565,14 +746,18 @@ internal class ContributionOutbox internal constructor(
         val body = ShareFiles.takesJson(list).toByteArray(Charsets.UTF_8)
         // the contributor the recording was shared under (the session JSON's)
         val who = ShareFiles.readJson(File(folder, ShareFiles.SESSION))?.get("contributor") as? String ?: contributor()
+        if (!mayGoOn()) return true
         rec.takesAttempts++
         save(rec)
         val r = try {
             api.uploadTakes(token, id, who, body)
         } catch (e: CloudException) {
+            // ended because the uploader was stopped: whoever stopped it drops the list, nothing is written here
+            if (halted()) return true
             retryTakes(id)
             return false
         }
+        if (halted()) return true
         rec = synchronized(records) { records[id] } ?: return true
         if (rec.takes != TAKES_PENDING) return true
         val e = r.error
@@ -619,6 +804,8 @@ internal class ContributionOutbox internal constructor(
 
     private fun retryTakes(id: String, immediately: Boolean = false, longWait: Boolean = false) {
         val rec = synchronized(records) { records[id] } ?: return
+        // a list that was dropped meanwhile (sharing went off) is not put back in line
+        if (rec.takes != TAKES_PENDING) return
         rec.takesNextAttempt = clock() + delayMs(rec.takesAttempts, immediately, longWait)
         save(rec)
     }
@@ -636,15 +823,22 @@ internal class ContributionOutbox internal constructor(
 
     @Volatile private var lastOffline = false
 
-    /** A Worker call: the response on 2xx; otherwise the item is retried or failed and null comes back. */
+    /**
+     * A Worker call: the response on 2xx; otherwise the item is retried or failed and null comes back. Null too, with
+     * nothing sent or nothing written, when the uploader may not go on ([mayGoOn]) or was stopped during the call.
+     */
     private fun send(id: String, route: String, call: () -> HttpResponse): HttpResponse? {
         lastOffline = false
+        if (!mayGoOn()) return null
         val r = try { call() } catch (e: CloudException) {
+            // ended because the uploader was stopped: not offline, not a failure of the network
+            if (halted()) return null
             lastOffline = true
             if (networkFailure(e.api?.status)) ladder.uploadFailed()
             retry(id, e.message ?: "offline")
             return null
         }
+        if (halted()) return null
         if (r.ok) return r
         if (networkFailure(r.status)) ladder.uploadFailed()
         val e = r.error
@@ -687,7 +881,7 @@ internal class ContributionOutbox internal constructor(
     private fun fetchUrls(id: String, from: Int, token: String): Boolean {
         val r = send(id, "uploads/urls") { api.uploadUrls(token, id, from, contributor()) }
         if (r == null) {
-            synchronized(records) { records[id] }?.let { it.attempts++; save(it) }
+            if (!halted()) synchronized(records) { records[id] }?.let { it.attempts++; save(it) }
             return false
         }
         val urls = parseUrls(r, id) ?: run { retry(id, "no upload URLs in the answer"); return false }
@@ -751,17 +945,31 @@ internal class ContributionOutbox internal constructor(
 
     /** Picks up folders the captures made, and recovers the ones a killed app left. Caller holds [records]. */
     private fun scan() {
+        val yes = gate.consentInForce()
+        val count = gate.consentCount()
+        val below = gate.deletedBelow()
         val names = (root.listFiles() ?: emptyArray()).filter { it.isDirectory && it.name.length == 32 && it.name.all { c -> c in '0'..'9' || c in 'a'..'f' } }
         for (f in names) {
             val name = f.name
-            if (records[name] != null) continue
-            val stored = load(File(f, ITEM))?.takeIf { it.id == name }
-            if (stored != null) { records[name] = stored; continue }
+            if (name in gone || File(f, GONE).exists()) {
+                // removed for good; its folder is still there (a file of it was open then, or its encoder was still
+                // ending): it goes as soon as it can, and is never read
+                if (name !in ShareCapture.ACTIVE) erase(f)
+                continue
+            }
+            var known = records[name]
+            if (known == null) {
+                known = load(File(f, ITEM))?.takeIf { it.id == name }
+                if (known != null) records[name] = known
+            }
             val capturing = name in ShareCapture.ACTIVE
+            // a folder that is being written now is its capture's: made under the yes in force, and the stop ends it
+            if (!capturing && fromBefore(f, known, yes, count, below)) continue
+            if (known != null) continue
             // an item appears with its first closed segment
             if (capturing && ShareFiles.markers(f).isEmpty()) continue
             if (!capturing && !File(f, ShareFiles.END).exists() && !ShareFiles.recover(f)) continue
-            val rec = Record(name, seq = (records.values.maxOfOrNull { it.seq } ?: 0) + 1)
+            val rec = Record(name, seq = (records.values.maxOfOrNull { it.seq } ?: 0) + 1, consent = ShareFiles.stamp(f))
             records[name] = rec
             save(rec)
         }
@@ -769,14 +977,38 @@ internal class ContributionOutbox internal constructor(
         for (rec in records.values.toList()) {
             if (rec.state != "active") continue
             val f = File(root, rec.id)
-            if (rec.id !in ShareCapture.ACTIVE && !File(f, ShareFiles.END).exists() && !ShareFiles.recover(f)) records.remove(rec.id)
+            if (rec.id !in ShareCapture.ACTIVE && !File(f, ShareFiles.END).exists() && !ShareFiles.recover(f)) forget(rec.id)
         }
     }
 
-    private fun remove(id: String) = synchronized(records) {
-        File(root, id).deleteRecursively()
-        records.remove(id)
+    /**
+     * A recording from before the learner's last word (SPEC 11.7, across a restart). Every recording carries the
+     * count of consent changes of its creation; what is asked here is on disk, so it holds whatever the process that
+     * made the recording lived to do. One made before an accepted "delete what I shared" goes whole, its status
+     * too. An unsent one goes when the learner's yes is not in force (none can rightly be there), or when it carries
+     * another count than the one in force (it was made before a no): it is never recovered and never uploaded. The
+     * signed config's pause is not a no: its queue is kept. An uploaded recording keeps its status; a take list of
+     * it that was still to send is dropped. True when the folder is gone (or marked to go). Caller holds [records].
+     */
+    private fun fromBefore(f: File, rec: Record?, yes: Boolean, count: Int, below: Int): Boolean {
+        val stamp = rec?.consent ?: ShareFiles.stamp(f)
+        if (stamp < below) {
+            erase(f)
+            return true
+        }
+        if (yes && stamp == count) return false
+        if (rec == null || rec.state == "active") {
+            erase(f)
+            return true
+        }
+        if (rec.takes == TAKES_PENDING) {
+            endTakes(rec, TAKES_DROPPED)
+            try { File(f, ShareFiles.TAKES).delete() } catch (_: Exception) {}
+        }
+        return false
     }
+
+    private fun remove(id: String) = synchronized(records) { erase(File(root, id)) }
 
     private fun snapshot(r: Record): Contribution {
         val f = File(root, r.id)
@@ -795,8 +1027,17 @@ internal class ContributionOutbox internal constructor(
     /** Where the take list of an item stands (null: none to send, else [TAKES_PENDING], [TAKES_SENT] or [TAKES_DROPPED]). */
     internal fun takesState(id: String): String? = synchronized(records) { scan(); records[id]?.takes }
 
-    private fun save(r: Record) {
-        synchronized(records) { records[r.id] = r }
+    /**
+     * Keeps a recording's state, in memory and in its folder. Not a removed one's ([gone]): an uploader that still held
+     * it when sharing went off does not bring it back. Inside the lock a delete holds, so the two never interleave.
+     */
+    private fun save(r: Record): Unit = synchronized(records) {
+        if (r.id !in gone) write(r)
+    }
+
+    /** Caller holds [records]. */
+    private fun write(r: Record) {
+        records[r.id] = r
         val o = linkedMapOf<String, Any?>("id" to r.id, "seq" to r.seq, "state" to r.state, "started" to r.started,
             "urls" to r.urls.map { (n, u) -> linkedMapOf("n" to n, "url" to u.first, "expires_at" to u.second) },
             "uploaded" to r.uploaded.toList(), "failCode" to r.failCode, "attempts" to r.attempts, "lastError" to r.lastError,
@@ -808,6 +1049,8 @@ internal class ContributionOutbox internal constructor(
             o["takesNextAttempt"] = r.takesNextAttempt
             if (r.takesRefused) o["takesRefused"] = true
         }
+        // 3.0.1: the count of consent changes of its creation (an item made before reads 0)
+        if (r.consent != 0) o["consent"] = r.consent
         try {
             val dir = File(root, r.id)
             if (dir.isDirectory) ShareFiles.writeJson(File(dir, ITEM), o)
@@ -835,11 +1078,33 @@ internal class ContributionOutbox internal constructor(
         r.takesAttempts = (o["takesAttempts"] as? Double)?.toInt() ?: 0
         r.takesNextAttempt = (o["takesNextAttempt"] as? Double)?.toLong() ?: 0
         r.takesRefused = o["takesRefused"] as? Boolean ?: false
+        r.consent = (o["consent"] as? Double)?.toInt() ?: 0
         return r
     }
 
     companion object {
         const val ITEM = "item.json"
+
+        /** The marker of a folder that was removed for good and could not be deleted at once. */
+        internal const val GONE = "removed"
+
+        /**
+         * Tests only (the shared restart cases of SPEC 11.7): stands in for the deletion of a recording's folder, so
+         * a test can have a storage that refuses, or a process that ends at that point. Null: the real deletion.
+         */
+        @Volatile internal var deleteForTests: ((File) -> Boolean)? = null
+
+        /**
+         * How long turning sharing off waits for the uploader to leave its pass, ms. With [ENCODERS_LEAVE_MS] it
+         * stays inside the 3000 ms the call may take (SPEC 11.7, R2).
+         */
+        internal const val PASS_LEAVES_MS = 2_000L
+
+        /** How long turning sharing off waits for the encoders of the recordings it ends, ms. */
+        internal const val ENCODERS_LEAVE_MS = 700L
+
+        /** How many removed recordings the outbox remembers. */
+        private const val GONE_KEPT = 512
         internal const val TAKES_PENDING = "pending"
         internal const val TAKES_SENT = "sent"
         internal const val TAKES_DROPPED = "dropped"

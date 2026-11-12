@@ -7,13 +7,62 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** One HTTP request. A body is bytes or a file (PUTs of segments stream from disk). */
+/**
+ * Ends the requests of one thread's work from another thread (SPEC 11.7: sharing turned off during an upload).
+ * The sharing outbox binds one to the thread of an upload pass ([bind]); every [HttpRequest] made on that thread
+ * while it is bound carries it, the token's requests too. [abort] ends the request that is in flight: the transport
+ * stops reading a body file at once and closes the connection, so a write, or a wait for the answer, on the other
+ * thread fails with an IOException, like a connection that dropped. Once aborted it stays so: a later request that
+ * carries it fails before anything is sent, and an answer that still came is not given out.
+ */
+internal class HttpAbort {
+    @Volatile var aborted = false
+        private set
+    private var how: (() -> Unit)? = null
+
+    /** The transport: how the request it has in flight is ended (null: none is). Called at once when [abort] came first. */
+    fun inFlight(how: (() -> Unit)?) {
+        val now = synchronized(this) {
+            this.how = how
+            aborted
+        }
+        if (now && how != null) try { how() } catch (_: Exception) {}
+    }
+
+    fun abort() {
+        val h = synchronized(this) {
+            aborted = true
+            how
+        }
+        try { h?.invoke() } catch (_: Exception) {}
+    }
+
+    companion object {
+        private val bound = ThreadLocal<HttpAbort?>()
+
+        /** The one bound to this thread, or null. */
+        fun current(): HttpAbort? = bound.get()
+
+        /** Binds [abort] to this thread (null: none). Returns the one that was bound before, to put back. */
+        fun bind(abort: HttpAbort?): HttpAbort? {
+            val before = bound.get()
+            if (abort == null) bound.remove() else bound.set(abort)
+            return before
+        }
+    }
+}
+
+/**
+ * One HTTP request. A body is bytes or a file (PUTs of segments stream from disk). [abort]: the handle bound to the
+ * thread that makes the request, if any ([HttpAbort]).
+ */
 internal class HttpRequest(
     val method: String,
     val url: String,
     val headers: Map<String, String> = emptyMap(),
     val body: ByteArray? = null,
     val bodyFile: File? = null,
+    val abort: HttpAbort? = HttpAbort.current(),
 )
 
 /** One HTTP response; header names lower case. */
@@ -53,7 +102,13 @@ internal class UrlConnectionTransport(
 ) : HttpTransport {
     override fun send(request: HttpRequest): HttpResponse {
         val c = URL(request.url).openConnection() as HttpURLConnection
+        val abort = request.abort
         try {
+            if (abort != null) {
+                if (abort.aborted) throw IOException(ENDED)
+                // closing the connection ends a write, or a wait for the answer, on this thread
+                abort.inFlight { c.disconnect() }
+            }
             c.instanceFollowRedirects = false
             c.useCaches = false
             c.connectTimeout = connectTimeoutMs
@@ -66,21 +121,58 @@ internal class UrlConnectionTransport(
                 // segments stream from disk with their length (never chunked: R2 refuses that)
                 c.doOutput = true
                 c.setFixedLengthStreamingMode(file.length())
-                c.outputStream.use { o -> file.inputStream().use { it.copyTo(o, 64 * 1024) } }
+                connected(c, abort)
+                c.outputStream.use { o ->
+                    file.inputStream().use { input ->
+                        // in small blocks: an ended request hands the system no more than the block it is in, and
+                        // lets go of the file at once
+                        val block = ByteArray(BLOCK)
+                        while (true) {
+                            if (abort?.aborted == true) throw IOException(ENDED)
+                            val n = input.read(block)
+                            if (n < 0) break
+                            o.write(block, 0, n)
+                        }
+                    }
+                }
             } else if (bytes != null) {
                 // small JSON bodies are buffered: in streaming mode a 401's body (its error code) is lost
                 c.doOutput = true
+                connected(c, abort)
                 c.outputStream.use { it.write(bytes) }
+            } else {
+                connected(c, abort)
             }
+            if (abort?.aborted == true) throw IOException(ENDED)
             val status = c.responseCode
             val stream: InputStream? = if (status >= 400) c.errorStream else try { c.inputStream } catch (_: IOException) { c.errorStream }
             val body = stream?.use { it.readBytes() } ?: ByteArray(0)
             val headers = HashMap<String, String>()
             for ((k, v) in c.headerFields) if (k != null && v != null && v.isNotEmpty()) headers[k.lowercase()] = v.last()
+            // an answer that still came after the request was ended is not given out
+            if (abort?.aborted == true) throw IOException(ENDED)
             return HttpResponse(status, headers, body)
         } finally {
+            abort?.inFlight(null)
             c.disconnect()
         }
+    }
+
+    /**
+     * A request that can be ended connects first: closing a connection that does not exist yet ends nothing, so an
+     * end that came while it was connecting is seen here, before anything of the request is sent.
+     */
+    private fun connected(c: HttpURLConnection, abort: HttpAbort?) {
+        if (abort == null) return
+        c.connect()
+        if (abort.aborted) throw IOException(ENDED)
+    }
+
+    private companion object {
+        const val ENDED = "the request was ended"
+
+        /** A body file is sent in blocks of this size. */
+        const val BLOCK = 16 * 1024
     }
 }
 

@@ -99,6 +99,11 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     internal val recorder = ShareRecorder(env.clock, { cloud.currentConfig?.flags?.shareJoinMs ?: TakeJoin.DEFAULT_WINDOW_MS },
         { active }, ::identity, ::open, TakeSequence(File(dir, "take-seq.json")))
 
+    init {
+        // an accepted deletion whose work on this device a kill cut short is finished before anything else happens
+        if (state.deletionUnfinished) try { finishDeletion() } catch (_: Exception) {}
+    }
+
     // ---- state ----
 
     /**
@@ -160,13 +165,22 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
 
     /**
      * The settings switch (not a sheet answer). On records the version in force now (already on: the version
-     * agreed to stays). Off stops uploads at once and deletes the unsent queue, and the SDK never asks again;
+     * agreed to stays). Off ends the upload in progress and deletes the unsent queue, and the SDK never asks again;
      * it works whatever words were agreed to.
      */
     fun setOn(on: Boolean) {
         val c = copy
+        // the learner's no is recorded first: from then on the uploader's own look before every request says no
+        // too; then the uploader is stopped, its request ended, and the queue deleted
         state.setFromSettings(on, c.consentVersion, textSha256 = c.consentTextSha256)
-        if (!on) stopAndClearQueue() else env.scheduler.scheduleUploads(cloud)
+        if (!on) {
+            stopAndClearQueue()
+            // a no the device could not store is in force in this process all the same; it is tried again now that
+            // the queue's files are gone, and at every later change of the state
+            state.store()
+        } else {
+            env.scheduler.scheduleUploads(cloud)
+        }
     }
 
     /** Every session in the outbox, oldest first. */
@@ -197,11 +211,11 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         return copy.impactMinutes(minutes)
     }
 
-    private fun stopAndClearQueue() {
-        // the open recording ends at once, in a take or waiting for the next one
-        recorder.stop()
-        outbox.cancelQueued()
-    }
+    /**
+     * Sharing goes off (SPEC 11.7): the uploader is stopped and its request in flight ended first; then the open
+     * recording ends at once, in a take or waiting for the next one; then the unsent queue is deleted.
+     */
+    private fun stopAndClearQueue() = outbox.cancelQueued(first = { recorder.stop() })
 
     /** The signed config switched sharing off: pause; the local queue is kept 7 days (the outbox expires it). */
     internal fun configTurnedOff() = recorder.stop()
@@ -225,34 +239,69 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
      * the device key, POST /v1/contributions/delete with no app credential. 202 for every
      * well-formed request; the server purges after answering. Then: sharing off, the local queue
      * gone, a new contributor id and key at the next share. Blocking.
+     *
+     * The uploader is stopped BEFORE the server is asked and stays stopped until it answered (SPEC 11.7): nothing
+     * is uploaded under a contributor that is being deleted. The no is on the device before the server is asked too
+     * (R5): a process that ends during the ask finds sharing off at its next launch and deletes the queue. A deletion
+     * the server did not take changes nothing: the earlier state is written back, sharing is still on, nothing on
+     * the device was deleted, and the queue goes on. When the device cannot store the no (a full disk), the server
+     * is asked all the same; an accepted deletion then turns sharing off in this process, deletes the queue, and
+     * stores the no as soon as the device can (first of all right after the queue's files are gone).
      */
     internal fun deleteEverything(): Deletion {
-        if (!contributor.hasKey) {
-            stopAndClearQueue()
-            recorder.forget()
-            outbox.clearAll()
-            state.afterDeletion()
-            return Deletion.NOTHING_SHARED
+        val result = outbox.whileStopped {
+            if (!contributor.hasKey) {
+                state.afterDeletion()
+                finishDeletion()
+                Deletion.NOTHING_SHARED
+            } else {
+                val app = env.app.appId
+                val id = contributor.id
+                // on the device before the server is asked: what a process that ends in here leaves is a no. When it
+                // cannot be stored, the server is asked all the same (SPEC 11.7)
+                state.deletionAsked()
+                try {
+                    val nonce = cloud.api.deletionChallenge(app, id)
+                    val ts = env.clock() / 1000
+                    val msg = ContributorKeys.deletionMessage(app, id, nonce, ts)
+                    val sig = contributor.sign(msg.toByteArray(Charsets.UTF_8))
+                    cloud.api.deleteSigned(linkedMapOf("app" to app, "contributor" to id, "nonce" to nonce, "timestamp" to ts,
+                        "action" to "delete-all", "signature" to java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(sig)))
+                } catch (e: CloudException) {
+                    state.deletionRefused()
+                    return@whileStopped if (e.offline) Deletion.OFFLINE else Deletion.REFUSED
+                } catch (e: Exception) {
+                    state.deletionRefused()
+                    throw e
+                }
+                // accepted: the no in force, in one write with the count and the mark of this deletion; then the device's part
+                state.afterDeletion()
+                finishDeletion()
+                Deletion.ACCEPTED
+            }
         }
-        val app = env.app.appId
-        val id = contributor.id
-        return try {
-            val nonce = cloud.api.deletionChallenge(app, id)
-            val ts = env.clock() / 1000
-            val msg = ContributorKeys.deletionMessage(app, id, nonce, ts)
-            val sig = contributor.sign(msg.toByteArray(Charsets.UTF_8))
-            cloud.api.deleteSigned(linkedMapOf("app" to app, "contributor" to id, "nonce" to nonce, "timestamp" to ts,
-                "action" to "delete-all", "signature" to java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(sig)))
-            stopAndClearQueue()
-            // the count of recordings and the previous take's end go with what was shared (SPEC 11.3)
-            recorder.forget()
-            outbox.clearAll()
-            contributor.reset()
-            state.afterDeletion()
-            Deletion.ACCEPTED
-        } catch (e: CloudException) {
-            if (e.offline) Deletion.OFFLINE else Deletion.REFUSED
-        }
+        // not taken: the upload that was in flight was ended for nothing, so a pass is asked for again
+        if (result == Deletion.OFFLINE || result == Deletion.REFUSED) env.scheduler.scheduleUploads(cloud)
+        return result
+    }
+
+    /**
+     * The device's part of an accepted deletion, after [ConsentState.afterDeletion] saved the no: the open recording,
+     * the queue and every status, the take count, the contributor. A kill in here leaves the mark in the saved state,
+     * and the next launch runs this again before anything else.
+     */
+    private fun finishDeletion() {
+        clearEverything()
+        if (contributor.hasKey) contributor.reset()
+        state.deletionFinished()
+    }
+
+    /** After a deletion: the open recording, the unsent queue, and every uploaded recording's status. */
+    private fun clearEverything() {
+        stopAndClearQueue()
+        // the count of recordings and the previous take's end go with what was shared (SPEC 11.3)
+        recorder.forget()
+        outbox.clearAll()
     }
 
     // ---- the recognizer's hooks (through QuranLabCloud) ----
@@ -273,6 +322,9 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
 
     /** A new recording for the take [e] (its session JSON is written once, with the first audio), or null. */
     private fun open(e: TajweedObserver.SessionStart, order: RecordingOrder): Recording? {
+        // the count first, the consent after it: a no between the two is either seen by the look at the consent or
+        // leaves this recording with an old count
+        val count = state.changes
         if (!active) return null
         val binding = try { contributor.binding() } catch (_: Exception) { return null }
         val c = contributor.id
@@ -285,7 +337,7 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
             ShareCapture.sessionJson(e.revision, e.decodeBackend, e.weightsSha256, consentVersion, c, binding.first, binding.second,
                 day, dev.deviceClass, dev.osMajor, rate, route, textSha,
                 modelBuild = e.build, takeSeq = order.takeSeq, gapMsPrev = order.gapMsPrev)
-        }, e.inputRoute.takeIf { it in ROUTES } ?: env.inputRoute().takeIf { it in ROUTES } ?: "unknown", { active })
+        }, e.inputRoute.takeIf { it in ROUTES } ?: env.inputRoute().takeIf { it in ROUTES } ?: "unknown", { active }, consent = count)
     }
 
     internal fun audio(samples: FloatArray, offset: Int, length: Int, sampleRate: Int) = recorder.audio(samples, offset, length, sampleRate)
@@ -337,6 +389,9 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         override fun contributorRevoked() { contributor.reset() }
         override fun badRequest(route: String) = cloud.report("other", "bad_request:$route")
         override fun log(message: String) { if (env.debugBuild) try { env.log(message) } catch (_: Exception) {} }
+        override fun consentInForce(): Boolean = state.granted
+        override fun consentCount(): Int = state.changes
+        override fun deletedBelow(): Int = state.deletedBelow
     }
 
     companion object {

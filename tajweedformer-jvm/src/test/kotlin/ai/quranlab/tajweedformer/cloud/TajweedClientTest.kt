@@ -555,7 +555,9 @@ class TajweedClientTest : OpenChecked() {
     fun theRefusalVectors() = runBlocking {
         val vectors = Json.parse(javaClass.getResourceAsStream("/vectors30/refusals.json")!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>
         assertEquals("quranlab.sdk-refusal-vectors/1", vectors["format"])
-        assertEquals(SdkInfo.VERSION, vectors["sdk"])
+        // the vectors were written for the SDK version they name: where a message states the SDK's own version
+        // ({sdk}), this SDK states its own
+        val vectorsSdk = vectors["sdk"] as String
         val cases = vectors["cases"] as List<Map<String, Any?>>
         assertEquals(11, cases.size)
         stub.appId = vectors["app"] as String
@@ -575,7 +577,8 @@ class TajweedClientTest : OpenChecked() {
                 e
             }
             assertEquals("$name: code", expect["code"], e?.code)
-            assertEquals("$name: message", expect["message"], e!!.message)
+            val message = (expect["message"] as String).replace("this is $vectorsSdk.", "this is ${SdkInfo.VERSION}.")
+            assertEquals("$name: message", message, e!!.message)
             assertEquals("$name: fix", expect["fix"], e.fix)
             val report = valid(c.diagnose())
             assertEquals("$name: diagnose", mapOf("accepted" to false, "reason" to expect["code"]), report["key"])
@@ -584,7 +587,7 @@ class TajweedClientTest : OpenChecked() {
             val asked = stub.seen.size
             assertTrue("$name: the server was never asked", asked > 0)
             val again = try { c.prefetch(); null } catch (x: TajweedError) { x }
-            assertEquals("$name: the same words again", listOf(expect["code"], expect["message"], expect["fix"]), listOf(again?.code, again?.message, again?.fix))
+            assertEquals("$name: the same words again", listOf(expect["code"], message, expect["fix"]), listOf(again?.code, again?.message, again?.fix))
             assertEquals("$name: a refused client went on asking the server", asked, stub.seen.size)
             c.close()
             passed++
