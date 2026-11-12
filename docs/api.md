@@ -59,8 +59,6 @@ public class TajweedModel
     public suspend fun listen(from: TajweedClip, options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession
     public suspend fun listen(from: FloatArray, sampleRate: Int, options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession
     public suspend fun session(options: TajweedSessionOptions = TajweedSessionOptions()): TajweedSession
-    public companion object
-        public suspend fun open(folder: File): TajweedModel
 ```
 
 ```kotlin

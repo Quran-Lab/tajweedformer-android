@@ -63,7 +63,8 @@ class AccelDenyTest : OpenChecked() {
 
     @Test fun prefixAndStarPatterns() {
         assertNotNull(denied(base + ("os_version" to "1*") + ("device_class" to "Pixel*") + ("model_revision" to "v4.0-*")))
-        assertNotNull(denied(base + ("sdk_version" to "3.0.*") + ("accelerator" to "*")))
+        // the SDK's own line (3.0.* for 3.0.x, 3.1.* for 3.1.x)
+        assertNotNull(denied(base + ("sdk_version" to SdkInfo.VERSION.substringBeforeLast('.') + ".*") + ("accelerator" to "*")))
         assertNull(denied(base + ("device_class" to "SM-*")))
         assertNull(denied(base + ("os_version" to "1")))
     }

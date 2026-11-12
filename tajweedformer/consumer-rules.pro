@@ -6,9 +6,9 @@
 -keepdirectories ai/quranlab/tajweedformer
 # LiteRT is optional (the NPU backend): absent classes are fine.
 -dontwarn com.google.ai.edge.litert.**
-# Play Integrity is optional (attested sharing uploads; an app that wants it adds the dependency). These are the
-# ten classes of it, and of the Play services tasks library it returns, that the SDK refers to. Without these
-# lines R8 stops an app that shrinks and does not have the dependency with "Missing classes".
+# Play Integrity is a dependency of the AAR since 3.1.0; an app may still exclude it (the SDK then asks for no
+# integrity token). These are the ten classes of it, and of the Play services tasks library it returns, that the SDK
+# refers to. Without these lines R8 stops an app that shrinks and excluded the dependency with "Missing classes".
 -dontwarn com.google.android.gms.tasks.Task
 -dontwarn com.google.android.gms.tasks.Tasks
 -dontwarn com.google.android.play.core.integrity.IntegrityManagerFactory

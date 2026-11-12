@@ -1,5 +1,74 @@
 # Changelog
 
+## 3.1.0
+
+A model comes from Quran Lab's server, through the Client, and from nowhere else. The same change in the Android,
+Apple, web and C SDKs.
+
+- **Removed: opening a model folder the app supplies.** A model comes from Quran Lab's server through the Client.
+  `TajweedModel.open(folder)` is gone, and an app that calls it does not compile. Why: the model is Quran Lab's to
+  deliver, verify and update, and an app that carries its own copy cannot be told of a newer or a withdrawn build.
+  What replaces it: `client.model()`, and `client.prefetch()` to download ahead. **Migration:** replace
+  `TajweedModel.open(folder)` with `TajweedClient(context, key).model()` (on the desktop JVM
+  `TajweedClient(key, storage).model()`) and take the model folder out of the app.
+- **The Client opens only a model it downloaded itself.** It keeps a record of each download, bound to this device
+  (Android: an HMAC key in the Android Keystore, which never leaves it; desktop JVM: a key derived from the machine's
+  id and the user name, or a key file in the storage folder on a machine without an id). A model folder in the SDK's
+  storage without that record, shipped in the app and copied into place or copied from another device, is deleted
+  and the model is downloaded. **An app that updates from an earlier SDK downloads the model once more**, because
+  the model it holds has no record; without a connection at that first start `client.model()` fails with
+  `needs_connection`. After that a model runs without a network, as before. When the key store fails (locked,
+  unavailable), nothing is opened, deleted or downloaded, and the call fails with `storage_failed`.
+- **Changed: a refused Client stops running the model and removes it.** When Quran Lab refuses the key or the app (a
+  revoked key, a paused or blocked app), the SDK stops running the model and removes the downloaded model from the
+  device. Once the key is accepted again the model is downloaded again. The refusals that do it: a key that was
+  revoked or that Quran Lab never issued; `app_not_allowed`, `origin_not_allowed`, `key_type_mismatch`;
+  `app_blocked`, which is an app blocked by Quran Lab or paused by its developer; `developer_not_approved`.
+  `client.model()` and `prefetch` fail with that refusal (`invalid_key`, or `server_rejected` with the refusal's
+  message and fix), also at the next start without a network, until a later answer accepts the key. The SDK removes
+  every model build it holds, what `removeModels()` removes, in the call that received the refusal; a file the system
+  does not let go of then is removed when the open Model is closed or at the next start. Before, a model on the
+  device kept running. A missing connection, a timeout, a server error, a network Quran Lab does not serve and any
+  answer that names no such reason never stop or remove a model, and a Model that is already open keeps running until
+  the app closes it. `sdk_too_old` does what it did. `diagnose()` names the refusal. What the SDK cannot remove: a
+  cache that a phone maker's accelerator runtime keeps by itself of a program the SDK loaded into it.
+- **Changed: model files are requested with the install's token.** Every request for the model (its manifest, each
+  file, each resumed range) carries the app token the SDK already uses for its other calls, next to the key, and
+  never follows a redirect. Two refusals of such a request have their own message and fix under `server_rejected`:
+  `model_attestation_required` and `model_not_allowed`; Quran Lab's daily limit for model downloads is
+  `download_failed` and is not retried in a loop. A refusal of the key while `model.reference.fetch()` downloads is
+  that refusal, not `reference_missing`.
+- **Changed: the SDK depends on Google's Play Integrity library**, `com.google.android.play:integrity:1.4.0` (an
+  `implementation` dependency of the AAR, so an app gets it through the SDK; with the ten libraries it brings it adds
+  33,594 bytes to the example app's release APK shrunk with R8, and 34,420 bytes to its debug APK). Quran Lab can
+  ask, before it sends the model or takes a shared recording, for proof that the request comes from the app as Google
+  Play delivered it, on a real device. The SDK asks Play for an integrity token only when Quran Lab's signed config
+  gives it Quran Lab's Cloud project number; without it the SDK asks Play for nothing and nothing changes for an
+  install. Where Play services are missing or Play cannot answer, it continues with an unattested token. **Removed:
+  the manifest entry `ai.quranlab.tajweedformer.PLAY_INTEGRITY_PROJECT`**: the project number comes from Quran Lab's
+  signed config, and an app that set the entry can delete it (it is not read).
+- **Changed: the sharing sheet and "What is shared" now say that no human ever listens to your recordings: only
+  software learns from them.** A learner who already agreed is not asked again, and their recordings keep the
+  consent version they agreed to; a learner asked from now on agrees to `share-2026-11-12` (copy deck
+  `2026-11-12.1`, the same in every Quran Lab SDK). The sentence is part of a line every sheet already shows, the
+  guardian variant included.
+- **Changed: the error catalogue** (the shared `errors.json`): the fix sentence of `model_missing`, the two reasons
+  above, and the words of `app_blocked`.
+- Tests: the shared vector `model_gate.json` (32 answers of the API and of the model host: which stop and remove a
+  model, remembered across a start and cleared by an accepting answer, and the error the app gets), each with a model
+  from a real download on the device and without one: a stop leaves no model file and no record and the next accepted
+  call downloads every file again, an answer that is not a stop removes nothing; a stop keeps the remembered refusal,
+  the device key, the sharing state and an unsent recording; a removal that fails is done at the next start; files
+  put back by hand are removed at a start that holds a refusal; a refusal of a model request that an answer of the
+  API does not clear; a storage folder filled in advance is not opened and is replaced by a download; a record made
+  with another device's key and a record of another build are not valid; a download, then a start with no request for
+  a file; an interrupted download resumes; the record is written before the first request; the two ways the key store
+  can fail; the headers of a manifest, a file and a range request; the token's renewal; no redirect; Play Integrity
+  with and without the project number and where Play fails. These run against the stub servers. The Android
+  Keystore's key of the install record ran on a phone, an Alcatel 1 with Android 11, in `InstallKeyDeviceTest` (key
+  made, records written and read back after a relaunch, a record of another key refused, a deleted key read as no
+  key), which CI does not run; the call to Play ran on no device.
+
 ## 3.0.1
 
 One fix: sharing turned off, or what was shared deleted, while a recording is being uploaded, or just before the

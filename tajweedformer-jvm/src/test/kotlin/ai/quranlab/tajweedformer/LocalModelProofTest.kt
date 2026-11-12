@@ -22,7 +22,7 @@ import java.nio.ByteOrder
  *     [-PproofKey=<the folder's public key, hex>] [-Pnative]
  * ```
  *
- * 1. The 35 conformance clips: `TajweedModel.open`, `model.session()`, `push` in pieces, the chunks, `finish()`. For
+ * 1. The 35 conformance clips: `TajweedModel.openVerifiedFolder` (internal), `model.session()`, `push` in pieces, the chunks, `finish()`. For
  *    every clip the chunk count, the take's greedy tokens, the cumulative FNV-1a of `log_probs` and the FNV-1a of
  *    each of the 12 outputs of every chunk are compared with the engine's expected rows
  *    (`conformance/v4_<context>_audio_expected.jsonl`, the fields `bench/v4_conformance_check.py` compares), for the
@@ -87,7 +87,7 @@ class LocalModelProofTest : OpenChecked() {
         val verifier = prop("TJ_TEST_PUBLIC_KEY")?.let { ManifestVerifier(listOf(TestKit.hex(it))) } ?: ManifestVerifier()
         val peak = Peak()
         val t0 = System.nanoTime()
-        val model = TajweedModel.open(folder, ModelHost(verifier = verifier))
+        val model = TajweedModel.openVerifiedFolder(folder, ModelHost(verifier = verifier))
         val lines = ArrayList<String>()
         fun say(s: String) { lines.add(s); println(s) }
         say("local proof: SDK ${SdkInfo.VERSION}, model ${model.version} build ${model.build}, contexts ${model.contexts}, engine through JNI on ${System.getProperty("os.name")} ${System.getProperty("os.arch")}")

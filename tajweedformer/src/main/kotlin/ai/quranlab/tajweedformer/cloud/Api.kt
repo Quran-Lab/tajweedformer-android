@@ -26,11 +26,15 @@ internal sealed class Credential {
 internal class QuranLabApi(
     val apiUrl: String = DEFAULT_API,
     transport: HttpTransport = UrlConnectionTransport(),
+    /** Sees every answer of every route (the refusals that stop a model, SPEC 15.3, are remembered there). */
+    private val observe: (HttpResponse) -> Unit = {},
 ) {
     private val base = apiUrl.trimEnd('/')
 
     /** Every request goes through here: the system's refusal of the network is an IOException like no connection. */
-    private val http = HttpTransport { r -> ai.quranlab.tajweedformer.permitted { transport.send(r) } }
+    private val http = HttpTransport { r ->
+        ai.quranlab.tajweedformer.permitted { transport.send(r) }.also { a -> try { observe(a) } catch (_: Exception) {} }
+    }
 
     private fun call(method: String, path: String, cred: Credential?, body: Map<String, Any?>? = null,
                      extra: Map<String, String> = emptyMap(), expectOk: Boolean = true): HttpResponse {

@@ -2,8 +2,11 @@ package ai.quranlab.tajweedformer
 
 import ai.quranlab.tajweedformer.accel.AcceleratorState
 import ai.quranlab.tajweedformer.cloud.CloudOptions
+import ai.quranlab.tajweedformer.cloud.ModelGate
+import ai.quranlab.tajweedformer.cloud.ModelRequestHeaders
 import ai.quranlab.tajweedformer.cloud.QuranLabCloud
 import ai.quranlab.tajweedformer.cloud.QuranLabKey
+import ai.quranlab.tajweedformer.cloud.Refusals
 import ai.quranlab.tajweedformer.cloud.RemoteConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
@@ -37,6 +40,8 @@ public class TajweedClient internal constructor(
 ) : AutoCloseable {
     private val work = Executors.newSingleThreadExecutor { r -> Thread(r, "tajweedformer-client").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
     private val modelLock = Mutex()
+    /** One removal of the models at a time (SPEC 15.3); made before the init block that may run one. */
+    private val removalLock = Any()
     @Volatile private var closed = false
     @Volatile private var model: TajweedModel? = null
     /** The version the open Model was asked for (null: Quran Lab's choice). The server may have answered a pin with
@@ -81,6 +86,11 @@ public class TajweedClient internal constructor(
 
     init {
         OpenObjects.opened(this, "Client")
+        // SPEC 15.3: before the Client does anything else, a removal of the models that is owed, or
+        // model files on a device that holds a refusal (put back, or left by a removal that could not finish), go;
+        // and from now on every refusal that stops a model removes them
+        if (removalOwed.exists() || (cloud.refusals.current != null && hasModelFiles())) removeModelsForStop()
+        cloud.refusals.onStop = { removeModelsForStop() }
         platform.lifecycle?.let { undo += it(this) }
         // without a lifecycle of its own (the desktop JVM) the making of the client is the app's opening
         if (autoLaunch) work.execute { try { cloud.launch(foreground = platform.lifecycle == null) } catch (_: Exception) {} }
@@ -110,15 +120,21 @@ public class TajweedClient internal constructor(
      *
      * [version] pins a model version (`"4.0.0"`); null takes the version Quran Lab serves this app. Errors:
      * `needs_connection` (the model is not on the device and there is no connection), `download_failed`,
-     * `storage_full`, `invalid_key`, `sdk_too_old`, `server_rejected`, and the model errors of
-     * [TajweedModel.open].
+     * `storage_full`, `storage_failed`, `invalid_key`, `sdk_too_old`, `server_rejected`, and the model's own:
+     * `model_invalid`, `signature_invalid`, `checksum_mismatch`, `model_incompatible`.
+     *
+     * A model comes only from Quran Lab's server, through this call or [prefetch]: the SDK opens only a build it
+     * downloaded itself on this device. When Quran Lab has refused the key or the app, the call fails with that
+     * refusal (`invalid_key`, or `server_rejected` with its reason), also when a model is on the device, until a later
+     * answer of the server accepts the key. A Model that is already open keeps running until the app closes it.
      */
     @JvmOverloads
     public suspend fun model(version: String? = null): TajweedModel = tracked {
         checkOpen()
         checkVersion(version)
         modelLock.withLock {
-            model?.let { m -> if (version == null || m.version == version || version == modelPin) return m }
+            // while a refusal holds no Model is given, also not the open one (which runs on until the app closes it)
+            model?.let { m -> if (cloud.refusals.current == null && (version == null || m.version == version || version == modelPin)) return m }
             val m = withContext(Dispatchers.IO) { runInterruptible { openModel(version) } }
             model?.close()
             model = m
@@ -147,7 +163,9 @@ public class TajweedClient internal constructor(
                 runInterruptible {
                     if (unmeteredOnly && connection() in WAITS) return@runInterruptible
                     val target = target(cloud.modelVersion, refresh = true)
-                    download(store(target), target, onProgress)
+                    val store = store(target)
+                    val state = admit(store, target)
+                    download(store, target, state, onProgress)
                     Unit
                 }
             }
@@ -201,9 +219,10 @@ public class TajweedClient internal constructor(
      */
     public suspend fun diagnose(): TajweedDiagnosis = withContext(Dispatchers.IO) {
         val cfg = try { cloud.currentConfig } catch (_: Exception) { null }
-        // the key: refused (a server refusal that stops the client), accepted (the server answered a config request in
-        // this process), or not known yet
-        val refusal = (TajweedError.ofServerCode(cloud.stopReason, refused = true) ?: TajweedError.ofServerCode(cloud.lastConfigError))?.code
+        // the key: refused (a refusal that stops the model, remembered on the device, or a server refusal that stops
+        // the client), accepted (the server answered a config request in this process), or not known yet
+        val refusal = (cloud.refusals.current?.let { ModelGate.error(it.reason, platform.cloud.app.bundleId) }
+            ?: TajweedError.ofServerCode(cloud.stopReason, refused = true) ?: TajweedError.ofServerCode(cloud.lastConfigError))?.code
         val accepted: Boolean? = when {
             refusal != null -> false
             cloud.lastConfigAt != 0L -> true
@@ -302,6 +321,43 @@ public class TajweedClient internal constructor(
         }
     }
 
+    /** Says that a removal of the models is owed (SPEC 15.3): there until every model file is gone. */
+    private val removalOwed: File get() = File(File(platform.cloud.storage, "cloud"), "models-removal-owed")
+
+    private fun hasModelFiles(): Boolean = try { modelsDir.walkTopDown().any { it.isFile } } catch (_: Exception) { false }
+
+    /**
+     * A refusal that stops a model removes every model build from the device (SPEC 15.3, contract 1.10.0): what
+     * [removeModels] removes, `models/` whole, whatever the version. The install records and the pointer file go
+     * first, so a folder that cannot go now (a file the system holds) is never opened again. What cannot be removed is
+     * owed ([removalOwed]): tried again when the open Model is closed, at the next start, at every refusal, and before a
+     * build is admitted. Never an error of its own; the remembered refusal, the device key, the sharing state and the
+     * unsent recordings are elsewhere and not touched. Returns whether every model file is gone.
+     */
+    internal fun removeModelsForStop(): Boolean = synchronized(removalLock) {
+        try {
+            removalOwed.parentFile?.mkdirs()
+            removalOwed.writeText("owed\n")
+        } catch (_: Exception) {
+        }
+        try {
+            modelsDir.listFiles()?.forEach { m ->
+                if (m.isFile) m.delete() else m.listFiles { f -> f.isFile && f.name.endsWith(InstallRecords.SUFFIX) }?.forEach { it.delete() }
+            }
+        } catch (_: Exception) {
+        }
+        val gone = try { !modelsDir.exists() || platform.deleteTree(modelsDir) } catch (_: Exception) { false }
+        if (gone && !hasModelFiles()) {
+            removalOwed.delete()
+            true
+        } else {
+            false
+        }
+    }
+
+    /** The install records of the builds this Client downloaded itself (SPEC 15.2). */
+    private val records = InstallRecords(platform.installKeys)
+
     private val currentFile: File get() = File(modelsDir, "current.json")
 
     /** The build last opened or downloaded on this device, or null. */
@@ -320,9 +376,12 @@ public class TajweedClient internal constructor(
         var cfg: RemoteConfig? = cloud.currentConfig
         // a config asked with another pin (or with none) does not say what the server has for this one
         if (refresh || cfg == null || cfg.recommendedRevision == null || !cloud.configAskedWith(version)) cfg = cloud.refreshConfig()
-        // a refusal that stops the client (a revoked key, an SDK too old, a blocked app) is the error when nothing
-        // on the device can serve
         val appId = platform.cloud.app.bundleId
+        // a refusal that stops the model (SPEC 15.3): no model, also not one on the device. One of a model request, once
+        // the API has accepted the key again, is asked of the CDN again ([admit])
+        cloud.refusals.current?.let { s -> if (s.from != Refusals.CDN || !cloud.refusals.askCdnAgain) throw ModelGate.error(s.reason, appId) }
+        // a refusal that stops the client (an SDK too old, a key the server does not take) is the error when nothing
+        // on the device can serve
         val refused = TajweedError.ofServerCode(cloud.stopReason, cloud.sdkRequired ?: cfg?.minSdk, refused = true, appId = appId)
             ?: TajweedError.ofServerCode(cloud.lastConfigError, cloud.sdkRequired ?: cfg?.minSdk, appId = appId)
         val r = cfg?.recommended
@@ -347,10 +406,33 @@ public class TajweedClient internal constructor(
         throw RecognizerException.NeedsConnection()
     }
 
-    private fun store(t: Target): ModelStore {
-        val key = cloud.key?.value
-        return ModelStore(dir(t), t.baseUrl, platform.modelHttp, HeaderProvider { key?.let { mapOf("x-qlab-key" to it) } ?: emptyMap() },
-            ManifestVerifier(platform.trustedKeys), expectBuild = t.build, expectVersion = t.version)
+    /** The store of [t]: every model request with the key and the install's token, made in one place (SPEC 15.4). */
+    private fun store(t: Target): ModelStore =
+        ModelStore(dir(t), t.baseUrl, platform.modelHttp, ModelRequestHeaders(cloud), ManifestVerifier(platform.trustedKeys),
+            expectBuild = t.build, expectVersion = t.version)
+
+    /**
+     * Before anything of [t] is opened or asked for (SPEC 15.2, 15.3): every build folder on the device without a valid
+     * install record is deleted (when the key store fails, nothing is deleted and the call fails with
+     * `storage_failed`); a build without a record gets one that says `downloading`, before the first byte of it is asked
+     * for. Then a refusal of a model request that the API's fresh config let through is asked of the CDN again: a model
+     * request it serves clears it, anything else leaves it, and the call fails with it. Returns the record's state.
+     */
+    private fun admit(store: ModelStore, t: Target): InstallRecords.State {
+        // a removal that is owed comes first: after a refusal the device holds no model, also once the key is accepted
+        if (removalOwed.exists()) removeModelsForStop()
+        records.sweep(modelsDir)
+        val dir = dir(t)
+        val state = records.state(dir, t.build) ?: run {
+            records.remove(dir)
+            records.write(dir, t.build, InstallRecords.State.DOWNLOADING)
+            InstallRecords.State.DOWNLOADING
+        }
+        if (cloud.refusals.current != null) {
+            try { store.manifest(refresh = true) } catch (_: TajweedError) {}
+            cloud.refusals.current?.let { throw ModelGate.error(it.reason, platform.cloud.app.bundleId) }
+        }
+        return state
     }
 
     /**
@@ -371,8 +453,11 @@ public class TajweedClient internal constructor(
     /** The context whose files are downloaded first: the config's `inference.context` when the build ships it. */
     private fun firstContext(m: ModelManifest): String = cloud.inferenceContext?.takeIf { it in m.contexts } ?: m.defaultContext
 
-    /** Brings the CPU set of [t] onto the device (resuming what an earlier call left) and opens the verified folder. */
-    private fun download(store: ModelStore, t: Target, onProgress: ((Long, Long) -> Unit)?): ModelFolder {
+    /**
+     * Brings the CPU set of [t] onto the device (resuming what an earlier call left) and opens the verified folder.
+     * When every file of it is verified, the install record of a download ([state] `downloading`) says `installed`.
+     */
+    private fun download(store: ModelStore, t: Target, state: InstallRecords.State, onProgress: ((Long, Long) -> Unit)?): ModelFolder {
         val m = manifest(store, t)
         val ctx = firstContext(m)
         val missing = store.missingCpu(ctx)
@@ -396,6 +481,7 @@ public class TajweedClient internal constructor(
                 else -> e
             }
         }
+        if (state != InstallRecords.State.INSTALLED) records.write(dir(t), m.build, InstallRecords.State.INSTALLED)
         modelsDir.mkdirs()
         try { currentFile.writeText(Json.write(Target(t.modelId, t.repo, m.build, m.version, t.folder, t.baseUrl).json())) } catch (_: Exception) {}
         return folder
@@ -404,12 +490,13 @@ public class TajweedClient internal constructor(
     private fun openModel(version: String?): TajweedModel {
         val t = target(version, refresh = cloud.lastConfigAt == 0L)
         val store = store(t)
-        val folder = download(store, t, null)
+        val state = admit(store, t)
+        val folder = download(store, t, state, null)
         // the sample clips (0.6 MB) come with the model when they can; a build or a network without them still opens
         try { for (e in ModelProfile.selfTest(folder.manifest, folder.defaultContext)) store.downloader.fetch(e) } catch (_: Exception) {}
-        // older builds of this model are no longer served to this app: their files go
+        // older builds of this model are no longer served to this app: their files and records go
         try {
-            dir(t).parentFile?.listFiles { f -> f.isDirectory && f != dir(t) }?.forEach { it.deleteRecursively() }
+            dir(t).parentFile?.listFiles { f -> f.isDirectory && f != dir(t) }?.forEach { records.remove(it) }
         } catch (_: Exception) {
         }
         val mc = ModelClient(store, ModelClient.Platform(
@@ -424,7 +511,11 @@ public class TajweedClient internal constructor(
             accelerator = { f, ctx -> mc.accelerator(f, ctx) }, forcedCpu = { f -> mc.forcedCpu(f) },
             recited = { r -> cloud.telemetry.recited(r.first, r.second, r.third) },
             chunkDropped = { droppedChunks.incrementAndGet() },
-            onClose = { m -> if (model === m) model = null },
+            onClose = { m ->
+                if (model === m) model = null
+                // the files of a Model that was open at a refusal go once it is closed
+                if (removalOwed.exists()) removeModelsForStop()
+            },
         )
         val m = TajweedModel.of(folder, host)
         // a build promoted in an earlier launch loads and warms its accelerator now, in the background
@@ -442,6 +533,9 @@ public class TajweedClient internal constructor(
     internal fun resumePromotions(): Int {
         val t = current() ?: return 0
         if (platform.accelerator == null) return 0
+        // only a build this Client downloaded itself, and none while a refusal holds (SPEC 15.2, 15.3)
+        if (cloud.refusals.current != null) return 0
+        if (try { records.state(dir(t), t.build) } catch (_: TajweedError) { null } != InstallRecords.State.INSTALLED) return 0
         val mc = modelClient ?: ModelClient(store(t), ModelClient.Platform(soc = platform.soc, network = platform.network,
             npuRunner = platform.npuRunner, npuDownloads = true, forcedBackend = { build -> cloud.forcedBackend(build) },
             accelerator = platform.accelerator))

@@ -57,7 +57,8 @@ internal class StubQlab : AutoCloseable {
     /** The portal's 2.0.1 change (platform client doc 7.1): incident reports may carry `message` and `detail`. Off, a
      *  2.0.0 server: such a body is a 400. */
     @Volatile var incidentsAccepted = false
-    @Volatile var flags: Map<String, Any?> = mapOf("analytics" to true, "issues" to true, "contributions" to true, "upload_trust" to mapOf("android" to "attested"))
+    @Volatile var flags: Map<String, Any?> = mapOf("analytics" to true, "issues" to true, "contributions" to true, "upload_trust" to mapOf("android" to "attested"),
+        "play_integrity_project_number" to PROJECT_NUMBER)
     /** More top-level fields of the signed config (`sdk_latest`, `accel_deny`, fields no SDK knows). */
     @Volatile var extra: Map<String, Any?> = emptyMap()
     /** The config's `inference` field (the portal's Response time); null: absent. A 3.x install gets no `tajweed` block. */
@@ -123,6 +124,13 @@ internal class StubQlab : AutoCloseable {
     val clock: () -> Long = { System.currentTimeMillis() + skewMs }
     /** The integrity token Play would give for a request hash (the stub's "Google" accepts only this). */
     fun integrityToken(hash: String) = "pi.$hash"
+
+    /** The stub's Play: an integrity token for a request hash, and the project number of each request it was asked. */
+    val integrityAsked: MutableList<Long> = Collections.synchronizedList(ArrayList())
+    fun play(hash: String, project: Long): String {
+        integrityAsked.add(project)
+        return integrityToken(hash)
+    }
     @Volatile var integrityRefuses = false
     /** Per-route overrides: return a reply to take over (by request count of that route, 1-based). */
     val overrides: MutableMap<String, (Int, Seen) -> Reply?> = Collections.synchronizedMap(HashMap())
@@ -134,6 +142,11 @@ internal class StubQlab : AutoCloseable {
     private var batches = 0
     private var tokenN = 0
     val attestedTokens: MutableSet<String> = Collections.synchronizedSet(HashSet())
+    /** Every token this stub issued. */
+    val issuedTokens: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
+    /** Whether [token] is one this stub issued. */
+    fun issued(token: String): Boolean = token in issuedTokens
 
     init {
         server.executor = Executors.newFixedThreadPool(4)
@@ -240,6 +253,7 @@ internal class StubQlab : AutoCloseable {
         if (attested) payload["via"] = "pi"
         val t = "qlt_v1." + Base64.getUrlEncoder().withoutPadding().encodeToString(Json.write(payload).toByteArray()) + ".sig${++tokenN}"
         if (attested) attestedTokens.add(t)
+        issuedTokens.add(t)
         return t
     }
 
@@ -507,9 +521,14 @@ internal class StubQlab : AutoCloseable {
         return try { Signature.getInstance("SHA256withECDSA").apply { initVerify(pub); update(msg) }.verify(sig) } catch (_: Exception) { false }
     }
 
+    companion object {
+        /** The Play Integrity project number of the stub's signed config (`flags.play_integrity_project_number`). */
+        const val PROJECT_NUMBER = "123456789012"
+    }
+
     // ---- a configured client against this stub ----
 
-    fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { integrityToken(it) },
+    fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
                     clock: () -> Long = this.clock, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
                     debugBuild: Boolean = false, log: (String) -> Unit = {}) =
         CloudEnvironment(storage, AppIdentity(appId, "3.1", "Recite"), device, FileContributorKeyStore(File(storage, "keys")),
@@ -524,7 +543,7 @@ internal class StubQlab : AutoCloseable {
     }
 
     fun cloud(storage: File, options: CloudOptions = CloudOptions(key, contributions = true, apiUrl = base, trustedKeys = listOf(publicKey)),
-              scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { integrityToken(it) },
+              scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
               clock: () -> Long = this.clock) =
         QuranLabCloud(options, environment(storage, scheduler, integrity, clock))
 }

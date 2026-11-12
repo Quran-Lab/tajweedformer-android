@@ -52,8 +52,8 @@ class TajweedClientTest : OpenChecked() {
     }
 
     /** A Client that talks to the stub; the launch sequence is not run by itself, so each test decides what the server saw. */
-    private fun client(key: String = stub.key, api: String = stub.base): TajweedClient =
-        TajweedClient(key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = api, trustedKeys = listOf(stub.publicKey)),
+    private fun client(key: String = stub.key, api: String = stub.base, storage: File = dir): TajweedClient =
+        TajweedClient(key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(storage), apiUrl = api, trustedKeys = listOf(stub.publicKey)),
             autoLaunch = false).also { open = it }
 
     private fun code(body: () -> Unit): String? = try {
@@ -569,7 +569,9 @@ class TajweedClientTest : OpenChecked() {
             val expect = case["expect"] as Map<String, Any?>
             stub.seen.clear()
             stub.everything = { _ -> StubQlab.Reply.json(status, body) }
-            val c = client()
+            // each case is an install of its own: since 3.1.0 a refusal that stops the model is remembered on the
+            // device (SPEC 15.3), so a storage shared by the cases would carry one case's refusal into the next
+            val c = client(storage = File(dir, "case-$passed").apply { mkdirs() })
             val e = try {
                 c.model()
                 null

@@ -9,10 +9,8 @@ import java.nio.file.StandardCopyOption
  * The model on this device: fetches the signed format 3 manifest, downloads only the profile in use
  * ([ModelProfile]), and opens the verified folder as a [ModelFolder].
  *
- * ```
- * val store = ModelStore(File(context.noBackupFilesDir, "tajweedformer"), headers = { mapOf("x-qlab-key" to key) })
- * val model = store.ensureCpu()                       // 56.5 MB the first time, nothing after
- * ```
+ * Made by the Client only, with the Client's headers ([ModelAuth]: the key and the install's token, SPEC 15.4) and in
+ * a build folder the Client has an install record for (SPEC 15.2).
  *
  * Network policy (LAYOUT.md): the CPU profile downloads on any network; NPU files ([ensureNpu]) only
  * on an unmetered network and only after the CPU path passed its self-test. All calls block: run
@@ -66,12 +64,8 @@ internal class ModelStore @JvmOverloads constructor(
     }
 
     private fun fetchBytes(path: String): ByteArray {
-        val h = HashMap<String, String>()
-        headers?.headers(baseUrl + path)?.let { h.putAll(it) }
-        h["Accept-Encoding"] = "identity"
         try {
-            permitted { transport.get(baseUrl + path, h) }.use { r ->
-                if (r.code != 200) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}")
+            modelRequest(transport, baseUrl + path, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
                 val bytes = r.body.readBytes()
                 if (bytes.size > MAX_MANIFEST_BYTES) throw RecognizerException.DownloadFailed(path, "too large")
                 return bytes
@@ -238,7 +232,7 @@ internal class ModelStore @JvmOverloads constructor(
     }
 
     companion object {
-        /** Where Quran Lab serves model files: `{base}/{owner}/{repo}/{revision}/{path}`, app key in `x-qlab-key`. */
+        /** Where Quran Lab serves model files: `{base}/{owner}/{repo}/{revision}/{path}`, with the key and the install's token. */
         const val MODELS_URL = "https://cdn.quranlab.ai/models"
 
         /**

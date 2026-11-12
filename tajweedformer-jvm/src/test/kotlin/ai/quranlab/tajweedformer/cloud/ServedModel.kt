@@ -26,10 +26,15 @@ internal class ServedModel private constructor(
     /** The folder this object made and deletes at [close]; null when it serves a folder that is not its own. */
     private val owned: File?,
 ) : AutoCloseable {
-    /** One request: the path inside the folder, its `Range` and `If-Range`, the status answered and the body bytes sent. */
-    class Request(val path: String, val range: String?, val ifRange: String?, val status: Int, val sent: Long) {
+    /** One request: the path inside the folder, its `Range` and `If-Range`, the status answered, the body bytes sent,
+     *  and every header it came with (names in lower case). */
+    class Request(val path: String, val range: String?, val ifRange: String?, val status: Int, val sent: Long,
+                  val headers: Map<String, String> = emptyMap()) {
         override fun toString(): String = "$path${range?.let { " [$it]" } ?: ""} -> $status, $sent bytes"
     }
+
+    /** An answer a test gives instead of the file (the CDN's refusals, a redirect). */
+    class Answer(val status: Int, val body: String = "", val headers: Map<String, String> = emptyMap())
 
     val requests: MutableList<Request> = Collections.synchronizedList(ArrayList())
 
@@ -38,6 +43,17 @@ internal class ServedModel private constructor(
 
     /** For a path: the bytes to serve instead of the file's; null: the file. */
     @Volatile var replace: ((String) -> ByteArray?)? = null
+
+    /** For a path and how many times it was asked for so far (1 for the first): the answer to give instead; null: the file. */
+    @Volatile var answer: ((String, Int) -> Answer?)? = null
+
+    /** Called when a request for a path arrives, before it is answered. */
+    @Volatile var onRequest: ((String) -> Unit)? = null
+
+    /** No connection: every request is dropped before an answer (the client sees an IOException), and not recorded. */
+    @Volatile var down = false
+
+    private val asked = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     /** The build id: the first 40 hex of the SHA-256 of the manifest's bytes. */
     val build: String = MessageDigest.getInstance("SHA-256").digest(File(root, ModelManifest.FILE_NAME).readBytes())
@@ -62,16 +78,30 @@ internal class ServedModel private constructor(
     init {
         server.executor = Executors.newFixedThreadPool(2)
         server.createContext("/") { ex ->
+            if (down) {
+                ex.close()
+                return@createContext
+            }
             val path = ex.requestURI.path
             val rel = if (path.startsWith(prefix)) path.removePrefix(prefix) else null
             val range = ex.requestHeaders.getFirst("Range")
             val ifRange = ex.requestHeaders.getFirst("If-Range")
             var status = 404
             var sent = 0L
+            val headers = ex.requestHeaders.entries.associate { it.key.lowercase() to it.value.last() }
             try {
+                rel?.let { r -> try { onRequest?.invoke(r) } catch (_: Exception) {} }
+                val given = rel?.let { r -> answer?.invoke(r, asked.merge(r, 1) { a, b -> a + b }!!) }
                 val other = rel?.let { replace?.invoke(it) }
                 val file = rel?.let { File(root, it) }
-                if (rel == null || (other == null && file?.isFile != true)) {
+                if (given != null) {
+                    status = given.status
+                    val bytes = given.body.toByteArray(Charsets.UTF_8)
+                    for ((k, v) in given.headers) ex.responseHeaders.add(k, v)
+                    if (bytes.isNotEmpty()) ex.responseHeaders.add("content-type", "application/json")
+                    ex.sendResponseHeaders(given.status, if (bytes.isEmpty()) -1 else bytes.size.toLong())
+                    if (bytes.isNotEmpty()) ex.responseBody.use { it.write(bytes) }
+                } else if (rel == null || (other == null && file?.isFile != true)) {
                     ex.sendResponseHeaders(404, -1)
                 } else {
                     val size = other?.size?.toLong() ?: file!!.length()
@@ -113,7 +143,7 @@ internal class ServedModel private constructor(
             } catch (_: IOException) {
                 // the client went away
             } finally {
-                requests.add(Request(rel ?: path, range, ifRange, status, sent))
+                requests.add(Request(rel ?: path, range, ifRange, status, sent, headers))
                 ex.close()
             }
         }

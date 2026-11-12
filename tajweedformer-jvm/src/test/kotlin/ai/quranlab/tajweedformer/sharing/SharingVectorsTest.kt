@@ -186,25 +186,28 @@ class SharingVectorsTest : OpenChecked() {
         }
     }
 
-    /** The bundled deck 2026-11-09.1 is Quran Lab's, byte for byte (the deck's READY list), and parses in every language. */
+    /**
+     * The bundled deck 2026-11-12.1 is Quran Lab's, byte for byte (the deck's READY list),
+     * and parses in every language; the consent version follows the deck.
+     */
     @Test fun copyDeck() {
         val want = mapOf(
-            "ar" to "87c6ff446e7db6f45f7b2f2cf47ba6e58e427d6f97948deb51489ef86443b940",
-            "bn" to "dc43b79f70a4b1ddde201e157e6eae40a05fcd4819201b3c0465ab1172d777fa",
-            "en" to "1b78ece9b9f7f017e8903ff1310e86fd714b31c2f45983fa2573a061087f1354",
-            "fr" to "b915ae7ae88595b7cc100aa97c2a55b8437bb0028ba3cc9453e8440de4c6c8b2",
-            "id" to "5b6c000dbff731cca3ff9fcdfe0964c8cabf4b648a50660dd1471c604830227e",
-            "ms" to "7e61b35f6d4d8f815e32740dc1a45af8212c4972f44d1812ba9ef2596d549c9f",
-            "tr" to "28eb02c30a25cfbe05633854b66275f2fed8071681554007284ceab6d8ce22a1",
-            "ur" to "953730278cc8d630a020a483283a4522bf9846a5dfd2f6510124d0f6ac1c5407",
+            "ar" to "b8a3402a262ac0f295af5e485ae99804fcbab0dde44f403dc9f38e1bc18be5f0",
+            "bn" to "56225ba6ebe642793b288d13b82874f9ada8184df8e83ea679aac3ca28a01acb",
+            "en" to "1600ab0625db9dab1483d1a2bfd0f0ec9e0e636880909a2d47df2eb7fefd52c0",
+            "fr" to "aba381efd20462db4864e8328b9a2f231597ffbffac7f42096b89e59e0950be2",
+            "id" to "8d32f968b66b6b9176a3e2c152c69903a96fa20601d53f47d23cf3d20edba4f5",
+            "ms" to "78bd9055b9c3f1ffa05efee1a15778897ee27f7d15aa1887142682d80f21848c",
+            "tr" to "258a04a68c4e4d44739ca73da170a052cdb2a2f41914e5067314982190e0b9d9",
+            "ur" to "6d50705ea642f30711207b7093337a15cb7afba5d12b5c4d80bf0fe7e192c1d1",
         )
         for ((lang, h) in want) {
             val b = SharingCopy::class.java.getResourceAsStream("/ai/quranlab/tajweedformer/sharing_copy/$lang.json")!!.use { it.readBytes() }
             assertEquals(lang, h, sha(b))
             val c = SharingCopy.forLanguage(lang)
             assertEquals(lang, c.lang)
-            assertEquals("2026-11-09.1", c.version)
-            assertEquals("share-2026-11-09", c.consentVersion)
+            assertEquals("2026-11-12.1", c.version)
+            assertEquals("share-2026-11-12", c.consentVersion)
             assertEquals(0, c.deleteDays)
             assertEquals("immediate", c.deleteTiming)
             assertNull(c.consentTextSha256)
@@ -221,6 +224,11 @@ class SharingVectorsTest : OpenChecked() {
             assertTrue("$lang hadith verified", c.hadith != null && c.hadithRef != null)
         }
         assertEquals("ar", SharingCopy.forLanguage("ar-SA").lang)
+        // SPEC 11.8: the English deck's who line and "What is shared" say that no human ever listens
+        val en = SharingCopy.forLanguage("en")
+        val noHuman = "No human ever listens to your recordings: only software learns from them."
+        assertTrue(en["sheet.who"].endsWith(noHuman))
+        assertTrue(noHuman in en["what.detail"])
         assertEquals("id", SharingCopy.forLanguage("in_ID").lang)
         assertEquals("en", SharingCopy.forLanguage("de").lang)
         assertEquals("You have shared 1 minute of recitation. May Allah reward you.", SharingCopy.ENGLISH.impactMinutes(1))
@@ -231,6 +239,42 @@ class SharingVectorsTest : OpenChecked() {
             "\"consent_version\":\"share-2026-11-07\",\"delete_days\":30,\"strings\":{\"delete.confirm\":\"Deleted within {days} days.\"}}")
         assertEquals("Deleted within 30 days.", old.deletion("delete.confirm"))
         assertNull(old.deleteTiming)
+    }
+
+    private companion object {
+        /** How the sheets read the who line and the detail of What is shared: the deck's string by its key. */
+        const val WHO = "c[\"sheet.who\"]"
+        const val DETAIL = "[\"what.detail\"]"
+    }
+
+    /**
+     * SPEC 11.8: every consent sheet shows the deck's `sheet.who` whole, in each of the eight languages, and "What is
+     * shared" shows `what.detail` whole. The text the SDK hands a sheet is the deck's string itself (read here from the
+     * deck's own JSON, not through the SDK's parser); both of the SDK's sheets, the Views dialog and the Compose sheet,
+     * draw that line after the variant's own lines, so in the learner's variant and in the guardian's.
+     */
+    @Test fun everySheetShowsTheWhoLineWhole() {
+        for (lang in listOf("en", "ar", "id", "ms", "tr", "fr", "ur", "bn")) {
+            val b = SharingCopy::class.java.getResourceAsStream("/ai/quranlab/tajweedformer/sharing_copy/$lang.json")!!.use { it.readBytes() }
+            @Suppress("UNCHECKED_CAST")
+            val strings = (ai.quranlab.tajweedformer.Json.parse(String(b, Charsets.UTF_8)) as Map<String, Any?>)["strings"] as Map<String, String>
+            val c = SharingCopy.forLanguage(lang)
+            for (k in listOf("sheet.who", "what.detail")) {
+                assertTrue("$lang $k", strings[k]!!.isNotEmpty())
+                assertEquals("$lang $k: the sheet shows the deck's line whole", strings[k], c[k])
+            }
+        }
+        val root = generateSequence(java.io.File("").absoluteFile) { it.parentFile }.first { java.io.File(it, "settings.gradle.kts").isFile }
+        for (path in listOf("tajweedformer/src/android/kotlin/ai/quranlab/tajweedformer/SharingViews.kt",
+            "tajweedformer-compose/src/main/kotlin/ai/quranlab/tajweedformer/compose/SharingCompose.kt")) {
+            val src = java.io.File(root, path).readText()
+            val sheet = src.substring(src.indexOf("if (guardian) {"))
+            val variantsEnd = sheet.indexOf("sheet.what")
+            val who = sheet.indexOf(WHO)
+            assertTrue("$path: the consent sheet does not draw sheet.who after both variants' own lines", variantsEnd in 0 until who)
+            // What is shared: the Views dialog draws the detail; the Compose settings open that same dialog
+            assertTrue("$path: What is shared does not draw what.detail", DETAIL in src || "SharingDialogs.whatIsShared(" in src)
+        }
     }
 
     /** The adaptive bitrate ladder: every case of the shared vector, a fresh ladder each, every step's expected rate. */
