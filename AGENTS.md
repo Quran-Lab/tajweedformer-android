@@ -78,9 +78,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.0.0` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.0.0"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.0.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.0.1 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -99,6 +99,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 // app/build.gradle.kts
 dependencies { implementation("ai.quranlab:tajweedformer:3.0.0") }
 ```
+
+Maven Central serves 3.0.0 today. 3.0.1 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 
@@ -307,8 +309,8 @@ learner taps "Share" on the consent sheet, and a learner who never answers never
 each recitation the SDK listens to is uploaded in the background as Opus in one Ogg stream, from a queue on disk
 that survives process death and reboots.
 
-- `client.sharing` (`TajweedSharing`): `isAvailable`, `isOn`, `setOn(false)` (stops uploads at once and deletes the
-  unsent queue), `ask()` (shows the sheet at the app's moment; it counts as one of the three showings an install
+- `client.sharing` (`TajweedSharing`): `isAvailable`, `isOn`, `setOn(false)` (ends the upload in progress and deletes the
+  unsent queue; what the system had already taken of the segment being sent may still go out), `ask()` (shows the sheet at the app's moment; it counts as one of the three showings an install
   ever gets), `items`, `summary()`, `delete()` (deletes what this install shared), `recoveryCode`, and
   `setWording(...)` for an app that words the sheet itself.
 - The SDK shows its own sheet after a finished take, in the learner's language, with a guardian variant for

@@ -179,7 +179,7 @@ public fun SharingSheetHost(client: TajweedClient, style: SharingStyle = Sharing
 }
 
 /**
- * The settings rows: "Share my recitations" (off stops uploads at once and deletes the unsent
+ * The settings rows: "Share my recitations" (off ends the upload in progress and deletes the unsent
  * queue), "What is shared", "Delete what I shared" and the recovery code. Deletion and the code
  * open the SDK's own dialogs: the app never handles either.
  *

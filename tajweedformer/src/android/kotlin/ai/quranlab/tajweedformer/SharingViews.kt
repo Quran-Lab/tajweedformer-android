@@ -313,7 +313,7 @@ internal object SharingDialogs {
 
 /**
  * The settings rows, ready to place in an app's settings screen: "Share my recitations" (a switch:
- * off stops uploads at once and deletes the unsent queue, whatever words the learner agreed to), "What is
+ * off ends the upload in progress and deletes the unsent queue, whatever words the learner agreed to), "What is
  * shared", "Delete what I shared", and the recovery code (once something was shared). Deletion and the code open the
  * SDK's own dialogs, after the learner confirms.
  *

@@ -67,7 +67,10 @@ tasks.withType<Test>().configureEach {
     for (k in listOf("TJ_V4_DIR", "TJ_V4_TRANSPORT_DIR", "TJ_TEST_PUBLIC_KEY", "TJ_NPU_DIR", "TJ_NPU_GOLDEN", "TJ_NPU_WORK", "TJ_NPU_2500_GOLDEN",
         "TJ_SELFTEST_TOKENS_OUT", "TJ_VECTORS_DIR", "TJ_ERRORS_JSON",
         // the real reference table (ReferenceTableTest): the index of the local model folders, and the source table
-        "TJ_LOCAL30", "TJ_EXPECTED_TJ3")) {
+        "TJ_LOCAL30", "TJ_EXPECTED_TJ3",
+        // how many times SharingOffTest runs each of its cases (the shared file says 20; a race passes most single
+        // runs), and a text that picks the cases to run
+        "TJ_REPEAT", "TJ_CASES")) {
         System.getenv(k)?.let { systemProperty(k, it) }
     }
     // bounded before it starts: one test JVM of at most 2 GB (maxHeapSize below), at most 4 workers on a shared

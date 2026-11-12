@@ -74,6 +74,28 @@ internal class StubQlab : AutoCloseable {
     @Volatile var expiresIn = 86_400L
     @Volatile var tamper = false
     @Volatile var down = false
+    /**
+     * A request held in flight (a server that does not answer): every request [which] says true for (method, path)
+     * waits here until [release] opens, and [arrived] opens when the first one waits. Held after its body was read
+     * (the request is in [seen], its answer is what waits), or with [beforeBody] before the server reads the body:
+     * the client is then still sending it (a large segment on a slow network), and the request is in [seen] only
+     * if its whole body came after the release. [cut] counts the ones whose body ended early, [cutBytes] is the most
+     * the server got of one of them (what had left the client when it ended the request), and [handled] opens when
+     * the first held request is through, whole or cut.
+     */
+    class Hold(val beforeBody: Boolean = false, val which: (String, String) -> Boolean) {
+        val arrived = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val handled = java.util.concurrent.CountDownLatch(1)
+        @Volatile var cut = 0
+        @Volatile var cutBytes = 0L
+        internal fun wait() {
+            arrived.countDown()
+            release.await(120, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    @Volatile var hold: Hold? = null
     /** An answer for every API request, whatever its route (a server that refuses the app outright); null: the routes. */
     @Volatile var everything: ((Seen) -> Reply?)? = null
     /** The app identifier the clients made here register with. */
@@ -83,6 +105,8 @@ internal class StubQlab : AutoCloseable {
     @Volatile var notPermitted = false
     /** A request this says true for gets no answer (an IOException), as [down] does for every request. */
     @Volatile var offlineFor: ((HttpRequest) -> Boolean)? = null
+    /** Runs in the client's transport when the answer to a request has arrived (a test ends the process there). */
+    @Volatile var afterSend: ((HttpRequest, HttpResponse) -> Unit)? = null
     @Volatile var batch = 20
     /** The 2.0.3 server's `POST /v1/uploads/{id}/takes`. Off: a server without the route (404 `not_found`). */
     @Volatile var takesRoute = true
@@ -128,10 +152,30 @@ internal class StubQlab : AutoCloseable {
     fun segments(id: String) = objects.filterKeys { it.startsWith("v1/$id/seg-") }.toSortedMap().values.toList()
 
     private fun handle(ex: HttpExchange) {
-        val body = ex.requestBody.readBytes()
+        val held = hold?.takeIf { it.which(ex.requestMethod, ex.requestURI.path) }
+        if (held != null && held.beforeBody) held.wait()
         val headers = ex.requestHeaders.entries.associate { it.key.lowercase() to it.value.last() }
-        val s = Seen(ex.requestMethod, ex.requestURI.path, ex.requestURI.rawQuery ?: "", headers, body)
+        // a client that ended its request while it was sending the body: the server has no request
+        val got = java.io.ByteArrayOutputStream()
+        val whole = try {
+            ex.requestBody.copyTo(got)
+            got.size().toLong() == (headers["content-length"]?.toLongOrNull() ?: got.size().toLong())
+        } catch (_: java.io.IOException) {
+            false
+        }
+        if (!whole) {
+            held?.let {
+                it.cutBytes = maxOf(it.cutBytes, got.size().toLong())
+                it.cut++
+                it.handled.countDown()
+            }
+            ex.close()
+            return
+        }
+        val s = Seen(ex.requestMethod, ex.requestURI.path, ex.requestURI.rawQuery ?: "", headers, got.toByteArray())
         seen.add(s)
+        if (held != null && !held.beforeBody) held.wait()
+        held?.handled?.countDown()
         val r = try { route(s) } catch (e: Exception) { Reply.error(500, "stub_error: ${e.message}") }
         for ((k, v) in r.headers) ex.responseHeaders.add(k, v)
         if (r.status == 304) ex.sendResponseHeaders(304, -1) else {
@@ -475,7 +519,7 @@ internal class StubQlab : AutoCloseable {
     val transport: HttpTransport = UrlConnectionTransport(5_000, 10_000).let { real ->
         HttpTransport { r ->
             if (notPermitted) throw SecurityException("Permission denied (missing INTERNET permission?)")
-            if (down || offlineFor?.invoke(r) == true) throw java.io.IOException("offline") else real.send(r)
+            if (down || offlineFor?.invoke(r) == true) throw java.io.IOException("offline") else real.send(r).also { afterSend?.invoke(r, it) }
         }
     }
 
