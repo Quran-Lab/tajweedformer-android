@@ -24,6 +24,7 @@ and the data it read still ships.
 | `RecognizerException` subclasses | One type, `TajweedError`, with `code`, `message`, `fix`, `docs`. The codes are the same in every Quran Lab SDK. |
 | `TajweedFormer.events.add(SdkObserver)` | `session.events` (speech started and ended, interruptions, a backend change, the end), `model.backend`, `client.diagnose()`. |
 | `QuranLab.sharing`, `QuranLabCloud.background()` | `client.sharing`, `client.background()` (automatic on Android). |
+| `Sharing.prompts`, `accept`, `decline` (your own consent UI) | None in this version: the sheet is the SDK's. `client.sharing.ask()` chooses the moment, `setWording` the words, `SharingTheme` and `SharingStyle` the look; `setOn` is the settings switch only. |
 | `CloudOptions(analytics, audience, ...)` | `TajweedClientOptions(appVersion, storage, analytics, audience)` |
 
 The quick start is now four calls: Client, model, listen, read. See the README.
