@@ -88,6 +88,7 @@ internal class ServedModel private constructor(
             val ifRange = ex.requestHeaders.getFirst("If-Range")
             var status = 404
             var sent = 0L
+            var recorded = false
             val headers = ex.requestHeaders.entries.associate { it.key.lowercase() to it.value.last() }
             try {
                 rel?.let { r -> try { onRequest?.invoke(r) } catch (_: Exception) {} }
@@ -96,6 +97,10 @@ internal class ServedModel private constructor(
                 val file = rel?.let { File(root, it) }
                 if (given != null) {
                     status = given.status
+                    // recorded before the answer goes out: a client that reads a short answer can return, and its test
+                    // read the requests, before this thread would reach the finally block
+                    requests.add(Request(rel ?: path, range, ifRange, status, sent, headers))
+                    recorded = true
                     val bytes = given.body.toByteArray(Charsets.UTF_8)
                     for ((k, v) in given.headers) ex.responseHeaders.add(k, v)
                     if (bytes.isNotEmpty()) ex.responseHeaders.add("content-type", "application/json")
@@ -143,7 +148,7 @@ internal class ServedModel private constructor(
             } catch (_: IOException) {
                 // the client went away
             } finally {
-                requests.add(Request(rel ?: path, range, ifRange, status, sent, headers))
+                if (!recorded) requests.add(Request(rel ?: path, range, ifRange, status, sent, headers))
                 ex.close()
             }
         }

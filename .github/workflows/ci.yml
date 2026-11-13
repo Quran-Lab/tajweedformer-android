@@ -25,6 +25,8 @@ jobs:
         run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
       - name: Compile the Android library's Kotlin and the Compose module
         run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin :tajweedformer-compose:compileReleaseKotlin
+      - name: The sharing sheet's layout and screenshot tests, both drawings (Views and Compose) with Android's own renderer on the JVM
+        run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
       - name: Compile the README's quick start and the example app (examples/quickstart; QuickStartDocTest above keeps the README equal to it)
         run: ./gradlew --no-daemon :examples:quickstart:compileDebugKotlin
 

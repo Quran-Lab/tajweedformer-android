@@ -262,6 +262,7 @@ public class SharingTheme
     public val titleSizeSp: Float
     public val bodySizeSp: Float
     public val titleTypeface: Typeface?
+    public val dark: Boolean?
     public companion object
         public var current: SharingTheme
 public class SharingSettingsView
@@ -286,6 +287,7 @@ public class SharingStyle
     public val cornerRadius: Dp?
     public val titleFont: FontFamily?
     public val bodyFont: FontFamily?
+    public val dark: Boolean?
 public fun SharingSheetHost(client: TajweedClient, style: SharingStyle = SharingStyle())
 public fun SharingSettings(client: TajweedClient, style: SharingStyle = SharingStyle())
 ```
