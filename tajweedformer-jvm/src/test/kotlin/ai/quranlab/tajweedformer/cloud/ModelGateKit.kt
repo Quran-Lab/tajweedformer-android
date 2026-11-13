@@ -15,9 +15,12 @@ import java.io.File
  * compiled against the released 3.0.1 code, which has no key store, to show it red there.
  */
 internal fun gatePlatform(stub: StubQlab, dir: File, s: ServedModel, keys: InstallKeyStore, integrity: IntegrityProvider?,
-                          deleteTree: ((File) -> Boolean)? = null, engine: TajweedEngineFactory = CountingEngines()): ClientPlatform =
+                          deleteTree: ((File) -> Boolean)? = null, engine: TajweedEngineFactory = CountingEngines(),
+                          retry: ai.quranlab.tajweedformer.RetryPlan = ai.quranlab.tajweedformer.RetryPlan.NONE): ClientPlatform =
     ClientPlatform(cloud = stub.environment(dir, integrity = integrity), apiUrl = stub.base, trustedKeys = listOf(stub.publicKey, TestKit.key.first),
-        modelsUrl = s.url, engine = engine, installKeys = keys, deleteTree = deleteTree ?: { f -> f.deleteRecursively() })
+        modelsUrl = s.url, engine = engine, installKeys = keys, deleteTree = deleteTree ?: { f -> f.deleteRecursively() }, modelRetry = retry,
+        // the Keystore's rule (the same failure at three starts in a row makes a new key), as Android's platform has it
+        installKeyReplaced = true)
 
 /**
  * The fake engine, which in addition maps the model's weights file read-only while it is open, as the native engine

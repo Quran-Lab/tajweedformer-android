@@ -70,7 +70,7 @@ class ListenMicrophoneTest : OpenChecked() {
         stub.recommended = s.recommended()
         stub.inference = null
         val engines = CountingEngines()
-        val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = stub.base,
+        val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
             trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = s.url, microphone = mic, warmRate = warmRate,
             engine = engines), autoLaunch = false).also { client = it }
         return Opened(c, c.model(), engines)

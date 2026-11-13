@@ -60,6 +60,14 @@ internal class ClientPlatform(
     val modelsUrl: String = ModelStore.MODELS_URL,
     /** The transport of model downloads. */
     val modelHttp: HttpTransport = UrlConnectionTransport(),
+    /** How a large model file is fetched (SDK 3.1.3: in 8 MiB ranges, four at a time over HTTP/1.1). */
+    val modelRanges: RangePlan = RangePlan.DEFAULT,
+    /** How a model request that the network cut is made again inside the call (SDK 3.1.3: five resumes per file, after
+     *  1, 2, 4, 8 and 16 s). */
+    val modelRetry: RetryPlan = RetryPlan.DEFAULT,
+    /** Keeps a model download going when the app leaves the foreground or its process ends (Android: WorkManager);
+     *  null: none (the desktop JVM, where the process is the app). */
+    val downloads: BackgroundDownloads? = null,
     /** The device's SoC id ([SocIds]), null when unknown. */
     val soc: String? = null,
     /** Whether the network is unmetered now (accelerator files and `prefetch(unmeteredOnly = true)` wait for it). */
@@ -85,6 +93,12 @@ internal class ClientPlatform(
     val extraObserver: ((TajweedObserver) -> (() -> Unit))? = null,
     /** The device key of the install records: the Android Keystore on Android, [MachineInstallKey] on the desktop JVM. */
     val installKeys: InstallKeyStore = MachineInstallKey(),
+    /**
+     * Whether the same failure of [installKeys] at three starts in a row makes a new key ([InstallKeyGuard], the rule of
+     * the Android Keystore, SPEC 15.2). False on the desktop JVM, whose key is derived and has its own rule
+     * ([MachineInstallKey]).
+     */
+    val installKeyReplaced: Boolean = false,
     /** Removes a folder and everything in it; false when something could not be removed (tests make it fail). */
     val deleteTree: (File) -> Boolean = { f -> f.deleteRecursively() },
 )

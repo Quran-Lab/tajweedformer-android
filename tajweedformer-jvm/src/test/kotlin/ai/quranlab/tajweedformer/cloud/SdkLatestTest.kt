@@ -64,7 +64,7 @@ class SdkLatestTest : OpenChecked() {
     @Test fun equalOlderReleaseOrMalformedLogNothing() {
         // equal, older, and newer ones that are malformed (two parts, no severity, a plain http link, a number, a string)
         for (extra in listOf(latest(SdkInfo.VERSION), latest("2.0.3"), latest("1.9.9"), latest("3.0"), latest("abc"),
-            latest("3.1.2", null), latest("3.1.2", "recommended", "http://insecure"), latest(3.2), mapOf("sdk_latest" to "3.1.2"),
+            latest("3.1.99", null), latest("3.1.99", "recommended", "http://insecure"), latest(3.2), mapOf("sdk_latest" to "3.1.99"),
             mapOf("sdk_latest" to emptyMap<String, Any?>()), emptyMap())) {
             stub.extra = extra
             val c = cloud()

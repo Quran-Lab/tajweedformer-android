@@ -50,7 +50,9 @@ public open class TajweedError internal constructor(
         /** A server answer (or no answer) as a catalogue error. */
         fun ofCloud(e: ai.quranlab.tajweedformer.cloud.CloudException): TajweedError {
             val a = e.api ?: return if (e.notPermitted) RecognizerException.NetworkNotPermitted(e) else RecognizerException.NeedsConnection(e)
-            return ofServerCode(a.refusal, a.minSdk, refused = a.status == 403) ?: TajweedError("download_failed", mapOf("detail" to a.toString()), e)
+            // a stop reason gives its error only in a 401 or a 403; under another status the call failed, no more
+            val known = if (a.stopOutOfPlace) null else ofServerCode(a.refusal, a.minSdk, refused = a.status == 403)
+            return known ?: TajweedError("download_failed", mapOf("detail" to a.toString()), e)
         }
 
         /** The server's codes the SDK knows as a refusal of the app or its key, whatever the status they came with. */

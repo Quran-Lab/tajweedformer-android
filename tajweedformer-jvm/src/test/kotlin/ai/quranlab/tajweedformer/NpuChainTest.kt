@@ -315,7 +315,7 @@ class NpuChainTest : OpenChecked() {
         val m = TestKit.sign(TestKit.manifest(files))
         val root = dir()
         TestKit.writeDecoded(root, files, m)
-        val store = ModelStore(root, "http://127.0.0.1:9/never/", verifier = TestKit.verifier)
+        val store = ModelStore(root, "http://127.0.0.1:9/never/", verifier = TestKit.verifier, retry = RetryPlan.NONE)
         val model = ModelFolder.open(root, TestKit.verifier)
         val factory: (File, NpuContract) -> NpuRunner = { _, _ -> error("no runner may load without a build") }
         val prep = NpuPreparer(store, model, NetworkPolicy.ALWAYS_UNMETERED, factory)

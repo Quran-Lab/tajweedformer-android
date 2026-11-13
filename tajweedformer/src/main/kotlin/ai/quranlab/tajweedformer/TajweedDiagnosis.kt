@@ -38,6 +38,11 @@ public class TajweedDiagnosis internal constructor(
      *  `none`, or `unknown` where the platform cannot tell (the desktop JVM). `prefetch(unmeteredOnly = true)` waits
      *  on `metered` and `none`. */
     public val connection: String,
+    /** The protocol the last request for a model file ran on in this process: `h3`, `h2` or `http/1.1`; null while this
+     *  Client has made no model request. The SDK's HTTP stack on Android and on the desktop JVM (`HttpURLConnection`)
+     *  speaks HTTP/1.1 only, so here it is `http/1.1` or null. Kept in memory: it is in no statistics and is never
+     *  written to the device. An optional field of the report: a reader must not expect it from every SDK. */
+    public val downloadProtocol: String? = null,
 ) {
     /** The report as a plain map, in the layout the four SDKs share. */
     public fun toMap(): Map<String, Any?> = linkedMapOf(
@@ -52,6 +57,7 @@ public class TajweedDiagnosis internal constructor(
         "lastError" to lastError,
         "droppedChunks" to droppedChunks,
         "connection" to connection,
+        "downloadProtocol" to downloadProtocol,
     )
 
     /** The report as JSON. */

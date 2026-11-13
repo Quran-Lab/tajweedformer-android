@@ -406,12 +406,156 @@ class ModelFromServerOnlyTest : OpenChecked() {
     @Test
     fun aModelRequestIsNeverRedirected() = runBlocking {
         withTimeout(120_000) {
-            val s = build()
-            val elsewhere = build()
-            s.answer = { path, _ -> ServedModel.Answer(302, "", mapOf("Location" to "${elsewhere.url}/${ServedModel.REPO}/${elsewhere.build}/${ServedModel.FOLDER}/$path")) }
-            val e = error { launch(s, storage()).model() }
-            assertNotNull("a redirected request gave a model", e)
-            assertEquals("the key and the token were taken to another address", emptyList<String>(), elsewhere.paths())
+            // 302 and 307
+            for (code in listOf(302, 307)) {
+                val s = build()
+                val elsewhere = build()
+                s.answer = { path, _ -> ServedModel.Answer(code, "", mapOf("Location" to "${elsewhere.url}/${ServedModel.REPO}/${elsewhere.build}/${ServedModel.FOLDER}/$path")) }
+                val e = error { launch(s, storage()).model() }
+                assertNotNull("$code: a redirected request gave a model", e)
+                assertEquals("$code: the key and the token were taken to another address", emptyList<String>(), elsewhere.paths())
+                assertEquals("$code: the redirected request was asked once", listOf("manifest.json"), s.paths())
+            }
+        }
+    }
+
+    /** The JSON of a refusal with a stop reason, as a 401 carries it. */
+    private val stopBody = """{"error":"invalid_key","message":"This key is not valid.","reason":"key_revoked"}"""
+
+    private fun remembered(dir: File) = File(File(dir, "cloud"), "refused.json")
+
+    /** The API's calls, by what they carry: the key, the token, a sharing start. Each on the Client's own API object,
+     *  so every answer passes the place where a refusal of the API is remembered. */
+    private fun apiCalls(c: TajweedClient): List<Pair<String, () -> Any?>> {
+        val api = c.cloud.api
+        val key = c.cloud.key!!
+        val app = c.cloud.env.app
+        return listOf(
+            "attest (the key)" to { api.attest(key, app) },
+            "the challenge (the key)" to { api.challenge(key) },
+            "config (the token)" to { api.config(Credential.Token("qlt_v1.test"), 1, app, null) },
+            "register (the token)" to { api.register(Credential.Token("qlt_v1.test"), app, "4.0.0", false) },
+            "a telemetry send (the token)" to { api.events("qlt_v1.test", "{}".toByteArray()) },
+            "a sharing start (the token)" to { api.uploadStart("qlt_v1.test", "0123456789abcdef", "{}".toByteArray()) },
+        )
+    }
+
+    /**
+     * An answer with [status] whose body is the JSON of a refusal with a stop reason is NOT a stop (SPEC 15.3: a stop is
+     * read only from a 401 or a 403; 15.4: a redirect is a failed request whatever its body says): to the manifest, to
+     * a file, to a request of an open Model, and to each call of the API. The call fails as a download that failed (an
+     * API call as that call fails), no refusal is remembered, what the device holds of the model stays, and the next
+     * call opens the model. [headers]: what else the answer carries (a redirect's `Location`).
+     */
+    private suspend fun notAStop(status: Int, headers: (String) -> Map<String, String> = { emptyMap() }) {
+        fun answer(path: String) = ServedModel.Answer(status, stopBody, headers(path))
+
+        // the manifest
+        var s = build()
+        var dir = storage()
+        s.answer = { path, _ -> answer(path) }
+        assertEquals("$status to the manifest", "download_failed", error { launch(s, dir).model() }?.code)
+        assertEquals("$status: the manifest was asked once", listOf("manifest.json"), s.paths())
+        assertFalse("$status to the manifest was remembered as a refusal", remembered(dir).exists())
+
+        // a file, with the manifest and the record on the device
+        s = build()
+        dir = storage()
+        s.answer = { path, _ -> if (path == "frontend.zfw.gz") answer(path) else null }
+        assertEquals("$status to a file", "download_failed", error { launch(s, dir).model() }?.code)
+        assertEquals("$status: the file was asked once: ${s.paths()}", 1, s.paths().count { it == "frontend.zfw.gz" })
+        assertFalse("$status to a file was remembered as a refusal", remembered(dir).exists())
+        assertTrue("$status to a file removed what the device held: ${modelFiles(dir)}", modelFiles(dir).isNotEmpty())
+        // nothing stops the next call: the server answers as it should, and the model opens
+        s.answer = null
+        assertNull("$status to a file: the next call did not open the model", error { launch(s, dir).model().close() })
+
+        // a request of an open Model, with the whole model on the device
+        s = build()
+        dir = storage()
+        val keys = Keys()
+        realDownload(s, dir, keys)
+        val held = modelFiles(dir)
+        s.answer = { path, _ -> answer(path) }
+        var c = launch(s, dir, keys)
+        val model = c.model()
+        val e = error { model.reference!!.fetch() }
+        assertTrue("$status to a request of an open Model: ${e?.code}", e != null && e.code != "invalid_key" && e.code != "server_rejected")
+        model.close()
+        assertFalse("$status to a request of an open Model was remembered as a refusal", remembered(dir).exists())
+        assertTrue("$status removed files of the model: ${held - modelFiles(dir).toSet()}", modelFiles(dir).containsAll(held))
+
+        // the API: each call is answered with the same status and body
+        s.answer = null
+        c = launch(s, dir, keys)
+        stub.everything = { _ -> StubQlab.Reply(status, stopBody.toByteArray(), mapOf("content-type" to "application/json") + headers("v1")) }
+        try {
+            for ((name, call) in apiCalls(c)) {
+                val outcome = try { (call() as? HttpResponse)?.status ?: "returned" } catch (x: CloudException) { "failed" }
+                assertTrue("$status to $name was taken for a success: $outcome", outcome == "failed" || outcome == status)
+                assertFalse("$status to $name was remembered as a refusal", remembered(dir).exists())
+                assertTrue("$status to $name removed files of the model: ${held - modelFiles(dir).toSet()}", modelFiles(dir).containsAll(held))
+            }
+            assertFalse("$status: a registration was taken for an accepted one", c.cloud.register())
+            assertFalse("$status to the registration was remembered as a refusal", remembered(dir).exists())
+        } finally {
+            stub.everything = null
+        }
+        // nothing stops the next launch: the model that is on the device opens
+        assertNull("$status to the API's calls: the model on the device did not open at the next launch", error { launch(s, dir, keys).model().close() })
+        assertTrue("$status: files of the model went: ${held - modelFiles(dir).toSet()}", modelFiles(dir).containsAll(held))
+    }
+
+    /** A redirect (302, 307) with a stop reason in its body, and the address in `Location` is never asked (SPEC 15.4). */
+    @Test
+    fun aRedirectWithAStopReasonInItsBodyIsNeverARefusal() = runBlocking {
+        withTimeout(240_000) {
+            for (code in listOf(302, 307)) {
+                val elsewhere = build()
+                notAStop(code) { path -> mapOf("Location" to "${elsewhere.url}/${ServedModel.REPO}/${elsewhere.build}/${ServedModel.FOLDER}/$path") }
+                assertEquals("$code: the key and the token were taken to another address", emptyList<String>(), elsewhere.paths())
+            }
+        }
+    }
+
+    /**
+     * SPEC 15.3: a stop is read only from an answer whose status is 401 or 403. The same body under 404, 429, 500 and
+     * 503 is not a stop; under 401 and 403 it is one (the control: remembered, the model removed), for a model request
+     * and for a call of the API.
+     */
+    @Test
+    fun aStopIsReadOnlyFromA401OrA403() = runBlocking {
+        withTimeout(240_000) {
+            for (status in listOf(404, 429, 500, 503)) notAStop(status)
+            for (status in listOf(401, 403)) {
+                // a model request
+                var s = build()
+                var dir = storage()
+                var keys = Keys()
+                realDownload(s, dir, keys)
+                s.answer = { _, _ -> ServedModel.Answer(status, stopBody) }
+                var c = launch(s, dir, keys)
+                val model = c.model()
+                assertEquals("$status with a stop reason to a request of an open Model", "invalid_key", error { model.reference!!.fetch() }?.code)
+                model.close()
+                assertTrue("$status with a stop reason to a model request was not remembered", remembered(dir).isFile)
+                assertEquals("$status with a stop reason to a model request left the model on the device", emptyList<String>(), modelFiles(dir))
+                // a call of the API
+                s = build()
+                dir = storage()
+                keys = Keys()
+                realDownload(s, dir, keys)
+                c = launch(s, dir, keys)
+                stub.everything = { _ -> StubQlab.Reply(status, stopBody.toByteArray(), mapOf("content-type" to "application/json")) }
+                try {
+                    val attest = apiCalls(c).first()
+                    try { attest.second() } catch (_: CloudException) {}
+                    assertTrue("$status with a stop reason to ${attest.first} was not remembered", remembered(dir).isFile)
+                    assertEquals("$status with a stop reason to ${attest.first} left the model on the device", emptyList<String>(), modelFiles(dir))
+                } finally {
+                    stub.everything = null
+                }
+            }
         }
     }
 

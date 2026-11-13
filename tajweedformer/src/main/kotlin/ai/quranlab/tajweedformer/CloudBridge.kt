@@ -96,7 +96,9 @@ internal class CloudBridge(
         val completed = stats.outcome == "finished"
         cloud.onSessionEnd(TajweedObserver.SessionEnd(stats.audioSeconds, completed, feedbackShown = completed,
             audioMs = stats.audioMs, computeUs = stats.computeUs, speechFrames = stats.speechFrames, silenceFrames = stats.silenceFrames,
-            tokens = stats.tokens))
+            tokens = stats.tokens,
+            // no sample reached the take (an app that opens a session only to warm the engine, and cancels it at once)
+            withoutAudio = stats.audioSeconds <= 0.0))
         sessionOpen(false)
     }
 

@@ -190,7 +190,7 @@ class ReferenceTableTest : OpenChecked() {
             assertEquals(local.build, server.build)
             s.recommended = server.recommended(local.version)
             s.inference = null
-            val c = TajweedClient(s.key, TajweedClientOptions(), ClientPlatform(cloud = s.environment(storage), apiUrl = s.base,
+            val c = TajweedClient(s.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = s.environment(storage), apiUrl = s.base,
                 trustedKeys = listOf(s.publicKey, local.key), modelsUrl = server.url), autoLaunch = false).also { client = it }
             val model = c.model()
             assertEquals(local.build, model.build)

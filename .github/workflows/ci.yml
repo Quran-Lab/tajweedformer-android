@@ -27,6 +27,8 @@ jobs:
         run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin :tajweedformer-compose:compileReleaseKotlin
       - name: The sharing sheet's layout and screenshot tests, both drawings (Views and Compose) with Android's own renderer on the JVM
         run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
+      - name: The bundle dry run's steps are the publish workflow's (what the dry run shows is what the publish workflow would upload)
+        run: python3 scripts/check_bundle_steps.py
       - name: Compile the README's quick start and the example app (examples/quickstart; QuickStartDocTest above keeps the README equal to it)
         run: ./gradlew --no-daemon :examples:quickstart:compileDebugKotlin
 

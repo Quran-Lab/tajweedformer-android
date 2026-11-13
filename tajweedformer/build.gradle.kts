@@ -9,7 +9,9 @@ plugins {
 
 // Maven coordinates ai.quranlab:tajweedformer (version in gradle.properties). Nothing here uploads anywhere:
 // the release writes a signed Maven layout to build/central-bundle and zips it (centralBundle), and the
-// publish workflow (.github/workflows/publish.yml) hands that zip to the Central Portal.
+// publish workflow (.github/workflows/publish.yml) hands that zip to the Central Portal. The zip holds this
+// library AND ai.quranlab:tajweedformer-compose (the Compose module publishes into the same folder): one bundle, one
+// deployment, so both artifacts of a version are on Maven Central or neither is.
 group = "ai.quranlab"
 version = providers.gradleProperty("tajweedformer.version").get()
 
@@ -147,16 +149,25 @@ tasks.matching { it.name == "publishReleasePublicationToBundleRepository" }.conf
 // The bundle for the Central Portal's upload API: the group's Maven layout with the .asc signatures and the
 // checksums the file repository wrote; maven-metadata is the repository's own bookkeeping, not part of a release.
 val centralBundle by tasks.registering(Zip::class) {
-    description = "Zips the signed release publication for the Central Portal (needs SIGNING_KEY)."
-    dependsOn("publishReleasePublicationToBundleRepository")
+    description = "Zips the signed release publications of the core and the Compose module for the Central Portal (needs SIGNING_KEY)."
+    dependsOn("publishReleasePublicationToBundleRepository", ":tajweedformer-compose:publishReleasePublicationToBundleRepository")
     from(bundleDir)
     exclude("**/maven-metadata*")
     archiveFileName.set("central-bundle-${project.version}.zip")
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))
     doFirst {
         check(signingKey != null) { "centralBundle needs SIGNING_KEY: Maven Central refuses unsigned files" }
+        // both components, whole: the AAR, the POM, the module file, sources and javadoc, each with its signature
+        val names = bundleDir.get().asFile.walkTopDown().filter { it.isFile }.map { it.relativeTo(bundleDir.get().asFile).invariantSeparatorsPath }.toSet()
+        for (artifact in listOf("tajweedformer", "tajweedformer-compose")) {
+            val base = "ai/quranlab/$artifact/${project.version}/$artifact-${project.version}"
+            for (file in listOf(".aar", ".pom", ".module", "-sources.jar", "-javadoc.jar")) {
+                check("$base$file" in names) { "the bundle has no $base$file" }
+                check("$base$file.asc" in names) { "the bundle has no signature of $base$file" }
+            }
+        }
         // the native engine must be in the AAR for both Android ABIs
-        val aar = bundleDir.get().asFile.walkTopDown().single { it.name.endsWith("${project.version}.aar") }
+        val aar = bundleDir.get().asFile.walkTopDown().single { it.name == "tajweedformer-${project.version}.aar" }
         val entries = ZipFile(aar).use { z -> z.entries().asSequence().map { it.name }.toSet() }
         for (abi in listOf("arm64-v8a", "armeabi-v7a")) {
             for (lib in listOf("libtajweedformer_jni.so", "libtajweedformer_opus.so")) {

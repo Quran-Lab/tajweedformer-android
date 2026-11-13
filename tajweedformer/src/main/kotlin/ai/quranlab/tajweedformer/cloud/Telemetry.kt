@@ -36,6 +36,8 @@ internal class Telemetry(
     private var agg: DayAggregate? = null
     private var session: CohortKey? = null
     private var sessionThrottled = false
+    /** What the chunks of the open take added to its cohort so far: taken back when the take ends without audio. */
+    private var added = Cohort()
     private var coldStartPending = true
     private var lastWrite = 0L
     private var dirty = false
@@ -75,6 +77,7 @@ internal class Telemetry(
         val k = CohortKey(e.revision, e.context, e.backend, e.build)
         session = k
         sessionThrottled = false
+        added = Cohort()
         val c = a.cohort(k)
         if (coldStartPending) c.coldStartPending = true
     }
@@ -86,8 +89,12 @@ internal class Telemetry(
         c.chunks++
         Hist.latency(c.latency, computeMs)
         if (audioMs > 0) Hist.rtf(c.rtf, computeMs / audioMs)
+        added.chunks++
+        Hist.latency(added.latency, computeMs)
+        if (audioMs > 0) Hist.rtf(added.rtf, computeMs / audioMs)
         if (c.coldStartPending && coldStartPending) {
             Hist.startup(c.coldStart, computeMs)
+            Hist.startup(added.coldStart, computeMs)
             coldStartPending = false
         }
         c.coldStartPending = false
@@ -96,8 +103,8 @@ internal class Telemetry(
 
     fun tokens(margins: FloatArray?, confidences: FloatArray?) = rec { a ->
         val c = a.cohort(session ?: return@rec)
-        margins?.forEach { Hist.margin(c.margin, it.toDouble()) }
-        confidences?.forEach { Hist.confidence(c.confidence, it.toDouble()) }
+        margins?.forEach { Hist.margin(c.margin, it.toDouble()); Hist.margin(added.margin, it.toDouble()) }
+        confidences?.forEach { Hist.confidence(c.confidence, it.toDouble()); Hist.confidence(added.confidence, it.toDouble()) }
     }
 
     /** The app was launched or came back to the foreground. */
@@ -196,6 +203,20 @@ internal class Telemetry(
 
     fun sessionEnd(e: TajweedObserver.SessionEnd) = rec { a ->
         val k = session ?: return@rec
+        if (e.withoutAudio) {
+            // a take without audio is not a session (SPEC 6.1, contract 1.13.0): no `sessions`, no `aborted`, no
+            // `minutes`, and what its chunks added (an engine gives a last chunk also for a take that got no sample:
+            // `chunks`, the latency, the cold start, the margins) is taken back. The cohort its start made, when nothing
+            // else is counted in it, goes again; the launch's cold start is still to be measured
+            a.cohorts[k]?.let { c ->
+                c.takeBack(added)
+                if (c.isBlank()) a.cohorts.remove(k)
+            }
+            if (added.coldStart.isNotEmpty()) coldStartPending = true
+            added = Cohort()
+            session = null
+            return@rec
+        }
         val c = a.cohort(k)
         c.sessions++
         c.minutes += e.audioSeconds / 60
@@ -482,6 +503,23 @@ internal class Cohort {
     var computeUs = 0L
     val tokens = LinkedHashMap<String, Int>()
     @Transient var coldStartPending = false
+
+    /** What the chunks of a take added ([o]: its `chunks` and the figures of each chunk) is taken out again. */
+    fun takeBack(o: Cohort) {
+        chunks = maxOf(0, chunks - o.chunks)
+        for ((dst, src) in listOf(latency to o.latency, rtf to o.rtf, coldStart to o.coldStart, margin to o.margin, confidence to o.confidence)) {
+            for ((k, v) in src) {
+                val left = (dst[k] ?: 0) - v
+                if (left > 0) dst[k] = left else dst.remove(k)
+            }
+        }
+    }
+
+    /** Nothing is counted in it. */
+    fun isBlank(): Boolean = sessions == 0 && minutes == 0.0 && chunks == 0 && aborted == 0 && fallbacks.isEmpty() &&
+        selfTestPass == 0 && selfTestFail == 0 && latency.isEmpty() && rtf.isEmpty() && coldStart.isEmpty() && modelLoad.isEmpty() &&
+        thermalTransitions == 0 && throttledSessions == 0 && margin.isEmpty() && confidence.isEmpty() && takes == 0 &&
+        audioMs == 0L && speechMs == 0L && silenceMs == 0L && computeUs == 0L && tokens.isEmpty()
 
     fun merge(o: Cohort) {
         sessions += o.sessions; minutes += o.minutes; chunks += o.chunks; aborted += o.aborted

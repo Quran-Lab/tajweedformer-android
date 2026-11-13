@@ -28,8 +28,12 @@ internal class ModelStore @JvmOverloads constructor(
     private val expectBuild: String? = null,
     /** The model version the signed config named; null: any. */
     private val expectVersion: String? = null,
+    /** How a large file is fetched (in ranges, SDK 3.1.3). */
+    ranges: RangePlan = RangePlan.DEFAULT,
+    /** How a request that the network cut is made again inside the call (SDK 3.1.3). */
+    private val retry: RetryPlan = RetryPlan.DEFAULT,
 ) {
-    val downloader = ModelDownloader(root, baseUrl, transport, headers)
+    val downloader = ModelDownloader(root, baseUrl, transport, headers, ranges, retry)
 
     @Volatile private var cached: ModelManifest? = null
 
@@ -63,6 +67,7 @@ internal class ModelStore @JvmOverloads constructor(
         return m
     }
 
+    /** A small file whole (the manifest). It is asked once (SPEC 16.2): the retry rule is for the files it lists. */
     private fun fetchBytes(path: String): ByteArray {
         try {
             modelRequest(transport, baseUrl + path, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
@@ -221,7 +226,7 @@ internal class ModelStore @JvmOverloads constructor(
         // a program rebuilt from a delta, and the size and SHA-256 kept next to it, stay with the delta's entry
         val built = m.files.filter { it.role == ModelProfile.NPU_DELTA_ROLE }.map { ModelProfile.deltaProgram(it) } +
             m.files.filter { it.role == "npu-model" || it.role == ModelProfile.NPU_PART_ROLE }.map { it.localPath }
-        val keep = m.files.map { it.localPath }.toSet() + m.files.flatMap { listOf(it.path + ".part", it.path + ".part.v") } +
+        val keep = m.files.map { it.localPath }.toSet() + m.files.flatMap { listOf(it.path + ".part", it.path + ".part.v", it.path + RangedFetch.MAP_SUFFIX) } +
             built + built.map { "$it.target" } + setOf(ModelManifest.FILE_NAME, VerifiedStamps.FILE_NAME, "accelerator.json", "accelerator.sentinel")
         var n = 0
         root.walkBottomUp().filter { it.isFile }.forEach { f ->

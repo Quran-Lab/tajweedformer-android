@@ -560,6 +560,36 @@ class CloudTest : OpenChecked() {
         assertTrue(stub.seen.isEmpty())
     }
 
+    /**
+     * SPEC 15.3 for the words of one failed call: a reason of the stop list (or a code that is one) gives its error
+     * only in a 401 or a 403. Under another status the call's error is the status's own, a request that failed; a
+     * code that is no stop reason keeps its meaning at any status.
+     */
+    @Test fun aStopReasonGivesItsErrorOnlyInA401OrA403() {
+        fun words(status: Int, code: String, reason: String? = null) =
+            ai.quranlab.tajweedformer.TajweedError.ofCloud(CloudException(ApiError(status, code, reason = reason), "x")).code
+        // the control: in a 401 and a 403 the stop reason is the error
+        assertEquals("invalid_key", words(401, "invalid_key", "key_revoked"))
+        assertEquals("server_rejected", words(401, "invalid_key", "app_not_allowed"))
+        assertEquals("app_not_allowed", ApiError(401, "invalid_key", reason = "app_not_allowed").refusal)
+        assertEquals("server_rejected", words(403, "app_blocked", "app_blocked"))
+        assertEquals("app_blocked", ApiError(403, "app_blocked", reason = "app_blocked").refusal)
+        // the same bodies under another status: a failed request, and the reason is not what the app was refused for
+        for (status in listOf(302, 404, 409, 429, 500, 503)) {
+            assertEquals("$status invalid_key with key_revoked", "download_failed", words(status, "invalid_key", "key_revoked"))
+            assertEquals("$status invalid_key with app_not_allowed", "download_failed", words(status, "invalid_key", "app_not_allowed"))
+            assertEquals("$status app_blocked with app_blocked", "download_failed", words(status, "app_blocked", "app_blocked"))
+            assertEquals("$status a code that is a stop reason, without a reason", "download_failed", words(status, "developer_not_approved"))
+            assertEquals("$status: the reason is not the refusal", "invalid_key", ApiError(status, "invalid_key", reason = "app_not_allowed").refusal)
+        }
+        // codes and reasons that stop nothing: as before, at any status
+        assertEquals("sdk_too_old", words(403, "sdk_too_old"))
+        assertEquals("server_rejected", words(403, "environment_mismatch"))
+        assertEquals("server_rejected", words(409, "app_owned_elsewhere"))
+        assertEquals("environment_mismatch", ApiError(409, "conflict", reason = "environment_mismatch").refusal)
+        assertEquals("server_rejected", words(409, "conflict", "environment_mismatch"))
+    }
+
     @Test fun errorTableActions() {
         assertEquals(ErrorAction.STOP_UNTIL_NEXT_LAUNCH, ApiError(401, "invalid_key").action)
         assertEquals(ErrorAction.RENEW_TOKEN, ApiError(401, "invalid_token").action)

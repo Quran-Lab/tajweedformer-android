@@ -9,6 +9,9 @@ import ai.quranlab.tajweedformer.cloud.QuranLabKey
 import ai.quranlab.tajweedformer.cloud.Refusals
 import ai.quranlab.tajweedformer.cloud.RemoteConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -93,7 +96,7 @@ public class TajweedClient internal constructor(
         cloud.refusals.onStop = { removeModelsForStop() }
         platform.lifecycle?.let { undo += it(this) }
         // without a lifecycle of its own (the desktop JVM) the making of the client is the app's opening
-        if (autoLaunch) work.execute { try { cloud.launch(foreground = platform.lifecycle == null) } catch (_: Exception) {} }
+        if (autoLaunch) work.execute { try { cloud.launch(heldRevision(), foreground = platform.lifecycle == null) } catch (_: Exception) {} }
     }
 
     /** Sharing recitations with Quran Lab, where Quran Lab offers it to this app and the learner said yes. */
@@ -102,9 +105,15 @@ public class TajweedClient internal constructor(
     /** The app's own counters for its statistics at sdk.quranlab.ai. */
     public val analytics: TajweedAnalytics = TajweedAnalytics(this)
 
-    private inline fun <T> tracked(body: () -> T): T = try {
+    /**
+     * A call of the app: its error is remembered for `diagnose().lastError`. A call whose coroutine was cancelled ends
+     * as a cancelled coroutine, whatever the work it interrupted failed with (a download sees the cancel as an
+     * interrupted thread and fails with "cancelled"): a cancel is not an error of the app's call.
+     */
+    private suspend inline fun <T> tracked(body: () -> T): T = try {
         guard(body)
     } catch (e: TajweedError) {
+        currentCoroutineContext().ensureActive()
         lastErrorCode = e.code
         throw e
     }
@@ -133,6 +142,8 @@ public class TajweedClient internal constructor(
         checkOpen()
         checkVersion(version)
         modelLock.withLock {
+            // a call that waited for another one while the Client was closed
+            checkOpen()
             // while a refusal holds no Model is given, also not the open one (which runs on until the app closes it)
             model?.let { m -> if (cloud.refusals.current == null && (version == null || m.version == version || version == modelPin)) return m }
             val m = withContext(Dispatchers.IO) { runInterruptible { openModel(version) } }
@@ -159,13 +170,14 @@ public class TajweedClient internal constructor(
     public suspend fun prefetch(unmeteredOnly: Boolean = false, onProgress: ((done: Long, total: Long) -> Unit)? = null): Unit = tracked {
         checkOpen()
         modelLock.withLock {
+            checkOpen()
             withContext(Dispatchers.IO) {
                 runInterruptible {
                     if (unmeteredOnly && connection() in WAITS) return@runInterruptible
                     val target = target(cloud.modelVersion, refresh = true)
                     val store = store(target)
                     val state = admit(store, target)
-                    download(store, target, state, onProgress)
+                    download(store, target, state, onProgress, unmeteredOnly)
                     Unit
                 }
             }
@@ -208,6 +220,8 @@ public class TajweedClient internal constructor(
             modelClient = null
             withContext(Dispatchers.IO) {
                 if (modelsDir.exists() && !modelsDir.deleteRecursively()) throw RecognizerException.StorageFailed(modelsDir.path)
+                // a download that was going on in the background is not owed any more
+                settle(job = true)
             }
         }
     }
@@ -251,6 +265,7 @@ public class TajweedClient internal constructor(
             lastError = lastErrorCode,
             droppedChunks = droppedChunks.get(),
             connection = connection(),
+            downloadProtocol = downloadProtocol,
         )
     }
 
@@ -276,7 +291,7 @@ public class TajweedClient internal constructor(
         if (closed) return
         work.execute {
             try {
-                cloud.foreground()
+                cloud.foreground(heldRevision())
                 cloud.refreshConfig()
                 cloud.deliver()
                 modelClient?.appActivated()
@@ -292,10 +307,12 @@ public class TajweedClient internal constructor(
     }
 
     /** Ends the client: the open Model and its Session are closed, what was counted is kept on disk for the next
-     *  start. After it a new client can be made. */
+     *  start. A `model()` or `prefetch()` call that is downloading ends with `download_failed`, and what it had
+     *  downloaded stays on the device for the next client. After it a new client can be made. */
     override fun close() {
         if (closed) return
         closed = true
+        backgroundCancel.cancel()
         try { model?.close() } catch (_: Exception) {}
         model = null
         try { cloud.telemetry.flushToDisk() } catch (_: Exception) {}
@@ -355,8 +372,24 @@ public class TajweedClient internal constructor(
         }
     }
 
+    /**
+     * The model this install has, for the daily registration (`model_revision`, PLATFORM_CLIENT.md 5): the version of
+     * the Model that is open, else of the build last downloaded or opened on this device, whatever its model id; null
+     * when the device holds none (a first launch, or after the models were removed).
+     */
+    private fun heldRevision(): String? = try {
+        model?.version?.takeIf { it.isNotEmpty() }
+            ?: current()?.takeIf { File(dir(it), ModelManifest.FILE_NAME).isFile }?.let { t -> t.version ?: ModelIds.version(t.build).takeIf { it != t.build } }
+    } catch (_: Exception) {
+        null
+    }
+
     /** The install records of the builds this Client downloaded itself (SPEC 15.2). */
-    private val records = InstallRecords(platform.installKeys)
+    private val records = InstallRecords(
+        if (!platform.installKeyReplaced) platform.installKeys
+        else InstallKeyGuard(platform.installKeys, File(File(platform.cloud.storage, "cloud"), InstallKeyGuard.FILE_NAME),
+            // the one report of a key that was replaced: the failure's class, nothing more
+            replaced = { failure -> cloud.report("other", "install_key_replaced:$failure") }))
 
     private val currentFile: File get() = File(modelsDir, "current.json")
 
@@ -406,10 +439,23 @@ public class TajweedClient internal constructor(
         throw RecognizerException.NeedsConnection()
     }
 
+    /** The protocol of the last answer to a model request of this Client (`diagnose().downloadProtocol`): in memory only. */
+    @Volatile private var downloadProtocol: String? = null
+
+    /** The model transport, with every answer's protocol noted for the diagnose report. */
+    private val modelHttp: HttpTransport = object : HttpTransport {
+        override fun get(url: String, headers: Map<String, String>): HttpResponse = get(url, headers, null)
+
+        override fun get(url: String, headers: Map<String, String>, cancel: Cancellation?): HttpResponse =
+            platform.modelHttp.get(url, headers, cancel).also { r -> downloadProtocol = r.protocol.takeIf { it in DOWNLOAD_PROTOCOLS } }
+
+        override val separateConnections: Boolean get() = platform.modelHttp.separateConnections
+    }
+
     /** The store of [t]: every model request with the key and the install's token, made in one place (SPEC 15.4). */
     private fun store(t: Target): ModelStore =
-        ModelStore(dir(t), t.baseUrl, platform.modelHttp, ModelRequestHeaders(cloud), ManifestVerifier(platform.trustedKeys),
-            expectBuild = t.build, expectVersion = t.version)
+        ModelStore(dir(t), t.baseUrl, modelHttp, ModelRequestHeaders(cloud), ManifestVerifier(platform.trustedKeys),
+            expectBuild = t.build, expectVersion = t.version, ranges = platform.modelRanges, retry = platform.modelRetry)
 
     /**
      * Before anything of [t] is opened or asked for (SPEC 15.2, 15.3): every build folder on the device without a valid
@@ -456,8 +502,14 @@ public class TajweedClient internal constructor(
     /**
      * Brings the CPU set of [t] onto the device (resuming what an earlier call left) and opens the verified folder.
      * When every file of it is verified, the install record of a download ([state] `downloading`) says `installed`.
+     *
+     * A download that starts is owed to the app until it is complete (SDK 3.1.3): the platform's background job
+     * ([BackgroundDownloads], [unmeteredOnly] its network rule) continues it when the app leaves or its process ends.
+     * What fails for good (a refusal, the daily limit, the storage) is not owed any more. [background]: the call is that
+     * continuation ([continueDownload]).
      */
-    private fun download(store: ModelStore, t: Target, state: InstallRecords.State, onProgress: ((Long, Long) -> Unit)?): ModelFolder {
+    private fun download(store: ModelStore, t: Target, state: InstallRecords.State, onProgress: ((Long, Long) -> Unit)?,
+                         unmeteredOnly: Boolean = false, background: Boolean = false): ModelFolder {
         val m = manifest(store, t)
         val ctx = firstContext(m)
         val missing = store.missingCpu(ctx)
@@ -465,26 +517,105 @@ public class TajweedClient internal constructor(
             val need = missing.sumOf { it.size + it.localSize }
             val free = platform.freeSpace?.invoke(store.root)
             if (free != null && free < need) throw RecognizerException.StorageFull(need, free)
+            if (!background) owe(unmeteredOnly)
         }
         var got = false
         val folder = try {
-            store.ensureCpu(ctx, null) { p ->
+            // every download of this Client ends when the Client is closed (SPEC 16.3): the call then fails with
+            // `download_failed`, and what it had stored stays for the next Client
+            store.ensureCpu(ctx, backgroundCancel) { p ->
                 got = true
                 try { onProgress?.invoke(p.bytes, p.total) } catch (_: Exception) {}
             }
-        } catch (e: RecognizerException.DownloadFailed) {
+        } catch (e: TajweedError) {
             // the system refused the network; nothing came at all: there is no connection; something came and then
             // stopped: a download that resumes
-            throw when {
+            val x = if (e !is RecognizerException.DownloadFailed) e else when {
                 e.cause is NetworkNotPermitted -> RecognizerException.NetworkNotPermitted(e)
                 !got && e.cause is java.io.IOException -> RecognizerException.NeedsConnection(e)
                 else -> e
             }
+            if (!retryable(x)) settle(job = !background)
+            throw x
         }
+        if (missing.isNotEmpty() || owedFile.exists()) settle(job = !background)
         if (state != InstallRecords.State.INSTALLED) records.write(dir(t), m.build, InstallRecords.State.INSTALLED)
         modelsDir.mkdirs()
         try { currentFile.writeText(Json.write(Target(t.modelId, t.repo, m.build, m.version, t.folder, t.baseUrl).json())) } catch (_: Exception) {}
         return folder
+    }
+
+    /** Ends this Client's downloads at [close]: a call of the app that is downloading then, and the background
+     *  continuation ([continueDownload]). */
+    private val backgroundCancel = Cancellation()
+
+    /**
+     * A download of the CPU set that is owed to the app (SDK 3.1.3): there while it is not complete, with the network
+     * rule and the version pin of the call that started it. Inside `models/`, so a stop and [removeModels] take it
+     * away with the models.
+     */
+    private val owedFile: File get() = File(modelsDir, "download.json")
+
+    private fun owe(unmeteredOnly: Boolean) {
+        val bg = platform.downloads ?: return
+        try {
+            modelsDir.mkdirs()
+            owedFile.writeText(Json.write(linkedMapOf("unmetered_only" to unmeteredOnly, "version" to cloud.modelVersion)))
+        } catch (_: Exception) {
+            return
+        }
+        try { bg.owe(unmeteredOnly) } catch (_: Exception) {}
+    }
+
+    /** Nothing is owed; with [job] the platform's job is called off too (the continuation itself leaves its own). */
+    private fun settle(job: Boolean) {
+        try { owedFile.delete() } catch (_: Exception) {}
+        if (job) try { platform.downloads?.settled() } catch (_: Exception) {}
+    }
+
+    /** Whether a download that failed this way may go on later by itself: the network, a failure of the server (5xx,
+     *  after the call's own resumes), or the call was ended. */
+    private fun retryable(e: TajweedError): Boolean = e is RecognizerException.NeedsConnection ||
+        (e is RecognizerException.DownloadFailed && (e.reason == "cancelled" || RetryPlan.resumable(e)))
+
+    /**
+     * Continues, blocking, a download of the model that the app started and did not finish (SDK 3.1.3): the platform's
+     * background job calls it ([BackgroundDownloads]), in the app's process or in one it started. It waits for a call
+     * of the app that is downloading, then downloads what is still missing of the build the config names (the same
+     * pin), under the same rules as `prefetch`: the install record, a refusal, the key and the token, the network rule
+     * of the call that started it. Not an app's call: `diagnose().lastError` does not change.
+     */
+    internal fun continueDownload(): Continued {
+        if (closed || !owedFile.isFile) return Continued.DONE
+        return try {
+            runBlocking {
+                modelLock.withLock {
+                    withContext(Dispatchers.IO) {
+                        runInterruptible {
+                            val o = try { Json.parse(owedFile.readText()) as? Map<*, *> } catch (_: Exception) { null }
+                            when {
+                                closed || o == null -> Continued.DONE
+                                o["unmetered_only"] == true && connection() in WAITS -> Continued.RETRY
+                                else -> {
+                                    val target = target(o["version"] as? String, refresh = true)
+                                    val store = store(target)
+                                    val state = admit(store, target)
+                                    download(store, target, state, null, o["unmetered_only"] == true, background = true)
+                                    Continued.DONE
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: TajweedError) {
+            if (retryable(e)) Continued.RETRY else {
+                settle(job = false)
+                Continued.GAVE_UP
+            }
+        } catch (_: Exception) {
+            Continued.RETRY
+        }
     }
 
     private fun openModel(version: String?): TajweedModel {
@@ -547,6 +678,9 @@ public class TajweedClient internal constructor(
 
         /** What `diagnose().connection` may say. */
         val CONNECTIONS = listOf("unmetered", "metered", "none", "unknown")
+
+        /** What `diagnose().downloadProtocol` may say beside null (the contract's names.json, `diagnosis.downloadProtocol`). */
+        val DOWNLOAD_PROTOCOLS = listOf("h3", "h2", "http/1.1")
 
         /** The connections on which `prefetch(unmeteredOnly = true)` waits. */
         private val WAITS = setOf("metered", "none")

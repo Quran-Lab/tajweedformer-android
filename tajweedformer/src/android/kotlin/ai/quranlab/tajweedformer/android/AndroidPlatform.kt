@@ -101,7 +101,13 @@ internal object AndroidPlatform {
             extraObserver = { cloud -> thermal(app, cloud) },
             // the install records' key: an HMAC key in the Android Keystore (SPEC 15.2)
             installKeys = KeystoreInstallKey(),
-        )
+            // a Keystore that fails the same way at three starts in a row gets a new key (SPEC 15.2, contract 1.14.0)
+            installKeyReplaced = true,
+            // the large file in ranges (SDK 3.1.3); a debuggable app can ask for one stream per file, as 3.1.2 did
+            modelRanges = if (debug && DebugHooks.singleStream) ai.quranlab.tajweedformer.RangePlan.SINGLE else ai.quranlab.tajweedformer.RangePlan.DEFAULT,
+            // the download goes on when the app leaves or its process ends (SDK 3.1.3); a debuggable app can turn it off
+            downloads = if (debug && !DebugHooks.backgroundDownloads) null else ModelDownloads(app),
+        ).also { if (debug) DebugHooks.watchDownloads() }
     }
 
     /**

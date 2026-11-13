@@ -2,6 +2,7 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     `maven-publish`
+    signing
     // the sharing sheet's screenshot and layout tests (src/test): Paparazzi renders the Compose sheet and the core's Views
     // dialog with Android's own renderer (layoutlib) on the JVM. It adds to the unit tests' configurations only: the
     // published AAR and POM of either module carry nothing of it.
@@ -10,6 +11,11 @@ plugins {
 
 // ai.quranlab:tajweedformer-compose: the recitation-sharing sheet and settings in Jetpack Compose.
 // Optional: the core AAR has the same views for the Views toolkit and needs no Compose.
+//
+// Published to Maven Central with the core, in ONE bundle and one deployment (the core's centralBundle task zips both
+// publications): either both artifacts of a version are on Maven Central or neither is. It works only with
+// ai.quranlab:tajweedformer of EXACTLY the same version: it is compiled as a friend of the core and calls the core's
+// internals, whose names and shapes belong to one version. Its POM names that one version of the core.
 group = "ai.quranlab"
 version = providers.gradleProperty("tajweedformer.version").get()
 
@@ -28,7 +34,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    publishing { singleVariant("release") { withSourcesJar() } }
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+            withJavadocJar()
+        }
+    }
 }
 
 // Only the types of the public API are public, here as in the core.
@@ -49,8 +60,61 @@ publishing {
             artifactId = "tajweedformer-compose"
             version = project.version.toString()
             afterEvaluate { from(components["release"]) }
+            // the POM names the versions the build resolved (the Compose libraries come through a BOM here; a POM
+            // reader without the BOM needs each version said)
+            versionMapping { allVariants { fromResolutionOf("releaseRuntimeClasspath") } }
+            pom {
+                name.set("TajweedFormer for Android: the sharing sheet in Jetpack Compose")
+                description.set(
+                    "The recitation-sharing sheet and settings of TajweedFormer for Android in Jetpack Compose. Optional: the " +
+                        "core library ai.quranlab:tajweedformer has the same sheet for the Views toolkit. Works only with " +
+                        "ai.quranlab:tajweedformer of exactly the same version."
+                )
+                url.set("https://github.com/Quran-Lab/tajweedformer-android")
+                licenses {
+                    license {
+                        name.set("Quran-Lab No-Profit License 1.2 (NPL-1.2)")
+                        url.set("https://github.com/Quran-Lab/tajweedformer-android/blob/main/LICENSE")
+                        distribution.set("repo")
+                    }
+                }
+                developers {
+                    developer {
+                        id.set("quran-lab")
+                        name.set("Quran Lab")
+                        organization.set("Quran Lab")
+                        organizationUrl.set("https://quranlab.ai")
+                    }
+                }
+                scm {
+                    connection.set("scm:git:https://github.com/Quran-Lab/tajweedformer-android.git")
+                    developerConnection.set("scm:git:ssh://git@github.com/Quran-Lab/tajweedformer-android.git")
+                    url.set("https://github.com/Quran-Lab/tajweedformer-android")
+                }
+            }
         }
     }
+    repositories {
+        // the core's bundle folder: both publications go into the one Maven layout that is zipped for the Central Portal
+        maven {
+            name = "bundle"
+            url = uri(project(":tajweedformer").layout.buildDirectory.dir("central-bundle"))
+        }
+    }
+}
+
+// In-memory GPG signing with the same key as the core, only when SIGNING_KEY is set (the publish workflow sets it).
+val signingKey: String? = providers.environmentVariable("SIGNING_KEY").orNull?.takeIf { it.isNotBlank() }
+signing {
+    if (signingKey != null) {
+        useInMemoryPgpKeys(signingKey, "")
+        sign(publishing.publications["release"])
+    }
+}
+
+// The core's publication empties the bundle folder before it writes: this one goes in after it, never before.
+tasks.matching { it.name == "publishReleasePublicationToBundleRepository" }.configureEach {
+    mustRunAfter(":tajweedformer:publishReleasePublicationToBundleRepository")
 }
 
 tasks.withType<Test>().configureEach {

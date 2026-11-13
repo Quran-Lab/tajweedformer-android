@@ -52,7 +52,7 @@ class ReferenceFetchTest : OpenChecked() {
         served = s
         stub.recommended = s.recommended()
         stub.inference = null
-        return TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = stub.base,
+        return TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
             trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = s.url, engine = CountingEngines()), autoLaunch = false).also { client = it }
     }
 

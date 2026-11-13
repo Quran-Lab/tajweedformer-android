@@ -8,8 +8,10 @@ import java.io.File
 
 /**
  * SPEC 15.3: which answers of Quran Lab's server stop a model on the device. An answer stops a model exactly when its
- * JSON body carries a `reason` that is in [STOP_REASONS]; an answer without a reason never does, whatever its status
- * and its `error`. The list is the server's (vector `model_gate.json`, `stop_reasons`): this constant is the one place.
+ * status is 401 or 403 and its JSON body carries a `reason` that is in [STOP_REASONS]. An answer without a reason never
+ * does, whatever its status and its `error`; and a reason of the list under any other status (a redirect, a 404, a
+ * 429, a server failure, a 2xx) is not a stop: nothing is remembered and nothing is removed for it. The list is the
+ * server's (vector `model_gate.json`, `stop_reasons`): this constant is the one place.
  */
 internal object ModelGate {
     /** The reasons that stop a model on the device. */
@@ -19,8 +21,11 @@ internal object ModelGate {
     /** The stop reasons whose error is `invalid_key` (the others are `server_rejected` with the reason's words). */
     val KEY_REASONS: Set<String> = setOf("key_revoked", "key_unknown")
 
-    /** Whether an answer whose body carries [reason] stops a model. */
+    /** Whether [reason] is one of the reasons that stop a model (in an answer that may carry a stop, see the next). */
     fun stops(reason: String?): Boolean = reason != null && reason in STOP_REASONS
+
+    /** Whether an answer with [status] whose body carries [reason] stops a model: only a 401 or a 403 can. */
+    fun stops(status: Int, reason: String?): Boolean = (status == 401 || status == 403) && stops(reason)
 
     /** The error `client.model()` and `prefetch` fail with while a refusal for [reason] holds. */
     fun error(reason: String, appId: String?): TajweedError =
@@ -146,15 +151,19 @@ internal class ModelRequestHeaders(private val cloud: QuranLabCloud) : ModelAuth
 
     override fun served() = cloud.refusals.cdnServed()
 
-    override fun refusal(status: Int, body: ByteArray): TajweedError? {
+    /** A stop of the model: remembered, and the model's files removed, before this returns (SPEC 15.3). */
+    override fun refuse(status: Int, body: ByteArray) {
+        val o = try { Json.parse(String(body, Charsets.UTF_8)) as? Map<*, *> } catch (_: Exception) { null }
+        val reason = o?.get("reason") as? String
+        if (ModelGate.stops(status, reason)) cloud.refusals.stop(reason!!, Refusals.CDN)
+    }
+
+    override fun refused(status: Int, body: ByteArray): TajweedError? {
         val o = try { Json.parse(String(body, Charsets.UTF_8)) as? Map<*, *> } catch (_: Exception) { null }
         val error = o?.get("error") as? String
         val reason = o?.get("reason") as? String
         val appId = cloud.env.app.bundleId
-        if (ModelGate.stops(reason)) {
-            cloud.refusals.stop(reason!!, Refusals.CDN)
-            return ModelGate.error(reason, appId)
-        }
+        if (ModelGate.stops(status, reason)) return ModelGate.error(reason!!, appId)
         return when {
             // the token was refused again after its renewal: a download that failed
             status == 401 && error == "invalid_token" -> null
