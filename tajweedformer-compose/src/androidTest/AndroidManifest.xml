@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The sheet's device check: an app screen that shows the SDK's consent sheet, in either toolkit, started from the
+     host with adb (exported: test APK only). No network, no key. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name="ai.quranlab.tajweedformer.compose.SheetHostActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
+</manifest>

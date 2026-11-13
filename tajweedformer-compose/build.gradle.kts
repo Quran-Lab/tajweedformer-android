@@ -2,6 +2,10 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     `maven-publish`
+    // the sharing sheet's screenshot and layout tests (src/test): Paparazzi renders the Compose sheet and the core's Views
+    // dialog with Android's own renderer (layoutlib) on the JVM. It adds to the unit tests' configurations only: the
+    // published AAR and POM of either module carry nothing of it.
+    id("app.cash.paparazzi")
 }
 
 // ai.quranlab:tajweedformer-compose: the recitation-sharing sheet and settings in Jetpack Compose.
@@ -13,6 +17,10 @@ android {
     namespace = "ai.quranlab.tajweedformer.compose"
     compileSdk = 34
     defaultConfig { minSdk = 26 }
+    // src/androidTest is the sheet's device check: an activity a host starts with adb to show both drawings on a phone
+    // and end them with the system's own input. Its APK targets a current Android (a phone's Play Protect blocks an app
+    // that targets an old one); the library itself has no target.
+    testOptions { targetSdk = 34 }
     buildFeatures { compose = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.10" }
     compileOptions {
@@ -45,6 +53,12 @@ publishing {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    maxHeapSize = "2g"
+    // -PsheetPictures=<folder>: the sheet tests write their pictures (PNG) there; without it they write nothing
+    providers.gradleProperty("sheetPictures").orNull?.let { systemProperty("sheet.pictures", it) }
+}
+
 dependencies {
     api(project(":tajweedformer"))
     val bom = platform("androidx.compose:compose-bom:2024.02.00")
@@ -52,4 +66,19 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    // the consent sheet's window hands the app's view-tree owners to the sheet's ComposeView: both libraries come with
+    // Compose UI at run time, in these versions; declared for compiling only, so neither the AAR nor the POM changes
+    compileOnly("androidx.lifecycle:lifecycle-runtime:2.6.1")
+    compileOnly("androidx.savedstate:savedstate:1.2.1")
+    // the device check only: the ComponentActivity that hosts both sheets (the version Compose UI already brings)
+    androidTestImplementation("androidx.activity:activity:1.7.0")
+    constraints {
+        // the screenshot tests only: layoutlib and Paparazzi's Android tools need Guava's standard JVM build, and an
+        // Android unit test's classpath would otherwise take its Android build (Paparazzi's issue 906)
+        testImplementation("com.google.guava:guava") {
+            attributes {
+                attribute(TargetJvmEnvironment.TARGET_JVM_ENVIRONMENT_ATTRIBUTE, objects.named(TargetJvmEnvironment::class.java, TargetJvmEnvironment.STANDARD_JVM))
+            }
+        }
+    }
 }

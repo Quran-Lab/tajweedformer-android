@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Android, JVM" src="https://img.shields.io/badge/platform-Android%20%7C%20JVM-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 3.1.0" src="https://img.shields.io/badge/version-3.1.0-2a3b8f?style=flat-square">
+  <img alt="version: 3.1.1" src="https://img.shields.io/badge/version-3.1.1-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -77,7 +77,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:3.0.1") }
 ```
 
-Maven Central serves 3.0.1 today. 3.1.0 follows there once it is released; the quick start below is the same for both.
+Maven Central serves 3.0.1 today. 3.1.1 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 

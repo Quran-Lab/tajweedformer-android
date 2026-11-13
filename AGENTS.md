@@ -78,9 +78,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.0.1` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.0"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.1 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -100,7 +100,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:3.0.1") }
 ```
 
-Maven Central serves 3.0.1 today. 3.1.0 follows there once it is released; the quick start below is the same for both.
+Maven Central serves 3.0.1 today. 3.1.1 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 
@@ -360,9 +360,13 @@ an earlier wording keeps that yes and the version they agreed to, and is not ask
   ever gets), `items`, `summary()`, `delete()` (deletes what this install shared), `recoveryCode`, and
   `setWording(...)` for an app that words the sheet itself.
 - The SDK shows its own sheet after a finished take, in the learner's language, with a guardian variant for
-  `TajweedClientOptions(audience = Audience.CHILDREN)`. `SharingTheme` styles it; `SharingSettingsView(activity,
-  client)` is the settings rows (the switch, "What is shared", "Delete what I shared", the recovery code). In
-  Compose: `SharingSheetHost(client)` and `SharingSettings(client)` from `ai.quranlab:tajweedformer-compose`.
+  `TajweedClientOptions(audience = Audience.CHILDREN)`. Since 3.1.1 it has Quran Lab's sheet design, the same in
+  every Quran Lab SDK: a bottom sheet on a phone and a centred card on a wide screen, "Quran Lab" at its top, the
+  disclosure in one card, "Share my recitations" and "Not now" always in view and the same size, light or dark with
+  the system. `SharingTheme` (Compose: `SharingStyle`) changes its colours, accent, corners and fonts; the design's
+  order, its lines and the name at the top stay. `SharingSettingsView(activity, client)` is the settings rows (the
+  switch, "What is shared", "Delete what I shared", the recovery code). In Compose: `SharingSheetHost(client)` and
+  `SharingSettings(client)` from `ai.quranlab:tajweedformer-compose`.
 - **Recordings that do not cut speech.** A `listen` take records only between `listen()` and the end of the take.
   An app that pushes its own audio can also feed the sharing recording directly (`client.sharing.feed(samples,
   sampleRate)`) so that a recording keeps the half second before a take starts and the half second after it ends;
@@ -542,7 +546,8 @@ engine/                     tajweedformer-engine, pinned
 
 3.0.0 is inference only: the scorer, the tajweed settings and the verdict types of 2.x are gone, and the
 public API is the five concepts above with the same names on every platform ([docs/api.md](docs/api.md) lists it).
-In 3.1.0 a model comes only from Quran Lab's server, through the Client. See [CHANGELOG.md](CHANGELOG.md).
+In 3.1.0 a model comes only from Quran Lab's server, through the Client. 3.1.1 gives the sharing sheet Quran Lab's
+design. See [CHANGELOG.md](CHANGELOG.md).
 
 What is proven where: the shared vectors of SDK 3.0, the Client against a stub server and the sharing rules run on
 every push in CI without a model; the engine through JNI builds and runs there too. No public runner has a model,
@@ -555,7 +560,13 @@ nothing to say. Not run yet with 3.0: the 35 conformance clips on a phone, and a
 3.1.0's rules (the install record, the refusals that stop and remove a model, the token on model requests) run in CI
 against the stub servers with stand-ins for the key store and for Play. The Android Keystore's key of the install
 record ran on a phone, an Alcatel 1 with Android 11 (`InstallKeyDeviceTest`, not run by CI); the Play Integrity call
-did not run on a device.
+did not run on a device. The sharing sheet's two drawings, the Views dialog and the Compose sheet, are drawn by
+Android's own renderer on the JVM (Paparazzi, in the Compose module's unit tests, run in CI) and checked against the
+design: every line of the deck whole, the name, the buttons' size, the guardian's switch, the direction, the
+accent's contrast; `./gradlew :tajweedformer-compose:testDebugUnitTest -PsheetPictures=<folder>` also writes their
+pictures. `SheetExitTest` (CI) checks what each way of ending the sheet records. Both sheets ran on a phone, an
+Alcatel 1 with Android 11, from the Compose module's device test APK (`SheetHostActivity`, not run by CI): each way
+of ending them reached the ending that 3.1.0 recorded for it.
 
 ## Download size
 

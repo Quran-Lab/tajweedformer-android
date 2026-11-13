@@ -1,5 +1,75 @@
 # Changelog
 
+## 3.1.1
+
+The sharing sheet has a new design: the one Quran Lab wrote for all of its SDKs, so that the sheet looks the same in
+an Android, an Apple and a web app. No word, no copy deck and no consent rule changed.
+
+- **What a learner sees.** On a phone the consent sheet is a bottom sheet that opens tall, with a grabber; on a wide
+  screen it is a centred card at most 480 dp wide. At its top is the name "Quran Lab" beside a small waveform
+  emblem, then the title and the text. What is shared, who receives it and how to stop are the three rows of one
+  card, each with its icon, placed before the hadith so that they come first. The hadith follows in a card of its
+  own, then the line about mistakes; the guardian variant ends with the parent's or guardian's switch. "Share my
+  recitations" and "Not now" are always in view, in a bar that does not scroll, one above the other and the same
+  size and shape: "Share" filled with the accent, "Not now" filled with a tint of it. The text scrolls under the
+  bar and fades out above it, and never shows behind the grabber. Light or dark follows the system's night mode.
+  The text follows the system's font size: at the largest sizes the text scrolls, and the buttons grow and keep
+  their labels whole, in two lines at most (a label that would need a third line makes both labels a little
+  smaller). Arabic and Urdu sheets are laid out right to left, because the deck says so, whatever the device's own
+  direction and whether or not the app declares right to left support. The sheet is drawn behind the system bars:
+  its top is just below the status bar and its buttons end above the navigation bar. The thank-you, "What is
+  shared", the deletion's dialogs and the settings rows take the same colours, corners and type.
+- **What a developer sees.** No call changes: the SDK shows its sheet as before, and `SharingSheetHost(client)` in
+  Compose. The sheet sets its own type (sizes in sp, which follow the font scale, and its own weights) and no longer
+  takes a size, a weight or a colour from the app's theme or typography, except the accent. Running text never
+  uses the accent and keeps 4.5 to 1. The accent carries the two button labels, the icons and the emblem's glyph,
+  which need 3 to 1 against what is behind them, or 4.5 to 1 when the device asks for more contrast (high contrast
+  text, and from Android 14 a contrast level above standard): the "Share" label is white when white has that
+  against the accent, else near-black; "Not now" and the emblem's glyph stay in the accent when it has that against
+  their tint, the icons when it has it against the card, else they take the text colour. So an app whose accent is
+  a blue like `#007AFF` gets a white label and blue marks, and the stricter result when the learner turns on high
+  contrast text. The tint behind "Not now" and the emblem comes from the accent. In Compose the sheet opens in the
+  same kind of window as the Views dialog, a platform dialog drawn behind the system bars, and is still composed as
+  part of the app's composition, so the app's `MaterialTheme` and other composition locals reach it.
+- **Changed, for an app that themes the sheet or relies on its defaults.** The accent is still the app's:
+  `SharingTheme.accent`, else the app theme's `android:colorAccent` when the app's theme or a library theme it uses
+  sets it; in Compose `SharingStyle.accent`, else the app's `MaterialTheme` primary colour. What changed is the case
+  without one: the framework's own `colorAccent` (an app theme that sets none) and Material's baseline purple (an
+  app without a colour scheme) are no longer taken for the app's, and the sheet uses Quran Lab's green, `#0E6B58`
+  (`#62D2B6` in the dark), where 3.1.0 used those or `#1B6E4F`. The defaults of `SharingTheme` are the design's:
+  `cornerRadiusDp` 28 (was 20), `titleSizeSp` 26 (was 20), `bodySizeSp` 15.5 (was 15); an app that passes its own
+  values keeps them, and the cards and buttons scale their corners by the same factor. The sheet's background,
+  text and secondary text default to the design's colours, light or dark, where 3.1.0 took the activity theme's
+  (Compose: the `MaterialTheme` colour scheme's).
+- **What a theme still changes.** `SharingTheme` and `SharingStyle` keep every field and every field still works:
+  background, text, secondary text, accent, corner radius and fonts; `SharingTheme`'s title and body sizes scale the
+  title and the rest of the text. New in both, with a default: `dark` (null follows the system's night mode, or a
+  dark background that the theme gives; true or false fixes it). A theme cannot change the order of the sheet, hide
+  one of its lines or remove the name "Quran Lab".
+- **What did not change.** The sheet shows the same copy deck, `2026-11-12.1`, every line of it whole, in the same
+  eight languages. The consent version and when the sheet is shown are as in 3.1.0, and so is what each way of
+  ending it records, in the Views dialog and in Compose: an ask is counted when the sheet is shown; "Share" records
+  a yes; "Not now" records a no; closing the sheet without a button, by the back gesture or a tap beside it as in
+  3.1.0 or by a drag down from its top, which is new, records a no, as closing 3.1.0's sheet did; a sheet that
+  disappears with its screen (a configuration change that recreates the activity, the app's process ending, the
+  Compose host leaving the screen) records nothing, and the next completed session asks again, within the same three
+  showings; a sheet left while the app is in the background is still there when the learner comes back. The name at
+  the top is a constant of the SDK, written in Latin letters in every language, not a string of the deck.
+- **Tests.** The Compose module's unit tests, which CI runs, draw both of the SDK's drawings of the sheet, the Views
+  dialog and the Compose sheet, with Android's own renderer on the JVM (Paparazzi, a test dependency of that module
+  only: it is in neither AAR nor POM), and check that every line of the deck is drawn whole and nothing else, that
+  the name is in every language's sheet whatever the theme, that both buttons have the same size in every language
+  at 100 % and 200 % text on a 320 dp wide phone, that the guardian's share button is disabled until the switch is
+  on, that the direction comes from the deck on a left to right and on a right to left device, the accent's
+  contrast rule, that nothing of the text shows behind the grabber, and that the two drawings put every line in the
+  same place within 3 pixels. `SheetDesignTest` checks the colours, the contrast rule and the type scale against
+  the design's tables, and `SheetExitTest` what each way of ending the sheet records, against the sharing state and
+  its stored file. Both sheets also ran on a phone, an Alcatel 1 with Android 11, from the Compose module's device
+  test APK (`SheetHostActivity`, started from a PC with adb; not run by CI), with its three-button navigation,
+  light and dark, in English and Arabic: each way of ending them, with the system's own key and touch events,
+  reached the ending that 3.1.0 recorded for it. Gesture navigation did not run on a phone: this one, an Android Go
+  phone, does not switch to it.
+
 ## 3.1.0
 
 A model comes from Quran Lab's server, through the Client, and from nowhere else. The same change in the Android,
