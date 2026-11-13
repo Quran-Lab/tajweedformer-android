@@ -82,7 +82,9 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
      * queue is emptied and sharing is turned off. The upload in progress is ended before the server is asked (as
      * with `setOn(false)`: what the system had already taken of the segment being sent may still go out). Returns
      * true when the request was accepted (or nothing had been shared), false when there was no connection or the
-     * server refused it: then nothing changed and it can be tried again.
+     * server refused it: then nothing changed and it can be tried again. Fails with `storage_failed` when the device
+     * cannot read this learner's contributor id, device key or recovery code: then the server is not asked and nothing
+     * changes.
      */
     public suspend fun delete(): Boolean = withContext(Dispatchers.IO) {
         when (inner.deleteEverything()) {
@@ -93,7 +95,7 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
 
     /**
      * The learner's recovery code, for deleting what they shared when the device is lost; null before anything was
-     * shared. Show it only to the learner, on request.
+     * shared, and while the device cannot read it. Show it only to the learner, on request.
      */
     public val recoveryCode: String? get() = inner.recoveryCode()
 

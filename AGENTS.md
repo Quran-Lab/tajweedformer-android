@@ -78,7 +78,7 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.3` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.3"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.4"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
@@ -99,6 +99,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 // app/build.gradle.kts
 dependencies { implementation("ai.quranlab:tajweedformer:3.1.3") }
 ```
+
+Maven Central serves 3.1.3 today. 3.1.4 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 
@@ -414,6 +416,14 @@ asked again.
   unsent queue; what the system had already taken of the segment being sent may still go out), `ask()` (shows the sheet at the app's moment; it counts as one of the three showings an install
   ever gets), `items`, `summary()`, `delete()` (deletes what this install shared), `recoveryCode`, and
   `setWording(...)` for an app that words the sheet itself.
+- **The contributor's id, device key and recovery code (3.1.4).** "Delete what I shared" is signed with a device key
+  in the Android Keystore that belongs to this install's contributor id; the recovery code deletes on the portal's
+  delete page. The SDK makes the key and the code together at the first share, and never makes, replaces or deletes
+  one of the three while one of them is there and cannot be read (a file it cannot read, a Keystore that fails, a
+  key the Keystore calls gone for good). Then no take is recorded for sharing, nothing is uploaded, no code is shown
+  that does not read, and `delete()` fails with `storage_failed` without asking the server; they are read again at
+  the next need. While the id or the device key cannot be read the install neither shares nor deletes from the
+  device; the recovery code, still shown while it reads, deletes on the portal.
 - The SDK shows its own sheet after a finished take, in the learner's language, with a guardian variant for
   `TajweedClientOptions(audience = Audience.CHILDREN)`. Since 3.1.1 it has Quran Lab's sheet design, the same in
   every Quran Lab SDK: a bottom sheet on a phone and a centred card on a wide screen, "Quran Lab" at its top, the
@@ -607,7 +617,8 @@ engine/                     tajweedformer-engine, pinned
 public API is the five concepts above with the same names on every platform ([docs/api.md](docs/api.md) lists it).
 In 3.1.0 a model comes only from Quran Lab's server, through the Client. 3.1.1 gives the sharing sheet Quran Lab's
 design. 3.1.3 makes the model download hold up on a poor connection and go on when the app is left, and publishes
-the Compose artifact. See [CHANGELOG.md](CHANGELOG.md).
+the Compose artifact. 3.1.4 never replaces the contributor's id, device key or recovery code that the device cannot
+read. See [CHANGELOG.md](CHANGELOG.md).
 
 What is proven where: the shared vectors of SDK 3.0, the Client against a stub server and the sharing rules run on
 every push in CI without a model; the engine through JNI builds and runs there too. No public runner has a model,
