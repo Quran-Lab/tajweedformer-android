@@ -131,7 +131,7 @@ class SharingTest : OpenChecked() {
         val meta = start.json!!
         assertEquals(setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major", "take_seq"), meta.keys)
         assertEquals("the first shared recording of the install", 1.0, meta["take_seq"])
-        assertEquals("a learner asked under the deck in force agrees to its version", "share-2026-11-12", meta["consent_version"])
+        assertEquals("a learner asked under the deck in force agrees to its version", "share-2026-11-09", meta["consent_version"])
         assertFalse("the deck's own words: no wording hash", meta.containsKey("consent_text_sha256"))
         assertEquals("both segments at the top rate on a good network", listOf(192_000, 192_000), item.segmentBitrates)
         assertEquals(c.sharing.contributor.id, meta["contributor"])
@@ -430,39 +430,87 @@ class SharingTest : OpenChecked() {
     }
 
     /**
-     * SPEC 11.8: the deck 2026-11-12.1 is in force. An install that said yes under 3.0.1's deck
-     * (share-2026-11-09) starts, is not asked again, and its next recordings carry share-2026-11-09; a learner asked
-     * from now on agrees to share-2026-11-12.
+     * SPEC 11.8: deck 2026-11-13.1 is in force, consent version share-2026-11-09. An install that said
+     * yes under 3.1.0's and 3.1.1's deck (share-2026-11-12), or under 3.0.1's (share-2026-11-09), starts, is not asked
+     * again, and its next recordings carry the version it agreed to; a learner asked from now on agrees to
+     * share-2026-11-09.
      */
-    @Test fun aYesUnderTheEarlierDeckIsNotAskedAgainAndKeepsItsVersion() {
-        val at = Files.createTempDirectory("tj-1109").toFile()
-        // the yes as 3.0.1 stored it (the state file of the same consent code), then a start of 3.1.0
-        cloud(consent = false, at = at).sharing.state.grant("share-2026-11-09", byGuardian = false)
-        assertTrue(File(File(at, "sharing"), "state.json").readText().contains("share-2026-11-09"))
-        val c = cloud(consent = false, at = at)
-        val asked = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { asked.add(it) }
-        assertEquals("share-2026-11-12", c.sharing.copy.consentVersion)
-        assertTrue(c.sharing.isOn && c.sharing.active)
-        assertEquals("share-2026-11-09", c.sharing.state.consentVersion)
-        assertNull("asked again", c.sharing.askNow())
-        val before = stub.starts().size
-        session(c, 3.0)
-        repeat(5) { session(c, 0.1) }
-        settle(c, 6)
-        assertTrue("a sheet was shown: $asked", asked.none { it is Sharing.SheetRequest.Consent })
-        val starts = stub.starts().drop(before)
-        assertEquals(6, starts.size)
-        assertTrue("a recording did not carry the version agreed to", starts.all { it.json!!["consent_version"] == "share-2026-11-09" })
-        assertEquals("share-2026-11-09", c.sharing.state.consentVersion)
+    @Test fun aYesUnderAnEarlierDeckIsNotAskedAgainAndKeepsItsVersion() {
+        for (agreed in listOf("share-2026-11-12", "share-2026-11-09")) {
+            val at = Files.createTempDirectory("tj-yes").toFile()
+            // the yes as the earlier SDK stored it (the state file of the same consent code), then a start of 3.1.2
+            cloud(consent = false, at = at).sharing.state.grant(agreed, byGuardian = false)
+            assertTrue(File(File(at, "sharing"), "state.json").readText().contains(agreed))
+            val c = cloud(consent = false, at = at)
+            val asked = ArrayList<Sharing.SheetRequest>()
+            c.sharing.prompts = { asked.add(it) }
+            assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
+            assertTrue(c.sharing.isOn && c.sharing.active)
+            assertEquals(agreed, c.sharing.state.consentVersion)
+            assertNull("$agreed: asked again", c.sharing.askNow())
+            val before = stub.starts().size
+            session(c, 3.0)
+            repeat(5) { session(c, 0.1) }
+            settle(c, 6)
+            assertTrue("$agreed: a sheet was shown: $asked", asked.none { it is Sharing.SheetRequest.Consent })
+            val starts = stub.starts().drop(before)
+            assertEquals(6, starts.size)
+            assertTrue("$agreed: a recording did not carry the version agreed to", starts.all { it.json!!["consent_version"] == agreed })
+            assertEquals(agreed, c.sharing.state.consentVersion)
+            assertTrue("$agreed: the stored version was rewritten", File(File(at, "sharing"), "state.json").readText().contains(agreed))
+            at.deleteRecursively()
+        }
         // a learner asked from now on: the deck's version
-        val d = cloud(consent = true, at = Files.createTempDirectory("tj-1112").toFile())
-        assertEquals("share-2026-11-12", d.sharing.state.consentVersion)
+        val d = cloud(consent = true, at = Files.createTempDirectory("tj-1109").toFile())
+        assertEquals("share-2026-11-09", d.sharing.state.consentVersion)
         val n = stub.starts().size
         session(d, 3.0)
         settle(d)
-        assertEquals("share-2026-11-12", stub.starts().drop(n).single().json!!["consent_version"])
-        at.deleteRecursively()
+        assertEquals("share-2026-11-09", stub.starts().drop(n).single().json!!["consent_version"])
+    }
+
+    /**
+     * The exact file SDK 3.1.1 wrote (its key order and fields) for a learner who said yes under its deck: [version] and
+     * [textSha] (the app's own wording, or none).
+     */
+    private fun state311(version: String, textSha: String? = null) =
+        "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":3,\"sessions\":9,\"thanked\":true,\"decidedAt\":1762980000," +
+            "\"consentVersion\":\"$version\",\"consentTextSha256\":${textSha?.let { "\"$it\"" } ?: "null"},\"guardian\":false," +
+            "\"changes\":1,\"deletedBelow\":0,\"deletionUnfinished\":false}"
+
+    /**
+     * 3.1.1 to 3.1.2: a stored yes under 3.1.1's deck (share-2026-11-12), or under an app's own wording whose base was
+     * that deck (custom-...), keeps sharing under the version 3.1.1 recorded, with no sheet before, during or after the
+     * sessions, and the file 3.1.2 writes back keeps it.
+     */
+    @Test fun anUpgradeFrom311KeepsTheGrantAndItsVersionWithoutAsking() {
+        // 3.1.1's version and hash of the test wording `sheet.what` below, whose base was share-2026-11-12
+        val custom = ("custom-" + "b8bcda33500d197510ec0cbf") to ("b8bcda33500d197510ec0cbf" + "7e386c36c94c39d9cdc44035ddda33efd1aaf904")
+        for ((stored, sha) in listOf("share-2026-11-12" to null, custom)) {
+            val at = Files.createTempDirectory("tj-311").toFile()
+            storedState(state311(stored, sha), at)
+            val c = cloud(consent = false, at = at)
+            val asked = ArrayList<Sharing.SheetRequest>()
+            c.sharing.prompts = { asked.add(it) }
+            assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
+            assertTrue(c.sharing.isOn && c.sharing.active)
+            assertEquals(stored, c.sharing.state.consentVersion)
+            assertNull("$stored: asked again", c.sharing.askNow())
+            val before = stub.starts().size
+            session(c, 3.0)
+            repeat(10) { session(c, 0.1) }
+            settle(c, 11)
+            assertTrue("$stored: a sheet: $asked", asked.isEmpty())
+            val starts = stub.starts().drop(before)
+            assertEquals(11, starts.size)
+            assertTrue("$stored: a recording under another version", starts.all { it.json!!["consent_version"] == stored && it.json!!["consent_text_sha256"] == sha })
+            // the next launch reads the file 3.1.2 wrote back: the same
+            val again = cloud(consent = false, at = at)
+            assertTrue(again.sharing.isOn)
+            assertEquals(stored, again.sharing.state.consentVersion)
+            assertEquals(sha, again.sharing.state.consentTextSha256)
+            at.deleteRecursively()
+        }
     }
 
     /** Writes [json] as the stored consent state, as an earlier SDK left it on disk. */
@@ -484,7 +532,7 @@ class SharingTest : OpenChecked() {
             val c = cloud(consent = false, at = at)
             val asked = ArrayList<Sharing.SheetRequest>()
             c.sharing.prompts = { asked.add(it) }
-            assertEquals("share-2026-11-12", c.sharing.copy.consentVersion)
+            assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
             assertTrue(c.sharing.isOn && c.sharing.active)
             assertEquals(expected, c.sharing.state.consentVersion)
             assertTrue(asked.isEmpty())
@@ -555,8 +603,8 @@ class SharingTest : OpenChecked() {
         session(again, 3.0)
         settle(again)
         val j = stub.starts().single().json!!
-        assertEquals("custom-b8bcda33500d197510ec0cbf", j["consent_version"])
-        assertEquals("b8bcda33500d197510ec0cbf7e386c36c94c39d9cdc44035ddda33efd1aaf904", j["consent_text_sha256"])
+        assertEquals("custom-df8c4e50965be0005aaca5d6", j["consent_version"])
+        assertEquals("df8c4e50965be0005aaca5d6ad8a2692efac1367c91bab97a50cf985d3c294d4", j["consent_text_sha256"])
         assertEquals(3, asked.size)
     }
 
@@ -577,7 +625,7 @@ class SharingTest : OpenChecked() {
             assertNull(again.sharing.askNow())
             assertTrue(asked.isEmpty())
             again.sharing.setOn(true)
-            assertEquals("share-2026-11-12", again.sharing.state.consentVersion)
+            assertEquals("share-2026-11-09", again.sharing.state.consentVersion)
             at.deleteRecursively()
         }
         // the switch turned on while already on keeps the version agreed to
@@ -748,7 +796,7 @@ class SharingTest : OpenChecked() {
     @Test fun ownWordingHasItsOwnVersionAndAnEarlierGrantKeepsItsOwn() {
         val c = cloud()
         val deck = c.sharing.copy.consentVersion
-        assertEquals("share-2026-11-12", deck)
+        assertEquals("share-2026-11-09", deck)
         assertNull(c.sharing.consentTextSha256)
         val asked = ArrayList<Sharing.SheetRequest>()
         c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it) }
@@ -763,11 +811,11 @@ class SharingTest : OpenChecked() {
         }
         val words = mapOf("sheet.what" to "Your recitation audio and the app's version. Nothing else.")
         c.sharing.setWording(words)
-        val hash = "b8bcda33500d197510ec0cbf7e386c36c94c39d9cdc44035ddda33efd1aaf904"
-        assertEquals("custom-b8bcda33500d197510ec0cbf", c.sharing.copy.consentVersion)
+        val hash = "df8c4e50965be0005aaca5d6ad8a2692efac1367c91bab97a50cf985d3c294d4"
+        assertEquals("custom-df8c4e50965be0005aaca5d6", c.sharing.copy.consentVersion)
         assertEquals(hash, c.sharing.consentTextSha256)
         assertEquals(words["sheet.what"], c.sharing.copy["sheet.what"])
-        assertEquals("quranlab.consent-text/1\nbase share-2026-11-12\nsheet.what\t${words["sheet.what"]}\n", c.sharing.consentText)
+        assertEquals("quranlab.consent-text/1\nbase share-2026-11-09\nsheet.what\t${words["sheet.what"]}\n", c.sharing.consentText)
         // the learner agreed to the deck's words: still on, never asked, the deck's version and no hash
         assertTrue(c.sharing.isOn)
         repeat(10) { session(c, 0.1) }
@@ -783,12 +831,12 @@ class SharingTest : OpenChecked() {
         d.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) { asked.add(it); d.sharing.accept() } }
         session(d, 0.2)
         assertEquals(1, asked.size)
-        assertEquals("custom-b8bcda33500d197510ec0cbf", d.sharing.state.consentVersion)
+        assertEquals("custom-df8c4e50965be0005aaca5d6", d.sharing.state.consentVersion)
         assertEquals(hash, d.sharing.state.consentTextSha256)
         val newer = mapOf("sheet.title" to "Help other learners")
         d.sharing.setWording(newer)
         val newVersion = d.sharing.copy.consentVersion
-        assertNotEquals("custom-b8bcda33500d197510ec0cbf", newVersion)
+        assertNotEquals("custom-df8c4e50965be0005aaca5d6", newVersion)
         assertTrue(d.sharing.isOn)
         val before = stub.starts().size
         repeat(10) { session(d, 0.1) }
@@ -797,11 +845,11 @@ class SharingTest : OpenChecked() {
         assertEquals(1, asked.size)
         val js = stub.starts().drop(before).map { it.json!! }
         assertEquals("the ten sessions after the grant (the one that ended with the ask was not captured)", 10, js.size)
-        assertTrue(js.all { it["consent_version"] == "custom-b8bcda33500d197510ec0cbf" && it["consent_text_sha256"] == hash })
+        assertTrue(js.all { it["consent_version"] == "custom-df8c4e50965be0005aaca5d6" && it["consent_text_sha256"] == hash })
         // after a relaunch, before the app sets its words again: still on, the same version and hash
         val relaunched = cloud(consent = false, at = at)
         assertTrue(relaunched.sharing.isOn)
-        assertEquals("custom-b8bcda33500d197510ec0cbf", relaunched.sharing.state.consentVersion)
+        assertEquals("custom-df8c4e50965be0005aaca5d6", relaunched.sharing.state.consentVersion)
         assertEquals(hash, relaunched.sharing.state.consentTextSha256)
         at.deleteRecursively()
 
@@ -822,7 +870,7 @@ class SharingTest : OpenChecked() {
     @Test fun ownWordingNeverSharesBeforeTheGrantAndWithdrawalWorks() {
         val c = cloud(consent = false)
         c.sharing.setWording(mapOf("sheet.title" to "Help other learners", "sheet.share" to "Share", "sheet.not_now" to "Not now"))
-        assertEquals("custom-0d30ac7b11eac4e8e471ee37", c.sharing.copy.consentVersion)
+        assertEquals("custom-a33668d3d103a75b669688e4", c.sharing.copy.consentVersion)
         assertEquals("Help other learners", c.sharing.copy["sheet.title"])
         session(c, 3.0)
         c.sharing.outbox.drain(ignoringBackoff = true)
@@ -831,7 +879,7 @@ class SharingTest : OpenChecked() {
         c.sharing.accept()
         session(c, 3.0)
         settle(c)
-        assertEquals("0d30ac7b11eac4e8e471ee375971bbd40741ccfcbd160e6236a06b5fe2d439db", stub.starts().single().json!!["consent_text_sha256"])
+        assertEquals("a33668d3d103a75b669688e45d3a674fc52a754ee197dd502e88e30baab0e0ab", stub.starts().single().json!!["consent_text_sha256"])
         // the settings switch off: queued uploads go at once
         stub.down = true
         session(c, 1.0)
@@ -844,7 +892,7 @@ class SharingTest : OpenChecked() {
         // on again from the settings: under the words in force
         c.sharing.setOn(true)
         assertTrue(c.sharing.isOn)
-        assertEquals("custom-0d30ac7b11eac4e8e471ee37", c.sharing.state.consentVersion)
+        assertEquals("custom-a33668d3d103a75b669688e4", c.sharing.state.consentVersion)
         // delete what I shared, under a custom version
         assertEquals(Sharing.Deletion.ACCEPTED, c.sharing.deleteEverything())
         assertEquals(1, stub.deletions)

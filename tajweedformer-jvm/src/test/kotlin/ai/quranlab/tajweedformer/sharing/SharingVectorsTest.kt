@@ -187,27 +187,27 @@ class SharingVectorsTest : OpenChecked() {
     }
 
     /**
-     * The bundled deck 2026-11-12.1 is Quran Lab's, byte for byte (the deck's READY list),
+     * The bundled deck 2026-11-13.1 is Quran Lab's, byte for byte (the deck's READY list),
      * and parses in every language; the consent version follows the deck.
      */
     @Test fun copyDeck() {
         val want = mapOf(
-            "ar" to "b8a3402a262ac0f295af5e485ae99804fcbab0dde44f403dc9f38e1bc18be5f0",
-            "bn" to "56225ba6ebe642793b288d13b82874f9ada8184df8e83ea679aac3ca28a01acb",
-            "en" to "1600ab0625db9dab1483d1a2bfd0f0ec9e0e636880909a2d47df2eb7fefd52c0",
-            "fr" to "aba381efd20462db4864e8328b9a2f231597ffbffac7f42096b89e59e0950be2",
-            "id" to "8d32f968b66b6b9176a3e2c152c69903a96fa20601d53f47d23cf3d20edba4f5",
-            "ms" to "78bd9055b9c3f1ffa05efee1a15778897ee27f7d15aa1887142682d80f21848c",
-            "tr" to "258a04a68c4e4d44739ca73da170a052cdb2a2f41914e5067314982190e0b9d9",
-            "ur" to "6d50705ea642f30711207b7093337a15cb7afba5d12b5c4d80bf0fe7e192c1d1",
+            "ar" to "03fc6aa2eed9134b5b5780ba2abcc5590c043024d0c6daf829c876742519f599",
+            "bn" to "e6b0a844386437838adcd0c3693ae39f93d40e5c3dba3b614c7f71574028a6b6",
+            "en" to "3bac94a18f4691e7fb51021e9aa4f241d409a6dc4f8f89ec22a82761ebd75051",
+            "fr" to "9895b3eaf3e67afa250629b9ea3d93613d0298168d068fb6aba2e00450dda7ca",
+            "id" to "f0621036f69d8f3754a0dfffea58b6c99e13a22c8356ba4cece0b20c3ba9abd0",
+            "ms" to "2c15cf8515885ef1bebe59117c61926dfd93ce406100fe2434e4b10d6c8e3e9d",
+            "tr" to "227783a34b2fdf6870ebd5d32eafb9e3ebcf496bed44797de87b571744200099",
+            "ur" to "755e2b9873180336b7e06bb44c0a9910441d8ee59dced42142c8f420ae77875a",
         )
         for ((lang, h) in want) {
             val b = SharingCopy::class.java.getResourceAsStream("/ai/quranlab/tajweedformer/sharing_copy/$lang.json")!!.use { it.readBytes() }
             assertEquals(lang, h, sha(b))
             val c = SharingCopy.forLanguage(lang)
             assertEquals(lang, c.lang)
-            assertEquals("2026-11-12.1", c.version)
-            assertEquals("share-2026-11-12", c.consentVersion)
+            assertEquals("2026-11-13.1", c.version)
+            assertEquals("share-2026-11-09", c.consentVersion)
             assertEquals(0, c.deleteDays)
             assertEquals("immediate", c.deleteTiming)
             assertNull(c.consentTextSha256)
@@ -224,11 +224,6 @@ class SharingVectorsTest : OpenChecked() {
             assertTrue("$lang hadith verified", c.hadith != null && c.hadithRef != null)
         }
         assertEquals("ar", SharingCopy.forLanguage("ar-SA").lang)
-        // SPEC 11.8: the English deck's who line and "What is shared" say that no human ever listens
-        val en = SharingCopy.forLanguage("en")
-        val noHuman = "No human ever listens to your recordings: only software learns from them."
-        assertTrue(en["sheet.who"].endsWith(noHuman))
-        assertTrue(noHuman in en["what.detail"])
         assertEquals("id", SharingCopy.forLanguage("in_ID").lang)
         assertEquals("en", SharingCopy.forLanguage("de").lang)
         assertEquals("You have shared 1 minute of recitation. May Allah reward you.", SharingCopy.ENGLISH.impactMinutes(1))
@@ -274,6 +269,27 @@ class SharingVectorsTest : OpenChecked() {
             assertTrue("$path: the consent sheet does not draw sheet.who after both variants' own lines", variantsEnd in 0 until who)
             // What is shared: the Views dialog draws the detail; the Compose settings open that same dialog
             assertTrue("$path: What is shared does not draw what.detail", DETAIL in src || "SharingDialogs.whatIsShared(" in src)
+        }
+    }
+
+    /**
+     * SPEC 11.8: no string the SDK can show, in any of the eight languages, holds the sentence that deck
+     * 2026-11-12.1 added (known only by its length and hash, [DeckFragments]): every string of the bundled deck as the
+     * sheets read it (the consent sheet's lines and the guardian's, "What is shared", the settings, the deletion lines
+     * with their numbers filled in, the reask, the thank-you), the impact line, and the hadith with its reference.
+     */
+    @Test fun theSentenceThatDeck2026_11_12_1AddedIsInNoStringTheSdkShows() {
+        val added = DeckFragments.addedBy2026_11_12_1
+        assertEquals(setOf("en", "ar", "id", "ms", "tr", "fr", "ur", "bn"), added.keys)
+        for ((lang, f) in added) {
+            assertTrue("$lang: the fragment's numbers", f.length > 20 && f.sha256.matches(Regex("[0-9a-f]{64}")))
+            val b = SharingCopy::class.java.getResourceAsStream("/ai/quranlab/tajweedformer/sharing_copy/$lang.json")!!.use { it.readBytes() }
+            @Suppress("UNCHECKED_CAST")
+            val keys = ((ai.quranlab.tajweedformer.Json.parse(String(b, Charsets.UTF_8)) as Map<String, Any?>)["strings"] as Map<String, String>).keys
+            val c = SharingCopy.forLanguage(lang)
+            val shown = keys.flatMap { listOf(c[it], c.deletion(it)) } + listOf(1L, 2L, 5L, 12L, 600L).map { c.impactMinutes(it) } +
+                listOfNotNull(c.hadith, c.hadithRef)
+            for (t in shown) assertFalse("$lang: a string the SDK shows holds the sentence that deck 2026-11-12.1 added", DeckFragments.holds(t, f))
         }
     }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.2
+
+- **Changed: the sharing sheet and "What is shared" have the text of copy deck `2026-11-09.1` again.** Copy deck
+  `2026-11-13.1` (consent `share-2026-11-09`), in eight languages. A learner who already agreed is not asked again,
+  and their recordings keep the version they agreed to.
+
 ## 3.1.1
 
 The sharing sheet has a new design: the one Quran Lab wrote for all of its SDKs, so that the sheet looks the same in
