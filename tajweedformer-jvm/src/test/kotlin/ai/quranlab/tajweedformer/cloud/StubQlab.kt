@@ -1,9 +1,11 @@
 package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.sharing.ContributorKeyStore
 import ai.quranlab.tajweedformer.sharing.ContributorKeys
 import ai.quranlab.tajweedformer.sharing.FileContributorKeyStore
 import ai.quranlab.tajweedformer.sharing.PlainSecretBox
+import ai.quranlab.tajweedformer.sharing.SecretBox
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import java.io.File
@@ -530,9 +532,10 @@ internal class StubQlab : AutoCloseable {
 
     fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
                     clock: () -> Long = this.clock, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
-                    debugBuild: Boolean = false, log: (String) -> Unit = {}) =
-        CloudEnvironment(storage, AppIdentity(appId, "3.1", "Recite"), device, FileContributorKeyStore(File(storage, "keys")),
-            PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" }, debugBuild, log = log)
+                    debugBuild: Boolean = false, log: (String) -> Unit = {},
+                    keys: ContributorKeyStore? = null, box: SecretBox? = null) =
+        CloudEnvironment(storage, AppIdentity(appId, "3.1", "Recite"), device, keys ?: FileContributorKeyStore(File(storage, "keys")),
+            box ?: PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" }, debugBuild, log = log)
 
     /** The client's network: offline (an IOException, no answer) while [down]. */
     val transport: HttpTransport = UrlConnectionTransport(5_000, 10_000).let { real ->
@@ -544,6 +547,6 @@ internal class StubQlab : AutoCloseable {
 
     fun cloud(storage: File, options: CloudOptions = CloudOptions(key, contributions = true, apiUrl = base, trustedKeys = listOf(publicKey)),
               scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
-              clock: () -> Long = this.clock) =
-        QuranLabCloud(options, environment(storage, scheduler, integrity, clock))
+              clock: () -> Long = this.clock, keys: ContributorKeyStore? = null, box: SecretBox? = null) =
+        QuranLabCloud(options, environment(storage, scheduler, integrity, clock, keys = keys, box = box))
 }

@@ -1,5 +1,45 @@
 # Changelog
 
+## 3.1.4
+
+The learner's contributor id, device key and recovery code are never replaced when the device cannot read them. No
+call changes.
+
+- **Fixed: a contributor id, device key or recovery code that cannot be read is no longer replaced.** Found by
+  reading the code of 3.1.3 and shown by tests; not observed on a device. In 3.1.3, when the Keystore failed for the
+  device key at the start of a shared take (on Android 12 and later every failure of the Keystore was read as "no
+  key"), the SDK made a new device key under the same contributor id: the server refuses a start with another key
+  for that contributor, and "delete what I shared" signed with the new key was answered as accepted and deleted
+  nothing, while the settings sheet said it was done. A key the Keystore called permanently invalidated, corrupted
+  or unrecoverable was replaced the same way. An id file whose text was not an id was replaced by a new id, and what
+  had been shared before could no longer be deleted from the device. A sealed recovery code that could not be read
+  made a new device key under the same id; one that did not open made `client.sharing.recoveryCode` throw an
+  exception that was not a `TajweedError`; and when the code's own sealing key was gone, reading the code made a new
+  one.
+  Now each of the three is read once, with three results: not there (for a file the system's "no such file", for
+  the device key the Keystore's answer that the alias has no entry), read, or cannot be read. A value that was read
+  and is not what the SDK writes there (an id that is not one, a sealed code that does not open) cannot be read
+  either, and every other answer of the Keystore, "gone for good" included, is "cannot be read" at every start.
+  While one of the three cannot be read, nothing of them is made, replaced or deleted; no take is recorded for
+  sharing (the session itself runs); the upload pass sends nothing; no summary is asked; and
+  `client.sharing.delete()` asks the server nothing and fails with `storage_failed`, with nothing changed (the
+  SDK's settings sheet then shows "Could not delete" and "Try again"). They are read again at the next need. The
+  device key and the recovery code are made together, and only when neither is there; the id only when it is not
+  there and the code is not either. A device key or a recovery code missing beside the other counts as one that
+  cannot be read, and a code that is there is still shown. Reading the sealed code never makes a sealing key.
+- **What it leaves: an install that neither shares nor deletes from the device.** While the id or the device key
+  cannot be read (a damaged id file, a key the Keystore has lost for good), the install cannot share and cannot
+  delete from the device; the recovery code on the portal's delete page still deletes, and the settings sheet still
+  shows the code while it reads.
+- The id and the sealed code are written through a temporary file and a rename. A first share stopped between
+  making the device key and the code makes the pair again at the next take: nothing was sent with it.
+- Tests, on the JVM (run by CI): whole sessions against a local stand-in of the API that binds a contributor's key
+  once, with the answers of the Android Keystore on Android 12 and later, as AOSP's sources give them, standing in
+  for the Keystore (`ContributorReadTest`, `KeystoreKeysTest`). `ContributorReadTest` ran first on the code of 3.1.3:
+  11 of its 14 tests failed, the controls passed. No test shows a real Keystore failing on a device. On Android 8
+  to 11 the platform may answer "no entry" for some failures of the Keystore too; there the SDK cannot tell the two
+  apart.
+
 ## 3.1.3
 
 The model download holds up on a poor connection, loses nothing to a wrong answer, and goes on when the app is left.

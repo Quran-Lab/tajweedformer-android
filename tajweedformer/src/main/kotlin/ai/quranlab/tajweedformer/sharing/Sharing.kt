@@ -1,5 +1,6 @@
 package ai.quranlab.tajweedformer.sharing
 
+import ai.quranlab.tajweedformer.RecognizerException
 import ai.quranlab.tajweedformer.cloud.ApiError
 import ai.quranlab.tajweedformer.cloud.CloudException
 import ai.quranlab.tajweedformer.cloud.CloudOptions
@@ -186,12 +187,13 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     /** Every session in the outbox, oldest first. */
     val items: List<Contribution> get() = outbox.items
 
-    /** Real numbers from the backend (`GET /v1/contributions/summary`), or null when the call fails or nothing was shared. */
+    /** Real numbers from the backend (`GET /v1/contributions/summary`), or null when the call fails or nothing was shared.
+     *  Not asked while the contributor cannot be read (SDK 3.1.4). */
     fun summary(): Map<String, Any?>? {
-        if (!contributor.hasKey) return null
+        val who = contributor.standing() as? Contributor.Standing.Bound ?: return null
         return try {
             val t = cloud.tokens ?: return null
-            cloud.api.contributionsSummary(t.token().token, contributor.id)
+            cloud.api.contributionsSummary(t.token().token, who.id)
         } catch (_: CloudException) {
             null
         }
@@ -228,8 +230,9 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
 
     // ---- the SDK's own settings sheet only (internal: no app API deletes or reveals) ----
 
-    /** The learner's recovery code, for the SDK's settings sheet (shown on request, never to the app). */
-    internal fun recoveryCode(): String? = if (contributor.hasKey) contributor.recoveryCode() else null
+    /** The learner's recovery code, for the SDK's settings sheet (shown on request, never to the app): whenever it reads,
+     *  also while the device key cannot be read (it deletes on the portal); null when there is none or it cannot be read. */
+    internal fun recoveryCode(): String? = contributor.recoveryCode()
 
     /** Result of a deletion request. */
     enum class Deletion { ACCEPTED, NOTHING_SHARED, OFFLINE, REFUSED }
@@ -249,14 +252,19 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
      * stores the no as soon as the device can (first of all right after the queue's files are gone).
      */
     internal fun deleteEverything(): Deletion {
+        // read once, before anything (SDK 3.1.4): while the contributor's id, device key or code cannot be read, or the
+        // key or the code is missing beside the other, the server is not asked, the uploader is not stopped, and nothing
+        // on the device changes
+        val who = contributor.standing()
+        if (who is Contributor.Standing.Lost) throw RecognizerException.StorageFailed("sharing: ${who.why}")
         val result = outbox.whileStopped {
-            if (!contributor.hasKey) {
+            if (who !is Contributor.Standing.Bound) {
                 state.afterDeletion()
                 finishDeletion()
                 Deletion.NOTHING_SHARED
             } else {
                 val app = env.app.appId
-                val id = contributor.id
+                val id = who.id
                 // on the device before the server is asked: what a process that ends in here leaves is a no. When it
                 // cannot be stored, the server is asked all the same (SPEC 11.7)
                 state.deletionAsked()
@@ -264,7 +272,11 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
                     val nonce = cloud.api.deletionChallenge(app, id)
                     val ts = env.clock() / 1000
                     val msg = ContributorKeys.deletionMessage(app, id, nonce, ts)
-                    val sig = contributor.sign(msg.toByteArray(Charsets.UTF_8))
+                    val sig = try {
+                        contributor.sign(id, msg.toByteArray(Charsets.UTF_8))
+                    } catch (e: Exception) {
+                        throw RecognizerException.StorageFailed("sharing: the device key did not sign", e)
+                    }
                     cloud.api.deleteSigned(linkedMapOf("app" to app, "contributor" to id, "nonce" to nonce, "timestamp" to ts,
                         "action" to "delete-all", "signature" to java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(sig)))
                 } catch (e: CloudException) {
@@ -317,7 +329,9 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     private fun identity(e: TajweedObserver.SessionStart): Any? {
         val version = state.consentVersion
         val textSha = if (version?.startsWith(ConsentWording.PREFIX) == true) state.consentTextSha256 else null
-        return listOf(contributor.id, version, textSha, e.revision)
+        // an id that cannot be read joins nothing (SDK 3.1.4)
+        val id = try { contributor.id } catch (_: Exception) { return Any() }
+        return listOf(id, version, textSha, e.revision)
     }
 
     /** A new recording for the take [e] (its session JSON is written once, with the first audio), or null. */
@@ -326,15 +340,16 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         // leaves this recording with an old count
         val count = state.changes
         if (!active) return null
+        // while the contributor cannot be read, no recording begins (SDK 3.1.4); the session itself runs
         val binding = try { contributor.binding() } catch (_: Exception) { return null }
-        val c = contributor.id
+        val c = binding.id
         // the version the learner agreed to (not the copy's now), and for the app's own wording its hash
         val consentVersion = state.consentVersion ?: return null
         val textSha = if (consentVersion.startsWith(ConsentWording.PREFIX)) state.consentTextSha256 ?: return null else null
         val day = Day.of(env.clock())
         val dev = env.device
         return ShareCapture(outbox, { rate, route ->
-            ShareCapture.sessionJson(e.revision, e.decodeBackend, e.weightsSha256, consentVersion, c, binding.first, binding.second,
+            ShareCapture.sessionJson(e.revision, e.decodeBackend, e.weightsSha256, consentVersion, c, binding.key, binding.recoveryHash,
                 day, dev.deviceClass, dev.osMajor, rate, route, textSha,
                 modelBuild = e.build, takeSeq = order.takeSeq, gapMsPrev = order.gapMsPrev)
         }, e.inputRoute.takeIf { it in ROUTES } ?: env.inputRoute().takeIf { it in ROUTES } ?: "unknown", { active }, consent = count)
@@ -388,6 +403,7 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         override fun networkAllowed(): Boolean = !cloud.options.uploadsOnUnmeteredOnly || env.unmetered()
         override fun uploaded(id: String) { if (state.takeThanks()) prompts?.invoke(SheetRequest.Thanks) }
         override fun contributorRevoked() { contributor.reset() }
+        override fun contributorReadable(): Boolean = !contributor.lost()
         override fun badRequest(route: String) = cloud.report("other", "bad_request:$route")
         override fun log(message: String) { if (env.debugBuild) try { env.log(message) } catch (_: Exception) {} }
         override fun consentInForce(): Boolean = state.granted

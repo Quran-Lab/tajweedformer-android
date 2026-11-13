@@ -232,12 +232,12 @@ internal object SharingDialogs {
     /** A row of buttons of equal width (the design's buttons; the last one is the action), in the deck's direction. */
     private fun buttons(k: SheetKit, vararg b: Button): LinearLayout = k.buttonRow(*b)
 
-    private fun message(activity: Activity, copy: SharingCopy, line: String, theme: SharingTheme, secure: Boolean = false, title: String? = null,
+    private fun message(activity: Activity, copy: SharingCopy, line: String?, theme: SharingTheme, secure: Boolean = false, title: String? = null,
                         retry: Pair<String, () -> Unit>? = null) {
         val k = SheetKit(activity, theme.look(activity, copy))
         val col = column(k)
         title?.let { col.addView(k.title(it), k.gap(0f)) }
-        col.addView(k.body(line), k.gap(if (title != null) SheetDesign.HEADER_GAP else 0f))
+        line?.let { col.addView(k.body(it), k.gap(if (title != null) SheetDesign.HEADER_GAP else 0f)) }
         val ok = k.button(if (retry != null) copy["delete.cancel"] else SdkText.CLOSE, primary = retry == null)
         val again = retry?.let { k.button(it.first, primary = true) }
         col.addView(if (again != null) buttons(k, ok, again) else buttons(k, ok), k.gap(SheetDesign.BLOCK_GAP + 4f))
@@ -282,11 +282,15 @@ internal object SharingDialogs {
     /** The signed deletion request, then its outcome: done, or failed with "Try again". */
     private fun delete(activity: Activity, sharing: Sharing, theme: SharingTheme, done: (() -> Unit)?) {
         io.execute {
-            val r = sharing.deleteEverything()
+            // the device cannot read the learner's contributor (SDK 3.1.4): nothing was asked, nothing changed. The deck
+            // has no sentence for it and its network sentence would be untrue, so only the title and "Try again"
+            val r = try { sharing.deleteEverything() } catch (_: Exception) { null }
             main.post {
                 if (activity.isFinishing) return@post
                 val c = sharing.copy
                 when (r) {
+                    null -> message(activity, c, null, theme, title = c["delete.failed.title"],
+                        retry = c["delete.retry"] to { delete(activity, sharing, theme, done) })
                     Sharing.Deletion.ACCEPTED, Sharing.Deletion.NOTHING_SHARED -> message(activity, c, c.deletion("delete.done"), theme)
                     else -> message(activity, c, c["delete.failed.network"], theme, title = c["delete.failed.title"],
                         retry = c["delete.retry"] to { delete(activity, sharing, theme, done) })

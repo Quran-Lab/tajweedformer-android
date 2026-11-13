@@ -55,6 +55,10 @@ internal interface SharingGate {
     fun uploaded(id: String) {}
     /** The contributor id was revoked on the server (deleted from elsewhere): a new one from now on. */
     fun contributorRevoked() {}
+
+    /** Whether this install's contributor reads (SDK 3.1.4): its id, device key and recovery code are there and can
+     *  be read, or none of them is there yet. While not, the upload pass sends nothing. */
+    fun contributorReadable(): Boolean = true
     /** A refusal that is an SDK bug (400): one issue a day. */
     fun badRequest(route: String) {}
     /** A line for the developer's log (debuggable builds). */
@@ -615,6 +619,11 @@ internal class ContributionOutbox internal constructor(
         if (due.isEmpty()) return true
         if (!gate.uploadsAllowed()) {
             for (id in due) note(id, "sharing is not allowed here now; waiting")
+            return true
+        }
+        // read at every pass: nothing is sent while the contributor cannot be read
+        if (!gate.contributorReadable()) {
+            for (id in due) note(id, "the contributor cannot be read now; waiting")
             return true
         }
         if (!gate.networkAllowed()) return true
