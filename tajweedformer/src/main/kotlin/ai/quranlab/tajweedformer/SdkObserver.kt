@@ -175,7 +175,14 @@ internal data class DownloadResult(
     val millis: Long = 0,
     /** The manifest revision the file belongs to. */
     val revision: String = "",
-)
+    /** Fetched in ranges (SDK 3.1.3), not in one request. */
+    val ranged: Boolean = false,
+    /** Body bytes per protocol the answers came over (`http/1.1`, `h2`, `h3`), with every protocol an answer came over. */
+    val protocols: Map<String, Long> = emptyMap(),
+) {
+    /** The protocol that carried most of the bytes (also when none came), or null when no answer came. */
+    val protocol: String? get() = protocols.entries.maxByOrNull { it.value }?.key
+}
 
 internal data class SelfTestResult(
     val backend: Backend,

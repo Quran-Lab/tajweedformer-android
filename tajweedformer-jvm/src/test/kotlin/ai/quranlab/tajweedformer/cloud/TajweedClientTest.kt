@@ -53,7 +53,7 @@ class TajweedClientTest : OpenChecked() {
 
     /** A Client that talks to the stub; the launch sequence is not run by itself, so each test decides what the server saw. */
     private fun client(key: String = stub.key, api: String = stub.base, storage: File = dir): TajweedClient =
-        TajweedClient(key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(storage), apiUrl = api, trustedKeys = listOf(stub.publicKey)),
+        TajweedClient(key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(storage), apiUrl = api, trustedKeys = listOf(stub.publicKey)),
             autoLaunch = false).also { open = it }
 
     private fun code(body: () -> Unit): String? = try {
@@ -107,12 +107,22 @@ class TajweedClientTest : OpenChecked() {
         return null
     }
 
+    /** `diagnosis` of the contract's names.json: its optional fields and the values each may take. */
+    @Suppress("UNCHECKED_CAST")
+    private val diagnosisNames: Map<String, Any?> by lazy {
+        (Json.parse(javaClass.getResourceAsStream("/vectors30/names.json")!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>)["diagnosis"] as Map<String, Any?>
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private val optionalFields: List<String> get() = diagnosisNames["optional_fields"] as List<String>
+
     /** The report as its JSON says it (what an issue would carry), checked against the schema. */
     private fun valid(d: TajweedDiagnosis): Map<String, Any?> {
         @Suppress("UNCHECKED_CAST")
         val report = Json.parse(d.toJson()) as Map<String, Any?>
         assertNull("diagnose() does not fit the schema: ${d.toJson()}", wrong(report, schema))
-        assertEquals("the eleven fields in their order", (schema["required"] as List<*>), report.keys.toList())
+        // the optional fields come after the eleven, and which they are is the contract's list (names.json), not this test's
+        assertEquals("the eleven fields in their order, then the optional ones", (schema["required"] as List<*>) + optionalFields, report.keys.toList())
         return report
     }
 
@@ -122,8 +132,8 @@ class TajweedClientTest : OpenChecked() {
         val examples = Json.parse(javaClass.getResourceAsStream("/vectors30/diagnosis_examples.json")!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>
         val good = examples["valid"] as List<Map<String, Any?>>
         val bad = examples["invalid"] as List<Map<String, Any?>>
-        assertEquals(7, good.size)
-        assertEquals(17, bad.size)
+        assertEquals(9, good.size)
+        assertEquals(18, bad.size)
         for (e in good) assertNull("${e["name"]}", wrong(e["report"], schema))
         for (e in bad) assertTrue("${e["name"]} passed the schema", wrong(e["report"], schema) != null)
         // reports of this SDK's own type in the states a device can be in
@@ -137,6 +147,15 @@ class TajweedClientTest : OpenChecked() {
         val demoted = TajweedDiagnosis("3.0.0", null, true, null, "stale", "4.0.0", "a".repeat(40), true, "c8_l64",
             TajweedBackend(TajweedBackend.Kind.CPU, "cpu", TajweedBackend.Stage.DEMOTED, "failover"), "denied", storage, "microphone_denied", 0, "metered")
         valid(demoted)
+        // the optional field: every value the contract names, and null, is a valid report; another
+        // spelling is not
+        for (p in (diagnosisNames["downloadProtocol"] as List<String>) + listOf<String?>(null)) {
+            val with = TajweedDiagnosis("3.0.0", null, true, null, "fresh", "4.0.0", "a".repeat(40), true, "c16_l64",
+                TajweedBackend(TajweedBackend.Kind.CPU, "cpu", TajweedBackend.Stage.CPU), "granted", storage, null, 0, "unmetered", downloadProtocol = p)
+            assertEquals(p, valid(with)["downloadProtocol"])
+        }
+        val other = TajweedDiagnosis("3.0.0", null, true, null, "fresh", null, null, false, null, null, "granted", storage, null, 0, "unmetered", downloadProtocol = "HTTP/2")
+        assertTrue("a protocol the contract does not name passed the schema", wrong(Json.parse(other.toJson()), schema) != null)
     }
 
     @Test
@@ -298,7 +317,7 @@ class TajweedClientTest : OpenChecked() {
             stub.versions = setOf("4.0.0")
             val log = java.util.Collections.synchronizedList(ArrayList<String>())
             var engines = 0
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir, debugBuild = true, log = { log.add(it) }),
+            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir, debugBuild = true, log = { log.add(it) }),
                 apiUrl = stub.base, trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = served.url,
                 engine = { _, _, _ -> engines++; Engine() }), autoLaunch = false).also { open = it }
 
@@ -352,7 +371,7 @@ class TajweedClientTest : OpenChecked() {
         ServedModel.of(files).use { served ->
             stub.recommended = served.recommended()
             stub.inference = null
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = stub.base,
+            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
                 trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = served.url, engine = { _, _, _ -> Engine() }),
                 autoLaunch = false).also { open = it }
             val big = "layers.zfw.gz"
@@ -495,7 +514,7 @@ class TajweedClientTest : OpenChecked() {
                 if (refuse.get()) throw SecurityException("Permission denied (missing INTERNET permission?)") else real.get(url, headers)
             }
             stub.notPermitted = true
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = stub.base,
+            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
                 trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = served.url, modelHttp = modelHttp,
                 engine = { _, _, _ -> Engine() }), autoLaunch = false).also { open = it }
 
@@ -671,7 +690,7 @@ class TajweedClientTest : OpenChecked() {
                 override fun isUnmetered(): Boolean = kind == "unmetered" || kind == "unknown"
                 override fun connection(): String = kind
             }
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir), apiUrl = stub.base,
+            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
                 trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = "http://127.0.0.1:${server.address.port}",
                 network = network, engine = { _, _, _ -> Engine() }), autoLaunch = false).also { open = it }
             val progress = java.util.Collections.synchronizedList(ArrayList<Pair<Long, Long>>())

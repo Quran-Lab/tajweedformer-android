@@ -100,9 +100,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     /** The refusal that stops a model on this device, remembered across launches (SPEC 15.3). */
     val refusals = Refusals(cloudDir)
 
-    /** Every API answer: one whose body carries a stop reason is remembered as a refusal of the API. */
+    /** Every API answer: a 401 or a 403 whose body carries a stop reason is remembered as a refusal of the API. A
+     *  stop reason under any other status is not a stop (SPEC 15.3). */
     val api = QuranLabApi(options.apiUrl, env.http) { r ->
-        if (!r.ok) r.error.reason?.let { if (ModelGate.stops(it)) refusals.stop(it, Refusals.API) }
+        if (r.status == 401 || r.status == 403) r.error.reason?.let { if (ModelGate.stops(r.status, it)) refusals.stop(it, Refusals.API) }
     }
     val config = ConfigStore(cloudDir, options.trustedKeys, env.clock)
     val tokens: TokenProvider? = key?.let {
@@ -229,7 +230,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             throw when {
                 a == null -> ai.quranlab.tajweedformer.RecognizerException.DownloadFailed(ai.quranlab.tajweedformer.ModelManifest.FILE_NAME,
                     "network: ${e.message}", e.cause as? java.io.IOException ?: java.io.IOException(e.message))
-                ModelGate.stops(a.reason) -> ModelGate.error(a.reason!!, env.app.bundleId)
+                ModelGate.stops(a.status, a.reason) -> ModelGate.error(a.reason!!, env.app.bundleId)
                 else -> ai.quranlab.tajweedformer.TajweedError.ofCloud(e)
             }
         }

@@ -47,6 +47,19 @@ internal class ServedModel private constructor(
     /** For a path and how many times it was asked for so far (1 for the first): the answer to give instead; null: the file. */
     @Volatile var answer: ((String, Int) -> Answer?)? = null
 
+    /** For a path, the request's `Range` header (null: none) and how many times that path with that range was asked for
+     *  (1 for the first): the answer to give instead; null: the file. Asked before [answer]. */
+    @Volatile var rangeAnswer: ((String, String?, Int) -> Answer?)? = null
+
+    /** For a path, its `Range` header and how many times that range was asked for: how many body bytes to send before
+     *  dropping the connection; null: [cut] decides. */
+    @Volatile var rangeCut: ((String, String?, Int) -> Long?)? = null
+
+    /** Answers that were sending a body at the same time, at most (every path). */
+    val mostAtOnce = java.util.concurrent.atomic.AtomicInteger()
+    private val atOnce = java.util.concurrent.atomic.AtomicInteger()
+    private val askedRange = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     /** Called when a request for a path arrives, before it is answered. */
     @Volatile var onRequest: ((String) -> Unit)? = null
 
@@ -76,7 +89,8 @@ internal class ServedModel private constructor(
     fun sent(path: String): Long = synchronized(requests) { requests.filter { it.path == path }.sumOf { it.sent } }
 
     init {
-        server.executor = Executors.newFixedThreadPool(2)
+        // room for a download's ranges at once (SDK 3.1.3: four) beside another request
+        server.executor = Executors.newFixedThreadPool(8)
         server.createContext("/") { ex ->
             if (down) {
                 ex.close()
@@ -92,7 +106,9 @@ internal class ServedModel private constructor(
             val headers = ex.requestHeaders.entries.associate { it.key.lowercase() to it.value.last() }
             try {
                 rel?.let { r -> try { onRequest?.invoke(r) } catch (_: Exception) {} }
-                val given = rel?.let { r -> answer?.invoke(r, asked.merge(r, 1) { a, b -> a + b }!!) }
+                val nRange = rel?.let { r -> askedRange.merge("$r $range", 1) { a, b -> a + b }!! } ?: 0
+                val given = rel?.let { r -> rangeAnswer?.invoke(r, range, nRange) }
+                    ?: rel?.let { r -> answer?.invoke(r, asked.merge(r, 1) { a, b -> a + b }!!) }
                 val other = rel?.let { replace?.invoke(it) }
                 val file = rel?.let { File(root, it) }
                 if (given != null) {
@@ -111,22 +127,31 @@ internal class ServedModel private constructor(
                 } else {
                     val size = other?.size?.toLong() ?: file!!.length()
                     val etag = "\"$build-${rel.hashCode()}-$size\""
-                    val asked = range?.let { Regex("^bytes=(\\d+)-$").find(it) }?.groupValues?.get(1)?.toLong()
-                    // a range of another version of the file (another validator) is answered with the whole file
-                    val from = if (asked != null && ifRange == etag) asked else 0L
+                    // `bytes=<from>-` (a resume) and, since 3.1.3's ranges, `bytes=<from>-<to>`
+                    val m = range?.let { Regex("^bytes=(\\d+)-(\\d*)$").find(it) }
+                    val asked = m?.groupValues?.get(1)?.toLong()
+                    val askedTo = m?.groupValues?.get(2)?.takeIf { it.isNotEmpty() }?.toLong()
+                    // a range of another version of the file (another validator) is answered with the whole file; a
+                    // range without If-Range is a range of whatever the server has
+                    val honoured = asked != null && (ifRange == null || ifRange == etag)
+                    val from = if (honoured) asked!! else 0L
+                    val to = if (honoured && askedTo != null) minOf(askedTo, size - 1) else size - 1
                     ex.responseHeaders.add("ETag", etag)
                     ex.responseHeaders.add("Accept-Ranges", "bytes")
-                    if (from >= size && from > 0) {
+                    if (honoured && from >= size) {
                         status = 416
                         ex.responseHeaders.add("Content-Range", "bytes */$size")
                         ex.sendResponseHeaders(416, -1)
                     } else {
-                        status = if (from > 0) 206 else 200
-                        if (from > 0) ex.responseHeaders.add("Content-Range", "bytes $from-${size - 1}/$size")
-                        val length = size - from
-                        val stop = cut?.invoke(rel)?.coerceIn(0L, length) ?: length
+                        // a closed range is a 206 also when it starts at 0; an open one from 0 is the whole file (200)
+                        val partial = honoured && (from > 0 || askedTo != null)
+                        status = if (partial) 206 else 200
+                        if (partial) ex.responseHeaders.add("Content-Range", "bytes $from-$to/$size")
+                        val length = to - from + 1
+                        val stop = (rangeCut?.invoke(rel, range, nRange) ?: cut?.invoke(rel))?.coerceIn(0L, length) ?: length
                         ex.sendResponseHeaders(status, if (length == 0L) -1 else length)
-                        if (length > 0) {
+                        mostAtOnce.accumulateAndGet(atOnce.incrementAndGet()) { a, b -> maxOf(a, b) }
+                        if (length > 0) try {
                             val out = ex.responseBody
                             (other?.inputStream() ?: file!!.inputStream()).use { input ->
                                 var skip = from
@@ -142,7 +167,9 @@ internal class ServedModel private constructor(
                             out.flush()
                             // a cut: the exchange is closed with the body short, which closes the connection
                             if (stop >= length) out.close()
-                        }
+                        } finally {
+                            atOnce.decrementAndGet()
+                        } else atOnce.decrementAndGet()
                     }
                 }
             } catch (_: IOException) {

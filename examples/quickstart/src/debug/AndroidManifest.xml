@@ -6,5 +6,10 @@
         <activity
             android:name=".GateActivity"
             android:exported="true" />
+        <!-- Not part of the example: the screen that proves the model download on a phone (a host starts it by name
+             with adb and reads its lines from the log). Debug builds only. -->
+        <activity
+            android:name=".DownloadProofActivity"
+            android:exported="true" />
     </application>
 </manifest>

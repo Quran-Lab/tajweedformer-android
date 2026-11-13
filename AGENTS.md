@@ -78,9 +78,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.2"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.3"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.2 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -99,6 +99,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 // app/build.gradle.kts
 dependencies { implementation("ai.quranlab:tajweedformer:3.1.2") }
 ```
+
+Maven Central serves 3.1.2 today. 3.1.3 follows there once it is released; the quick start below is the same for both.
 
 ## Before you start
 
@@ -224,6 +226,13 @@ alignment and the LLR are the app's: [docs/migrating-to-3.md](docs/migrating-to-
 error `client_exists`). Options are always last and optional:
 `TajweedClientOptions(appVersion, storage, analytics, audience)`.
 
+`storage` is the folder where the SDK keeps its files (default: `noBackupFilesDir/quranlab`). **Use sharing in one
+process.** The storage folder belongs to the app, and by default every process of the app uses the same one. The SDK
+keeps the learner's sharing answer in memory in each process and writes it as a whole, so two processes that each
+make a Client on the same folder do not see each other's changes: sharing turned off in one does not stop the other,
+and the other's next write puts the earlier answer back. Make the Client in one process of your app. If a second
+process needs the model, give it its own `storage` folder.
+
 - `client.model()` gives the model version Quran Lab's signed config recommends for this app, downloading and
   verifying it on the first call; `client.model("4.0.0")` asks for one version. A model has a `version` (what you
   ask for) and a `build` (the exact files, 40 hex); `model.contexts`, `defaultContext` and `chunkMs(context)` say
@@ -233,18 +242,21 @@ error `client_exists`). Options are always last and optional:
   not wait. With `unmeteredOnly = true` it waits while the connection is metered or absent (the call returns; call
   it again later, for example at the next app start) and downloads on Wi-Fi or Ethernet. On the desktop JVM the
   SDK cannot tell what the connection is, so the option cannot be honoured there and the download runs.
-  `client.storage` says what is on the device, `client.removeModels()` deletes it.
+  A download that `model()` or `prefetch` started goes on when the learner leaves the app, as long as the app's
+  process lives (see "Model download and verification"). `client.storage` says what is on the device,
+  `client.removeModels()` deletes it.
 - `client.diagnose()` answers "why does it not work" in one object (`toJson()` for a bug report): the SDK version
   and the newest one, whether the key was accepted and why not, whether the config is fresh, the model on the
   device and whether it verified, the context, the backend and its stage, the microphone permission, storage, the
-  last error, the chunks dropped for a collector that did not read, and the connection (`unmetered`, `metered`,
-  `none`, or `unknown` on the desktop JVM). It never throws and works offline.
+  last error, the chunks dropped for a collector that did not read, the connection (`unmetered`, `metered`,
+  `none`, or `unknown` on the desktop JVM), and the protocol of the last model request of the process
+  (`downloadProtocol`: `http/1.1` or null). It never throws and works offline.
 - A model comes only from Quran Lab's server, through the Client (`client.model()`, `client.prefetch()`). There is
   no call that opens a model folder the app ships or keeps itself: the model is Quran Lab's to deliver, verify and
   update, and an app that carries its own copy cannot be told of a newer or a withdrawn build.
 - When Quran Lab refuses the key or the app (a revoked key, a paused or blocked app), the SDK stops running the
   model and removes the downloaded model from the device. Once the key is accepted again the model is downloaded
-  again. The refusals that do it: a revoked or unknown key,
+  again. The refusals that do it, read only from an answer with status 401 or 403: a revoked or unknown key,
   `app_not_allowed`, `origin_not_allowed`, `key_type_mismatch`, `app_blocked`, `developer_not_approved`.
   `client.model()` and `prefetch` fail with that refusal (`invalid_key`, or `server_rejected` with its message and
   fix), also at the next start without a network, until a later answer of the server accepts the key. The SDK
@@ -283,9 +295,44 @@ then moved into place atomically; any mismatch deletes it. Models are kept by bu
 `<storage>/models/<model id>/<build>/`, so a new version never overwrites the one in use, and an app that goes
 offline keeps working with the last verified build.
 
+**A download that breaks goes on by itself (3.1.3).** When the transfer of a file stops (no answer, a connection
+that ends, a server error, or no byte for 30 seconds), the call waits and goes on from the bytes already on the
+device: up to five times per file, after 1, 2, 4, 8 and 16 seconds, and only then fails (`download_failed`, or
+`needs_connection` when nothing came at all); the partial file stays for the next call. The 30 seconds are a limit
+on silence, not on the time of a download. A refusal is asked once and never again in the call. A file above 8 MiB
+(the weights) comes in 8 MiB ranges, four at a time, with a map of the ranges that are complete beside the partial
+file, so a cut, a crash or a restart costs only the ranges that were under way. That is what the ranges are for;
+they do not make the download faster where one connection already fills the link (measured on an Alcatel 1 over
+Wi-Fi: 15.5 to 21.2 seconds for the weights in one stream, 16.5 to 17.5 seconds in ranges). `client.close()` ends
+a download that is under way: the call fails with `download_failed`, and what it had downloaded stays on the device
+for the next Client. A call whose coroutine is cancelled ends as a cancelled coroutine.
+
+**Only the answer that was asked for is taken.** A request for a file takes a 200 whose length is the file's, or a
+206 whose `Content-Range` is exactly the range asked for, of a file of the manifest's size. Anything else that says
+success is a failed attempt: it counts against the five, and nothing already on the device is changed by it. A
+whole file sent in answer to a range request is written beside the partial file and takes its place only when all
+of it has arrived.
+
+**The download goes on when the app is left.** Shown on a phone (an Alcatel 1 with Android 11): a download that
+was cut went on at the app's next start from the ranges that were complete, and a download went on to its end
+after the app was left (Home), in the app's own process, with the job described here. With the download the SDK
+enqueues one WorkManager job: no new permission (WorkManager is a dependency of the SDK since 2.0.0), no foreground
+service, no notification, nothing in the app's manifest. The job is meant to go on with the download when the
+learner leaves the app, in the app's process or, after that process has ended, in a new one, from the ranges that
+are complete; it keeps the call's network rule and every rule of a model request, ends on a refusal, the daily
+limit or a storage error, and is called off by `client.removeModels()`. Going on after the app's process has ended
+depends on the phone maker's system letting a scheduled job start the app. The one phone tried refused it; the
+download then continues at the app's next start, from the same ranges. This path is exercised only on the JVM, with
+a stand-in for WorkManager. On the desktop JVM there is no such job: the process is the app.
+
+`client.diagnose()` says which protocol the last model request ran on (`downloadProtocol`: `http/1.1`, or null
+before the first model request of the process; the SDK's HTTP stack speaks HTTP/1.1 only). It is kept in memory,
+is in no statistics and is not written to the device. An app's HTTP response cache (`HttpResponseCache`) never sees
+a model request.
+
 Every request for the model (its manifest, each file, each resumed range) carries the app key (`x-qlab-key`) and
 the install's token (`authorization: Bearer ...`), the token the SDK already uses for its other calls to Quran Lab;
-it never follows a redirect. Where Quran Lab's signed config asks for it, the token is attested with Play Integrity
+it never follows a redirect, and nor does any other request of the SDK: a 3xx is a failed request, asked once. Where Quran Lab's signed config asks for it, the token is attested with Play Integrity
 (see "Play Integrity" below). A refusal of the model request has its own message and fix under `server_rejected`
 (`model_attestation_required`, `model_not_allowed`), and Quran Lab's daily limit for model downloads is
 `download_failed` and is not retried in a loop.
@@ -300,6 +347,17 @@ as the same user. When the key store fails (locked, unavailable), nothing is ope
 call fails with `storage_failed`. **An app that updates from an earlier SDK downloads the model once more**, because
 the model it holds has no record; without a connection at that first start `client.model()` fails with
 `needs_connection`.
+
+A key store never keeps a device from the model for good (3.1.3). On Android, a Keystore answer that the key is
+gone for good (permanently invalidated, unrecoverable) is "no key": a new key and one download. When the Keystore
+fails in the same way at three starts of the app in a row, the SDK makes a new key, downloads the model once, and
+reports one issue (`install_key_replaced:<the exception's class>`, nothing more). On the desktop JVM under Windows
+and macOS the machine id is read by a command of the system (`reg`, `ioreg`), which can fail or time out: the id a
+read gave is kept in the SDK's folder (`cloud/install.machine`, with a MAC under the folder's key file
+`cloud/install.key`), a read that works wins, and the kept answer serves when a read fails, so a slow start does
+not cost a download. A storage folder carried to another machine downloads the model once there, and nothing is
+reported. A machine whose id can never be read is bound by its key file alone, which a copied folder carries with
+it.
 
 ### Play Integrity
 
@@ -334,8 +392,10 @@ the app.
   the take goes on there (`BackendChanged`). A long silence from the accelerator is checked against the CPU engine
   in the background before anything is switched.
 - Preparation runs only while no take is active, not in battery saver, not below 20 % battery unless charging, and
-  not above light thermal throttling. It is WorkManager work, so it resumes after the app is killed or the phone
-  restarts.
+  not above light thermal throttling. It is WorkManager work, meant to go on after the app's process has ended or
+  the phone has restarted. Whether a scheduled job may start the app is the decision of the phone maker's system;
+  the one phone tried (an Alcatel 1 with Android 11) refused it, and there the preparation goes on at the app's next
+  start.
 
 The accelerator path has not run inside an app on an accelerator phone yet; its native runner ran on the Exynos
 2500 and 2600 boards.
@@ -363,7 +423,10 @@ asked again.
   the system. `SharingTheme` (Compose: `SharingStyle`) changes its colours, accent, corners and fonts; the design's
   order, its lines and the name at the top stay. `SharingSettingsView(activity, client)` is the settings rows (the
   switch, "What is shared", "Delete what I shared", the recovery code). In Compose: `SharingSheetHost(client)` and
-  `SharingSettings(client)` from `ai.quranlab:tajweedformer-compose`.
+  `SharingSettings(client)` from `ai.quranlab:tajweedformer-compose`, on Maven Central from 3.1.3 on:
+  `implementation("ai.quranlab:tajweedformer-compose:<version>")`. It works only with `ai.quranlab:tajweedformer`
+  of exactly the same version (it is compiled against the core's internals), and its POM names that version, so
+  the one line brings the right core; an app that names both gives both the same version.
 - **Recordings that do not cut speech.** A `listen` take records only between `listen()` and the end of the take.
   An app that pushes its own audio can also feed the sharing recording directly (`client.sharing.feed(samples,
   sampleRate)`) so that a recording keeps the half second before a take starts and the half second after it ends;
@@ -530,7 +593,8 @@ tajweedformer/              the Android library (AAR), ai.quranlab:tajweedformer
   src/android/kotlin        Android only: the Client's platform side, the microphone, the sharing views
   src/jvm/kotlin            desktop JVM only: TajweedClient(key, storage)
   src/androidTest           DeviceEndToEndTest
-tajweedformer-compose/      the sharing sheets and settings in Jetpack Compose (optional)
+tajweedformer-compose/      the sharing sheets and settings in Jetpack Compose (optional), ai.quranlab:tajweedformer-compose,
+                            published with the core in one bundle
 tajweedformer-jvm/          those sources on the desktop JVM, with the tests
 examples/quickstart/        the example app, one screen: loading, Play sample, Recite, the tokens, Diagnose
 docs/                       migrating-to-3.md, api.md, platform-client.md
@@ -544,7 +608,8 @@ engine/                     tajweedformer-engine, pinned
 3.0.0 is inference only: the scorer, the tajweed settings and the verdict types of 2.x are gone, and the
 public API is the five concepts above with the same names on every platform ([docs/api.md](docs/api.md) lists it).
 In 3.1.0 a model comes only from Quran Lab's server, through the Client. 3.1.1 gives the sharing sheet Quran Lab's
-design. See [CHANGELOG.md](CHANGELOG.md).
+design. 3.1.3 makes the model download hold up on a poor connection and go on when the app is left, and publishes
+the Compose artifact. See [CHANGELOG.md](CHANGELOG.md).
 
 What is proven where: the shared vectors of SDK 3.0, the Client against a stub server and the sharing rules run on
 every push in CI without a model; the engine through JNI builds and runs there too. No public runner has a model,

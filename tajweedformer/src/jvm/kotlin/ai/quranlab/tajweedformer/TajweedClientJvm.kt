@@ -35,6 +35,9 @@ public fun TajweedClient(key: String, storage: File, options: TajweedClientOptio
         secretBox = PlainSecretBox,
     )
     // the install records' key: derived from the machine id and the user name; a machine without an id keeps a key
-    // file in the storage folder (SPEC 15.2)
-    return TajweedClient(key, options, ClientPlatform(cloud = env, installKeys = MachineInstallKey(File(File(dir, "cloud"), "install.key"))))
+    // file in the storage folder (SPEC 15.2). Where the id is read by a command (Windows, macOS) the id that was read is
+    // kept beside it, and serves when a later read fails
+    val cloudDir = File(dir, "cloud")
+    return TajweedClient(key, options, ClientPlatform(cloud = env, installKeys = MachineInstallKey(File(cloudDir, "install.key"),
+        keptId = File(cloudDir, MachineInstallKey.KEPT_ID_NAME).takeIf { MachineInstallKey.READ_BY_COMMAND })))
 }

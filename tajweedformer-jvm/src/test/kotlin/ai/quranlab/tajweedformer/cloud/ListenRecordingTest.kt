@@ -159,7 +159,7 @@ class ListenRecordingTest : OpenChecked() {
             var now = System.currentTimeMillis()
             val microphone = FakeMicrophone()
             val engine = Engine()
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(cloud = stub.environment(dir, clock = { now }), apiUrl = stub.base,
+            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir, clock = { now }), apiUrl = stub.base,
                 trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelsUrl = "http://127.0.0.1:${http.address.port}",
                 microphone = microphone, engine = { _, _, _ -> engine }), autoLaunch = false).also { client = it }
             // Quran Lab offers sharing to this app and the learner said yes

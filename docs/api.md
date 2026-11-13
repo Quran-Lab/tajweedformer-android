@@ -228,6 +228,7 @@ public class TajweedDiagnosis
     public val lastError: String?,
     public val droppedChunks: Long,
     public val connection: String,
+    public val downloadProtocol: String?
     public fun toMap(): Map<String, Any?>
     public fun toJson(): String
 ```

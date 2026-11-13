@@ -162,7 +162,9 @@ location, app user data.
 ### Register
 
 `POST /v1/register` is called once per UTC day per install (the first launch or return to the foreground of
-the day; a day stamp on the device), not at every launch, so the server counts daily active installs.
+the day; a day stamp on the device), not at every launch, so the server counts daily active installs. It names the
+model the install has (`model_revision`: the version of the Model that is open, else of the build on the device,
+whatever the model's id; none when the device holds no model).
 
 ## CPU first, then the accelerator (iOS, macOS, Android)
 

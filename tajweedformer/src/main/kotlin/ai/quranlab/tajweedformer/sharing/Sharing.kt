@@ -352,7 +352,8 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     internal fun sessionEnded(e: TajweedObserver.SessionEnd) {
         // the recording stays open for the next take; the ask below does not close it
         recorder.takeEnded(e.completed)
-        if (!e.completed) return
+        // a take without audio is not a finished session (SPEC 6.1, contract 1.13.0): it never leads to the ask
+        if (!e.completed || e.withoutAudio) return
         // an ask nobody can show is not counted: the sheet goes to the SDK's UI or the app's own
         val show = prompts
         val v = state.sessionCompleted(e.feedbackShown, available && show != null)

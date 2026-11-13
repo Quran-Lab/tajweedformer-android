@@ -180,7 +180,9 @@ class PublicContractTest : OpenChecked() {
         // diagnose(): the fields in order, and the words it uses
         val diagnosis = names["diagnosis"] as Map<String, Any?>
         val d = TajweedDiagnosis("3.0.0", null, null, null, "none", null, null, false, null, null, "none", emptyMap(), null, 0, "unknown")
-        assertEquals(diagnosis["fields"], d.toMap().keys.toList())
+        // the eleven fields, then the optional ones this SDK gives
+        assertEquals((diagnosis["fields"] as List<String>) + (diagnosis["optional_fields"] as List<String>), d.toMap().keys.toList())
+        assertEquals(diagnosis["downloadProtocol"], TajweedClient.DOWNLOAD_PROTOCOLS)
         assertEquals(diagnosis["microphone"], MicPermission.entries.map { it.key })
         assertEquals(diagnosis["connection"], TajweedClient.CONNECTIONS)
     }

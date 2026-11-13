@@ -26,3 +26,15 @@ In your own app the key is a string in your code: `TajweedClient(context, "qlk_v
 `GateActivity` (`src/debug`, debug builds only) is not part of the example. It is the screen the SDK's release gate
 starts on a phone: `scripts/phone_gate.py` builds this app against a built AAR (`-PsdkAar=<file>`), runs every sample
 clip of the model through `model.listen(clip)` and reads `client.diagnose()`.
+
+## The download proof
+
+`DownloadProofActivity` (`src/debug`, debug builds only) is not part of the example either. It is the screen that
+proves the model download on a phone: a host starts it by name with `adb` and reads its lines from the log (tag
+`TJ_DL`). With the app's own Client and Quran Lab's server it removes the models and downloads them again (`mode
+time`), or downloads what is missing (`mode fetch`), and prints the wall time and, for every file the SDK
+downloaded, its bytes, its time, whether it came in ranges and over which protocol. The extras `on` and `off` name
+debug switches of the SDK, which only a debuggable app has: `singleStream` (every file in one request) and
+`backgroundDownloads` (the job that goes on with a download when the app is left). So a download that is cut in the
+middle (the app's process ended) and goes on at the next start, and a download that goes on after the app was
+left, can be watched on a real phone.

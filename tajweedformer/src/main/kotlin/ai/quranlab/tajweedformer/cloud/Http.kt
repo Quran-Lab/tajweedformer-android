@@ -79,8 +79,10 @@ internal class HttpResponse(val status: Int, val headers: Map<String, String>, v
         null
     }
 
-    /** qlab-api's `{"error","message"}`, or `http_<status>`. */
+    /** qlab-api's `{"error","message"}`, or `http_<status>`. A redirect (3xx) is `http_<status>` whatever its body
+     *  says: it is a failed request, never a refusal and never a stop of a model (SPEC 15.4). */
     val error: ApiError get() {
+        if (status in 300..399) return ApiError(status, "http_$status")
         val o = json()
         return ApiError(status, o?.get("error") as? String ?: "http_$status", o?.get("min_sdk") as? String, o?.get("reason") as? String)
     }
@@ -229,7 +231,14 @@ internal data class ApiError(
      * `server_rejected`), else the error [code]. The reason is read first; what the SDK does to its network calls
      * ([action]) follows the code as before.
      */
-    val refusal: String get() = reason?.takeIf { it in ai.quranlab.tajweedformer.ErrorCatalogue.reasons("server_rejected") } ?: code
+    val refusal: String get() = reason?.takeIf {
+        // a reason of the stop list is one only in a 401 or a 403 (SPEC 15.3); under another status the code stands
+        it in ai.quranlab.tajweedformer.ErrorCatalogue.reasons("server_rejected") && (!ModelGate.stops(it) || ModelGate.stops(status, it))
+    } ?: code
+
+    /** The answer names a stop (its reason, or its code, is of the stop list) under a status that cannot carry one:
+     *  for the app it is a request that failed, with the status's own error (SPEC 15.3). */
+    val stopOutOfPlace: Boolean get() = status != 401 && status != 403 && (ModelGate.stops(reason) || ModelGate.stops(code))
 
     val action: ErrorAction get() = when {
         status == 400 -> ErrorAction.DROP_AND_REPORT

@@ -65,10 +65,16 @@ class SharingOffTest(private val name: String, @Suppress("unused") private val r
     /** The platform's job: runs a pass when the SDK asks for one, once the test lets it ([auto]). */
     private class Jobs : CloudScheduler {
         @Volatile var auto = false
+        /** The passes the SDK asked for while [auto] was off (they were not run). */
+        val asked = java.util.concurrent.atomic.AtomicInteger()
         val pool = Executors.newSingleThreadExecutor { r -> Thread(r, "test-uploads").apply { isDaemon = true } }
         override fun scheduleDelivery(cloud: QuranLabCloud) {}
         override fun scheduleUploads(cloud: QuranLabCloud, atMs: Long?) {
-            if (!auto || atMs != null) return
+            if (atMs != null) return
+            if (!auto) {
+                asked.incrementAndGet()
+                return
+            }
             try { pool.execute { try { cloud.sharing.outbox.drain() } catch (_: Exception) {} } } catch (_: Exception) {}
         }
         /** Waits until the passes asked for so far are through. False when one still runs. */
@@ -264,7 +270,11 @@ class SharingOffTest(private val name: String, @Suppress("unused") private val r
         val disk0 = onDisk(c)
         val contributor0 = c.sharing.contributor.id
         if (case.action == "delete_refused") stub.overrides["/v1/contributions/delete"] = { _, _ -> StubQlab.Reply.error(500, "internal") }
-        jobs.auto = true
+        // a delete the server does not take asks for a pass as its last act (the queue goes on). That pass is run after
+        // the device was looked at: run at once, on its own thread, it can be in the middle of an item's write (a temp
+        // file and a rename) at the moment of the look, which is the pass's work and not a change the delete made
+        jobs.auto = case.action != "delete_refused"
+        jobs.asked.set(0)
         var thrown: Throwable? = null
         var result: Sharing.Deletion? = null
         val t0 = System.nanoTime()
@@ -297,10 +307,16 @@ class SharingOffTest(private val name: String, @Suppress("unused") private val r
             check("a_refused_delete_changes_nothing", c.sharing.isOn && all == disk0 && c.sharing.contributor.id == contributor0) {
                 "sharing on: ${c.sharing.isOn}; on disk before ${disk0.size} files, after ${all.size}: gone ${disk0 - all.toSet()}, new ${all - disk0.toSet()}"
             }
+            // the pass the SDK asked for when the server did not take the delete: now
+            val askedForAPass = jobs.asked.get() > 0
+            jobs.auto = true
+            if (askedForAPass) jobs.scheduleUploads(c)
             hold.release.countDown()
             task.join(20_000)
             val up = until { uploaded(c, old[0]) && stub.segments(old[0]).size == 2 }
-            check("queue_resumes", up) { "the recording that was in flight: ${c.sharing.outbox.item(old[0])}, ${stub.segments(old[0]).size} of 2 segments at the storage" }
+            check("queue_resumes", askedForAPass && up) {
+                "the SDK asked for a pass: $askedForAPass; the recording that was in flight: ${c.sharing.outbox.item(old[0])}, ${stub.segments(old[0]).size} of 2 segments at the storage"
+            }
             return
         }
 

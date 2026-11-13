@@ -1,10 +1,13 @@
 name: Publish to Maven Central
 
 # Started by hand on a tag (Actions, Publish to Maven Central, Run workflow, Use workflow from: Tags).
-# Tests, then the signed bundle of ai.quranlab:tajweedformer, then the Central Portal upload as AUTOMATIC: the
-# Portal validates the bundle and, when it passes, publishes it to Maven Central without a person. The run waits
-# for its own deployment and fails, with the Portal's reasons, when validation fails or the deployment is not
-# PUBLISHED within 30 minutes.
+# Tests, then ONE signed bundle with ai.quranlab:tajweedformer and ai.quranlab:tajweedformer-compose, then the
+# Central Portal upload as AUTOMATIC: the Portal validates the bundle and, when it passes, publishes it to Maven
+# Central without a person. The run waits for its own deployment and fails, with the Portal's reasons, when
+# validation fails or the deployment is not PUBLISHED within 30 minutes.
+#
+# One bundle, one deployment: the Compose artifact works only with the core of exactly the same version, so both
+# artifacts of a version are published or neither is. The Portal validates a deployment as a whole.
 #
 # Automatic since 2026-11-13, by Quran Lab's decision: before, the upload waited on the Portal for someone to
 # press Publish, and every release waited with it. A version published to Maven Central can never be taken back
@@ -31,6 +34,10 @@ jobs:
         run: |
           v=$(sed -n 's/^tajweedformer.version=//p' gradle.properties)
           [ -n "$v" ] && [ "$GITHUB_REF_NAME" = "$v" ] || { echo "tag $GITHUB_REF_NAME is not tajweedformer.version $v" >&2; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      # From here to the end marker: the steps that the bundle dry run (bundle-dry-run.yml) runs too, the same text in
+      # both files; scripts/check_bundle_steps.py fails CI when they differ. They read the version from VERSION.
+      # bundle-steps:begin
       - name: Engine submodule
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,19 +60,27 @@ jobs:
             --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
             --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
             --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
-      - name: Signed bundle (AAR with arm64-v8a, armeabi-v7a and x86_64, sources, javadoc, POM, signatures, checksums)
+      - name: The Compose module's unit tests (the sharing sheet's layout and screenshot tests), before anything is signed or uploaded
+        run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
+      - name: Signed bundle of both artifacts (the core's AAR with arm64-v8a, armeabi-v7a and x86_64, the Compose module's AAR; each with sources, javadoc, POM, signatures, checksums)
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
         run: |
           [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
+          # the core's task builds and zips both publications, and fails when a file of either is missing
           ./gradlew --no-daemon :tajweedformer:centralBundle
           unzip -l tajweedformer/build/distributions/central-bundle-*.zip
-      - name: Android's verifier rule on monitors, on the AAR inside the bundle (nothing is uploaded when a class would be rejected on a phone)
+          for a in tajweedformer tajweedformer-compose; do
+            unzip -l tajweedformer/build/distributions/central-bundle-*.zip | grep -q "ai/quranlab/$a/$VERSION/$a-$VERSION\.pom\$" \
+              || { echo "the bundle has no $a of $VERSION" >&2; exit 1; }
+          done
+      - name: Android's verifier rule on monitors, on both AARs inside the bundle (nothing is uploaded when a class would be rejected on a phone)
         run: |
           python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
           rm -rf build/monitor-check && mkdir -p build/monitor-check
           unzip -o -q tajweedformer/build/distributions/central-bundle-*.zip '*.aar' -d build/monitor-check
           python3 scripts/check_monitor_handlers.py build/monitor-check
+      # bundle-steps:end
       - name: Upload to the Central Portal (AUTOMATIC) and wait until the deployment is PUBLISHED
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
@@ -91,8 +106,9 @@ jobs:
             case $state in
               PUBLISHED)
                 {
-                  echo "Deployment \`$id\` is PUBLISHED: ai.quranlab:tajweedformer:$GITHUB_REF_NAME is on its way to Maven Central."
+                  echo "Deployment \`$id\` is PUBLISHED: ai.quranlab:tajweedformer and ai.quranlab:tajweedformer-compose $GITHUB_REF_NAME are on their way to Maven Central."
                   echo "https://repo1.maven.org/maven2/ai/quranlab/tajweedformer/$GITHUB_REF_NAME/"
+                  echo "https://repo1.maven.org/maven2/ai/quranlab/tajweedformer-compose/$GITHUB_REF_NAME/"
                 } >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
               FAILED)

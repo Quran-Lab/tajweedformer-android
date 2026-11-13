@@ -1,5 +1,145 @@
 # Changelog
 
+## 3.1.3
+
+The model download holds up on a poor connection, loses nothing to a wrong answer, and goes on when the app is left.
+No call changes. `ai.quranlab:tajweedformer-compose` is published with the core from this release on.
+
+- **Changed: a download that breaks or stalls goes on by itself.** When the transfer of a file stops (no answer, a
+  connection that ends, a server error, or no byte for 30 seconds), `client.model()` and `client.prefetch()` wait
+  and go on from the bytes already on the device: up to five times per file, after 1, 2, 4, 8 and 16 seconds, and
+  only then fail with `download_failed` (`needs_connection` when nothing came at all). Before, the first such
+  failure ended the call. The partial file stays after a failure, so the next call goes on from it, as before. A
+  cancelled call ends a wait at once. A refusal is asked once and never again in the call: a revoked key, a blocked
+  or paused app, a daily limit, any 401, 403 or 429 beyond the one renewal of the token, a network Quran Lab does
+  not serve. The manifest is asked once. The 30 seconds are a limit on silence, as before, not on the time of a
+  download: a link that keeps delivering is never cut.
+- **Changed: the large file comes in ranges, with a map of what is complete.** A model file above 8 MiB (in a CPU
+  install the weights, 53.7 MB of 55.5 MB) is fetched in 8 MiB ranges, four at a time, each on a connection of its
+  own. A file beside the partial one (`<file>.part.ranges`) lists the ranges that are complete, and a range is
+  entered there only when its bytes are on the storage. After a cut, a crash or a restart only the missing ranges
+  are asked for, with `If-Range` and the validator of the first answer; inside a call, a range that was cut goes on
+  from the byte where it stopped, and ranges that one failure of the link cut together count as one of the five.
+  This is for what an interruption costs, not for speed: on an Alcatel 1 over Wi-Fi the weights took 15.5, 21.2 and
+  17.4 seconds in one stream and 16.5, 17.2 and 17.5 seconds in ranges (three runs each, one phone, one access
+  point). A server that does not answer ranges is used as before, in one stream. Every file's SHA-256 is still
+  checked against the signed manifest before the file is put in place.
+- **Changed: only the answer that was asked for is taken, and a wrong one costs no byte.** A request for a file
+  takes a 200 whose length is the file's, or a 206 whose `Content-Range` is exactly the range asked for, of a file
+  of the manifest's size. Anything else that says success (a 204, a 200 of another length or with an error page, an
+  empty 206, a 206 of another start or total) is a failed attempt: it counts against the five, and the bytes
+  already on the device stay as they were, the complete ranges and their map included. A whole file sent in answer
+  to a range request is written beside the partial file and takes its place only when all of it has arrived.
+  What removes stored bytes, and nothing else does: for a file in one stream, a 416 to a resume (the stored bytes
+  run past the server's file), a partial file longer than the file, and a complete file whose SHA-256 is wrong;
+  for a file in ranges, only a complete set of ranges that fails its size or its SHA-256. A partial file whose
+  first answer gave no strong ETag is resumed with the range alone, at a later call too and whatever the file's
+  size; before, it was started again.
+  **Fixed with it:** a released build never opened wrong bytes (every file is hashed against the signed manifest
+  before it is used) and never looped, but a 200 that was shorter or longer than the file, or an error page sent
+  with 200, in answer to a resume replaced or deleted what was already stored, so the download began again from
+  less or from nothing; and a 206 was added to the stored bytes without a look at its total. A released build
+  also kept a partial file only together with its validator, so a part whose server gave no strong ETag was
+  started again from its first byte at the next call; 3.1.3 goes on from it with the range alone, also for the
+  large file. (Against Quran Lab's CDN this never happened: it gives a strong ETag.)
+- **Changed: the download goes on when the app is left.** Shown on a phone (an Alcatel 1 with Android 11): a
+  download that was cut went on at the app's next start from the ranges that were complete, and a download went on
+  to its end after the app was left (Home), in the app's own process, with the job described here. What the SDK
+  does: when `client.model()` or `client.prefetch()` starts a download, it enqueues one WorkManager job (no new
+  permission: WorkManager is a dependency of the SDK since 2.0.0; no foreground service, no notification, no entry
+  in the app's manifest). While the app's process lives, the job is meant to keep it from being frozen with the
+  download half done; after the process has ended, the job is meant to go on in a new one, from the ranges that
+  are complete, with the client's options as they were saved. It keeps the call's network rule (`unmeteredOnly`
+  waits for Wi-Fi or Ethernet) and the rules of every model request. A refusal, the daily limit or a storage error
+  end it; `client.removeModels()` calls it off. The SDK lets it try eight times and then waits for the app's next
+  call.
+  Going on after the app's process has ended depends on the phone maker's system letting a scheduled job start
+  the app. The one phone tried refused it; the download then continues at the app's next start, from the same
+  ranges. This path is exercised only on the JVM, with a stand-in for WorkManager.
+- **Changed: closing the Client ends its download, and a cancelled call ends as cancelled.** `client.close()` ends a
+  `model()` or `prefetch()` call that is downloading at that moment: the call fails with `download_failed`, and what
+  it had downloaded stays on the device for the next Client. Before, such a call went on to its end on a closed
+  Client. A call whose coroutine is cancelled now ends as a cancelled coroutine (`CancellationException`) and leaves
+  `diagnose().lastError` alone; before, it failed with `download_failed`. When two callers wait for the same model,
+  cancelling the one that waits ends its wait and nothing else; cancelling the one that downloads ends its requests,
+  and the other caller goes on from what is stored.
+- **Changed: an app's HTTP response cache never sees a model request.** An app that installs
+  `HttpResponseCache` (or any `java.net.ResponseCache`) had the model's requests pass through it. They no longer
+  do: no byte of a model is kept in a second place.
+- **New: `ai.quranlab:tajweedformer-compose` on Maven Central.** The sharing sheet and settings in Jetpack Compose
+  (`SharingSheetHost`, `SharingSettings`) were named in the docs and never published. From 3.1.3 the artifact is
+  published together with the core, in one deployment, so both artifacts of a version are there or neither. It
+  works only with `ai.quranlab:tajweedformer` of exactly the same version (it is compiled against the core's
+  internals); its POM names that version, so one line is enough:
+  `implementation("ai.quranlab:tajweedformer-compose:3.1.3")`.
+- **Fixed: the daily registration names the model the install has.** `POST /v1/register` carried no
+  `model_revision`. It now carries the version of the Model that is open, else of the build the device holds,
+  whatever the model's id; an install that holds no model sends none.
+- **Fixed: a Keystore that fails does not keep a device from the model for good.** When the Android Keystore says
+  the install record's key is gone for good (permanently invalidated, unrecoverable; from Android 13 also its own
+  codes for a key that does not exist or is corrupted), that is "no key": a new key is made and the model is
+  downloaded once. Any other Keystore error is still `storage_failed` for that start, with nothing opened, deleted
+  or downloaded. When the same error has been met at three starts of the app in a row, the SDK makes a new key,
+  downloads the model once, and reports one issue (`other`, `install_key_replaced:<the exception's class>`,
+  nothing more). Before, such a device stayed without the model at every start.
+- **Fixed, desktop JVM: on Windows and macOS a slow start could cost a download.** The machine id is read there by
+  a command of the system (`reg`, `ioreg`); when the read failed, the key changed and the model was downloaded
+  again. The SDK now keeps the id it read in its folder (`cloud/install.machine`, with a MAC made with the folder's
+  key file, so that it counts only in the folder that kept it): a read that works is used and kept, and the kept
+  answer is used when a read fails. A folder carried to another machine has another machine's
+  answer in it: the model is downloaded once there, and nothing is reported. An install on a machine whose id can
+  be read keeps its model through this update.
+- **Fixed: a take without audio is not a session.** A take that ends, cancelled or finished, before one sample of
+  audio was pushed or captured counts nothing in the statistics (no `sessions`, no `aborted`, no `minutes`, no
+  `chunks`, no latency or cold start figure) and never leads to the sharing ask. An app that opens a session only
+  to have the engine ready, and cancels it at once, had added an aborted session to its statistics at every launch.
+- **New: `diagnose()` says which protocol the last model request ran on.** `downloadProtocol`, in the report's
+  JSON and on `TajweedDiagnosis`: null while this Client has made no model request in this process, else
+  `http/1.1`. The SDK's HTTP stack on Android and on the desktop JVM speaks HTTP/1.1 only, so no other value
+  appears here; the shared schema of the report also names `h2` and `h3`. It is kept in memory: it is in no
+  statistics and is not written to the device.
+- No request of the SDK follows a redirect (the model's since 3.1.0, every other call since 2.0.1): a 3xx is a
+  failed request, asked once. New tests pin it for the calls that carry the key or the token, for a sharing start
+  and for a segment's upload, on the SDK's real HTTP code.
+- **Fixed: a redirect is a failed request whatever its body says.** A released build did not follow a redirect,
+  but by its code it would have read a stop reason in a redirect's body as a refusal: remembered, and the model
+  removed. Quran Lab's servers never answer a redirect.
+- **Fixed: a refusal that stops the model is read only from a 401 or a 403.** By its code a released build would
+  have read a stop reason under another status (a 404, a 429, a server failure) as a refusal too. Now such an
+  answer is what its status says: a server failure is asked again by the retry rule, a 429 is the limit, anything
+  else a failed request, asked once; nothing is remembered and nothing is removed, and the call's error is the
+  failed request, not the refusal. This holds for a model request and for a call of the API. Quran Lab's servers
+  send a stop reason only with 401 or 403.
+- **Documented: use sharing in one process.** Read from the code: each process keeps the learner's sharing answer
+  in memory and writes it as a whole. `AGENTS.md` says so beside the `storage` option (section "The Client and the
+  model"): make the Client in one process of the app, and give a second process that needs the model its own
+  `storage` folder.
+- Tests, on the JVM (run by CI), on the SDK's real HTTP code against a local server that plays the link and the
+  answers: the retry rule (`RetryRuleTest`: a stall, a connection that ends, a server error, a slow link that
+  keeps delivering, the five resumes, ranges cut together, a cancel in a pause, the refusals and the manifest asked
+  once, the app's response cache); the answer rule (`AnswerRuleTest`: the wrong answers in one stream and in ranges
+  with what is stored before and after, 416, a part without a validator for a small and for a large file, a part
+  longer than the file); a stop reason in the body of a redirect, a 404, a 429, a 500 and a 503, to the manifest,
+  a file, a range, a request of an open Model and the API's calls with the key and with the token, with the same
+  body under 401 and 403 as the control (`ModelFromServerOnlyTest`, `RangedClientTest`); the ranges and their map
+  (`RangedDownloadTest`, `RangedClientTest`: a cut, a restart, a file that changed, a server without ranges, a
+  redirect on a range, two ranges refused at once, a refusal while other ranges are under way, closing the
+  Client, cancelling one of two callers, `downloadProtocol`); the job's
+  rules with a stand-in for WorkManager (`BackgroundDownloadTest`); `NoRedirectTest`, `RegisterRevisionTest`,
+  `TakeWithoutAudioTest`; the key store rules with stand-ins for the Keystore and for the machine id
+  (`KeyStoreRuleTest`, `InstallKeyStoresTest`). The wrong answers were also given to 3.1.2; "Fixed with it" above
+  says what it did with them.
+- On a phone, an Alcatel 1 with Android 11 on Wi-Fi, from a debug screen of the example app (started from a PC
+  with adb; not run by CI): a download whose process was ended at 31.3 of 55.5 MB went on at the next start from
+  the three complete ranges and fetched the other 28.6 MB; a download went on to its end after the app was left
+  (Home), in the app's process, with the job. When the process was ended with the job owed, that phone refused
+  every start of the job (nine in seven minutes), so no new process came; at the app's next start the model was
+  complete from the stored ranges without a byte fetched again. The continuation in a new process therefore ran
+  on no device, only on the JVM with the stand-in. Also not run on a device: a mobile or a metered link, a
+  Keystore that fails, the Keystore codes of Android 13. The bundle of both artifacts was built and signed with a
+  test key, and an app that names only `tajweedformer-compose` was built from it out of a folder; nothing of
+  3.1.3 was resolved from Maven Central before the release.
+
 ## 3.1.2
 
 - **Changed: the sharing sheet and "What is shared" have the text of copy deck `2026-11-09.1` again.** Copy deck

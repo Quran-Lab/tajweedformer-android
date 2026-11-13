@@ -97,6 +97,9 @@ internal interface TajweedObserver {
         val silenceFrames: Int = 0,
         /** Greedy tokens emitted per selected CTC head. */
         val tokens: Map<String, Int> = emptyMap(),
+        /** The take ended, cancelled or finished, before one sample of audio was pushed or captured: it is not a
+         *  session (SPEC 6.1, contract 1.13.0), counts nothing, and is not a finished session for the sharing ask. */
+        val withoutAudio: Boolean = false,
     )
 
     /** The fallback reasons of telemetry v2. */

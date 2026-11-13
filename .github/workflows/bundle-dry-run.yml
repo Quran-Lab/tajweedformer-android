@@ -1,0 +1,114 @@
+name: Bundle dry run (nothing is uploaded)
+
+# Builds the bundle that the publish workflow WOULD upload for this branch's version, and shows it: the zip's
+# SHA-256, its file list, and the full text of both POMs (ai.quranlab:tajweedformer and
+# ai.quranlab:tajweedformer-compose) in the run's summary. It runs by itself on every push to a release-* branch,
+# on exactly the pushed commit, before a tag exists. It can also be started by hand on a branch (Actions, this
+# workflow, Run workflow), but GitHub offers that only once this file is on the default branch.
+#
+# Its triggers are those two and no other: never a pull request (a pull request's code must not get the signing
+# key), never a tag (a tag is the publish workflow's). scripts/check_bundle_steps.py holds that too.
+#
+# Why it is there: a version published to Maven Central can never be taken back or replaced, a new coordinate can
+# never be renamed, and once the publish workflow is started on a tag (by hand: a pushed tag starts nothing) it
+# uploads and the Portal publishes without a person in between. So what that run would upload is read here first.
+#
+# It CANNOT publish, whatever it is started on: it has no upload step, it names no Central Portal secret, and it
+# makes no request to the Portal. That is why it is a file of its own and not a switch of publish.yml (a wrong
+# condition there would be an upload). It signs with the same signing key as the real run, so the list of files is
+# the real one; the signatures, and with them the zip's SHA-256, differ from run to run.
+#
+# The steps between the two markers are the publish workflow's own, the same text in both files;
+# scripts/check_bundle_steps.py (run below, and by CI on every push) fails when they differ.
+
+on:
+  push:
+    branches: ['release-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Test, sign and show the bundle (no upload)
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: The version of this branch; the bundle steps are the publish workflow's
+        run: |
+          v=$(sed -n 's/^tajweedformer.version=//p' gradle.properties)
+          [ -n "$v" ] || { echo "gradle.properties names no tajweedformer.version" >&2; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          python3 scripts/check_bundle_steps.py
+      # bundle-steps:begin
+      - name: Engine submodule
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-engine.sh engine
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
+        run: |
+          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
+      # the same tests as the CI workflow, in the same way (the 2.x list named test classes that 3.0 does not have)
+      - name: libopus for the sharing tests (built first, so no sharing test ever skips)
+        run: bash scripts/opus/build_opus_host.sh
+      - name: JVM tests (no engine; libopus required)
+        run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
+      - name: JVM tests with the engine (the host JNI library is built; the model-dependent ones skip without the model)
+        run: |
+          ./gradlew --no-daemon :tajweedformer-jvm:cleanTest :tajweedformer-jvm:test -Pnative \
+            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
+            --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
+            --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
+      - name: The Compose module's unit tests (the sharing sheet's layout and screenshot tests), before anything is signed or uploaded
+        run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
+      - name: Signed bundle of both artifacts (the core's AAR with arm64-v8a, armeabi-v7a and x86_64, the Compose module's AAR; each with sources, javadoc, POM, signatures, checksums)
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
+          # the core's task builds and zips both publications, and fails when a file of either is missing
+          ./gradlew --no-daemon :tajweedformer:centralBundle
+          unzip -l tajweedformer/build/distributions/central-bundle-*.zip
+          for a in tajweedformer tajweedformer-compose; do
+            unzip -l tajweedformer/build/distributions/central-bundle-*.zip | grep -q "ai/quranlab/$a/$VERSION/$a-$VERSION\.pom\$" \
+              || { echo "the bundle has no $a of $VERSION" >&2; exit 1; }
+          done
+      - name: Android's verifier rule on monitors, on both AARs inside the bundle (nothing is uploaded when a class would be rejected on a phone)
+        run: |
+          python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
+          rm -rf build/monitor-check && mkdir -p build/monitor-check
+          unzip -o -q tajweedformer/build/distributions/central-bundle-*.zip '*.aar' -d build/monitor-check
+          python3 scripts/check_monitor_handlers.py build/monitor-check
+      # bundle-steps:end
+      - name: What the publish workflow would upload for this version (the zip's SHA-256, its file list, both POMs), written to the run's summary
+        run: |
+          zip=$(ls tajweedformer/build/distributions/central-bundle-*.zip)
+          sha256sum "$zip"
+          unzip -l "$zip"
+          {
+            echo "## The bundle the publish workflow would upload for $VERSION (dry run: nothing was uploaded)"
+            echo
+            echo "Commit \`$GITHUB_SHA\` on \`$GITHUB_REF_NAME\`."
+            echo
+            echo "SHA-256 of \`$(basename "$zip")\` (this run's signatures): \`$(sha256sum "$zip" | cut -d' ' -f1)\`"
+            echo
+            echo '```'
+            unzip -l "$zip"
+            echo '```'
+            for a in tajweedformer tajweedformer-compose; do
+              echo
+              echo "### ai/quranlab/$a/$VERSION/$a-$VERSION.pom"
+              echo
+              echo '```xml'
+              unzip -p "$zip" "ai/quranlab/$a/$VERSION/$a-$VERSION.pom"
+              echo
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

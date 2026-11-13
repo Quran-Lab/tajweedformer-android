@@ -96,7 +96,7 @@ class DownloaderTest : OpenChecked() {
         return m
     }
 
-    private fun store(root: File) = ModelStore(root, base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier)
+    private fun store(root: File) = ModelStore(root, base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, retry = RetryPlan.NONE)
 
     /** The CPU profile is the CPU files only: an accelerator or self-test file is never in it, whatever its `need`. */
     @Test
