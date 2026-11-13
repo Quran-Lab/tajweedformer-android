@@ -1,0 +1,43 @@
+{
+  "format": "quranlab.deck-fragment/1",
+  "added_by": "2026-11-12.1",
+  "absent_from": "2026-11-13.1",
+  "what": "the sentence that deck 2026-11-12.1 added to sheet.who and what.detail, as each language has it",
+  "length": "UTF-16 code units of the fragment (a Java or Kotlin String's length), without the space before it",
+  "sha256": "SHA-256 of the fragment's UTF-8 bytes, lower-case hex",
+  "made_by": "tajweedformer-release-tools tools/deck_fragment_hashes.py from the contract's sharing_copy",
+  "languages": {
+    "en": {
+      "length": 73,
+      "sha256": "fab25a5643ea799fdefa3cb471b8c880ae0456fb91338b7cf338f3e1342968ca"
+    },
+    "ar": {
+      "length": 64,
+      "sha256": "80ce286a85aea0d01d6917e7ab0b1ddf97760cf4452e8aa173707c63230d0be9"
+    },
+    "id": {
+      "length": 104,
+      "sha256": "bda904df8e5a0aa7931850d25edad6e4ba867165eb41c9953207efe3ff829972"
+    },
+    "ms": {
+      "length": 95,
+      "sha256": "03df443411cf592a8c126d669e6f79102bb326aa168ceaaaedad35fe1f40d773"
+    },
+    "tr": {
+      "length": 76,
+      "sha256": "062b193a5574511294b1886495777a5e9193c2fad630a9ddbd84d835dda65c65"
+    },
+    "fr": {
+      "length": 97,
+      "sha256": "57bf4b08a3effb747f13401da625bbca315edd90cad76311c1ddb7d549835311"
+    },
+    "ur": {
+      "length": 73,
+      "sha256": "32892abd9ad9bac14fe44faf6a6aaf5fb16714bc1f57acc2fda12861bb20bf38"
+    },
+    "bn": {
+      "length": 74,
+      "sha256": "3e20fde7feb61aca617beaa75c25ae642224933c00d97d3de2643db9193f0c0c"
+    }
+  }
+}

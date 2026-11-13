@@ -5,7 +5,7 @@ package ai.quranlab.tajweedformer
  * (a manifest with `version`) needs 3.0.0, and older SDKs are never offered it.
  */
 internal object SdkInfo {
-    const val VERSION = "3.1.1"
+    const val VERSION = "3.1.2"
 
     /** The oldest Android the SDK runs on (the library's minSdk). */
     const val MIN_ANDROID = "Android 8.0 (API 26)"

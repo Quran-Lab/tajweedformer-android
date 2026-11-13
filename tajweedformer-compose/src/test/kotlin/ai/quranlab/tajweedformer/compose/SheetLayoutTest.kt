@@ -73,6 +73,45 @@ class SheetLayoutTest : SheetTestBase() {
         }
     }
 
+    /**
+     * SPEC 11.8: what both drawings draw, in each of the eight languages, in the learner's and the
+     * guardian's variant, first ask and reask, holds nowhere the sentence that deck 2026-11-12.1 added. The sentence is
+     * known only by its length and SHA-256 per language (the JVM tests' `sharing_vectors/deck_2026-11-12.1_added.json`,
+     * made by the release tooling from the contract's archived deck); a drawn text holds it when a window of that
+     * length has that hash.
+     */
+    @Test fun theSentenceThatDeck2026_11_12_1AddedIsDrawnNowhere() {
+        val root = generateSequence(java.io.File("").absoluteFile) { it.parentFile }.first { java.io.File(it, "settings.gradle.kts").isFile }
+        @Suppress("UNCHECKED_CAST")
+        val doc = ai.quranlab.tajweedformer.Json.parse(java.io.File(root, "tajweedformer-jvm/src/test/resources/sharing_vectors/deck_2026-11-12.1_added.json")
+            .readText()) as Map<String, Any?>
+        assertEquals("2026-11-12.1", doc["added_by"])
+        @Suppress("UNCHECKED_CAST")
+        val added = (doc["languages"] as Map<String, Map<String, Any?>>).mapValues { (_, v) -> (v["length"] as Double).toInt() to v["sha256"] as String }
+        assertEquals(languages.toSet(), added.keys)
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        fun holds(t: String, f: Pair<Int, String>): Boolean = (0..t.length - f.first).any { i ->
+            md.digest(t.substring(i, i + f.first).toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) } == f.second
+        }
+        for (lang in languages) for (guardian in listOf(false, true)) for (variant in listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK)) {
+            val case = Case(lang, variant = variant, guardian = guardian)
+            val f = added.getValue(lang)
+            use(case)
+            val (screen, _) = views(case)
+            shoot(screen) {
+                val drawn = screen.texts().map { it.text.toString() }
+                assertTrue("views $lang: nothing drawn", drawn.size > 5)
+                assertTrue("views $lang guardian=$guardian $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
+            }
+            val c = compose(case)
+            shoot(c) {
+                val drawn = c.nodes(merged = false).mapNotNull { it.text() }
+                assertTrue("compose $lang: nothing drawn", drawn.size > 5)
+                assertTrue("compose $lang guardian=$guardian $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
+            }
+        }
+    }
+
     /** "Quran Lab" at the top of every language's sheet, before the title for a screen reader; a theme that sets everything keeps it. */
     @Test fun theNameIsInEveryLanguagesSheetAndAThemeCannotRemoveIt() {
         val everything = SharingTheme(background = 0xFF101820.toInt(), text = 0xFFF0E6D2.toInt(), secondaryText = 0xFFB0A890.toInt(),

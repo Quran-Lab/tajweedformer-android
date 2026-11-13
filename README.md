@@ -77,6 +77,8 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:3.1.1") }
 ```
 
+Maven Central serves 3.1.1 today. 3.1.2 follows there once it is released; the quick start below is the same for both.
+
 ## Before you start
 
 | | |
