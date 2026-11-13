@@ -1,0 +1,145 @@
+name: Publish one validated deployment
+
+# Publishes ONE deployment that the publish workflow uploaded to the Central Portal for manual publishing and that
+# passed validation there. Started by hand on main (Actions, this workflow, Run workflow) with two things typed in:
+# the deployment's id and the one coordinate it must hold (ai.quranlab:tajweedformer:<version>).
+#
+# What it does, in this order, and it stops at the first thing that is not so:
+#   1. the id is a deployment id and the coordinate is ai.quranlab:tajweedformer with a plain x.y.z version;
+#   2. that version is newer than the newest one Maven Central serves (an old deployment is never published);
+#   3. the Portal's status of THAT id says VALIDATED, and every component it lists is that coordinate;
+#   4. with dry_run (the default) it ends here: it has only read one deployment's status;
+#   5. else it asks the Portal to publish that id and waits, at most 30 minutes, until the Portal says PUBLISHED.
+# It never lists deployments and never acts on any id but the one typed in.
+#
+# A version published to Maven Central can never be taken back or replaced. Run it without dry_run only for a
+# deployment whose tag passed CI on main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: "The deployment's id on the Central Portal (the publish run's summary has it)"
+        required: true
+        type: string
+      coordinate:
+        description: "The one coordinate it must hold, for example ai.quranlab:tajweedformer:3.1.1"
+        required: true
+        type: string
+      dry_run:
+        description: "Read and check only; publish nothing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-deployment
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Check one deployment, and publish it unless dry_run
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: The inputs
+        env:
+          ID: ${{ inputs.deployment_id }}
+          COORDINATE: ${{ inputs.coordinate }}
+        run: |
+          printf '%s' "$ID" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+            || { echo "deployment_id is not a deployment id (8-4-4-4-12 hex digits)" >&2; exit 1; }
+          printf '%s' "$COORDINATE" | grep -Eqx 'ai\.quranlab:tajweedformer:[0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "coordinate is not ai.quranlab:tajweedformer:<x.y.z>" >&2; exit 1; }
+      - name: The version is newer than the newest one Maven Central serves
+        env:
+          COORDINATE: ${{ inputs.coordinate }}
+        run: |
+          version=${COORDINATE##*:}
+          meta=$(curl --fail -sS https://repo1.maven.org/maven2/ai/quranlab/tajweedformer/maven-metadata.xml)
+          latest=$(printf '%s' "$meta" | sed -n 's:.*<latest>\([0-9][0-9.]*\)</latest>.*:\1:p' | head -n 1)
+          [ -n "$latest" ] || { echo "Maven Central's maven-metadata.xml names no latest version" >&2; exit 1; }
+          echo "Maven Central serves $latest as its newest; asked for $version"
+          [ "$version" != "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n 1)" = "$version" ] \
+            || { echo "$version is not newer than $latest: nothing is published" >&2; exit 1; }
+      - name: The deployment is VALIDATED and holds that coordinate only; then publish it and wait for PUBLISHED
+        env:
+          ID: ${{ inputs.deployment_id }}
+          COORDINATE: ${{ inputs.coordinate }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          [ -n "$MAVEN_CENTRAL_USERNAME" ] && [ -n "$MAVEN_CENTRAL_PASSWORD" ] || { echo "no Central Portal secrets" >&2; exit 1; }
+          token=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
+          echo "::add-mask::$token"
+          api=https://central.sonatype.com/api/v1/publisher
+          version=${COORDINATE##*:}
+          want="pkg:maven/ai.quranlab/tajweedformer@$version"
+
+          # 0 when a status answer ($1) lists at least one component and every one of them is the package URL $2
+          # (a package URL may carry qualifiers after a '?', such as type=aar)
+          only_holds() {
+            printf '%s' "$1" | jq -e --arg want "$2" \
+              '(.purls | length) >= 1 and ([.purls[] | select((. == $want or startswith($want + "?")) | not)] | length) == 0' > /dev/null
+          }
+          # the check itself, on made-up answers, before it is trusted with the Portal's
+          t=pkg:maven/ai.quranlab/tajweedformer@9.9.9
+          only_holds "{\"purls\":[\"$t\"]}" "$t" && only_holds "{\"purls\":[\"$t?type=aar\",\"$t?type=pom\"]}" "$t" \
+            || { echo "the coordinate check refuses what it must accept" >&2; exit 1; }
+          for bad in '[]' "[\"${t}0\"]" '["pkg:maven/ai.quranlab/tajweedformer@2.0.3"]' '["pkg:maven/ai.quranlab/tajweedformer-compose@9.9.9"]' \
+                     "[\"$t\",\"pkg:maven/ai.quranlab/tajweedformer-compose@9.9.9\"]" '["pkg:maven/ai.other/tajweedformer@9.9.9"]'; do
+            if only_holds "{\"purls\":$bad}" "$t"; then echo "the coordinate check accepts $bad" >&2; exit 1; fi
+          done
+          echo "the coordinate check refuses 6 made-up deployments and accepts 2"
+
+          # the status of this one id: what the Portal says it is and what it holds (no secret is in it)
+          status=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" "$api/status?id=$ID")
+          printf '%s' "$status" | jq '{deploymentId, deploymentName, deploymentState, purls, errors}'
+          [ "$(printf '%s' "$status" | jq -r .deploymentId)" = "$ID" ] || { echo "the Portal answered for another deployment" >&2; exit 1; }
+          state=$(printf '%s' "$status" | jq -r .deploymentState)
+          [ "$state" = "VALIDATED" ] || { echo "the deployment is $state, not VALIDATED: nothing is published" >&2; exit 1; }
+          only_holds "$status" "$want" || { echo "the deployment does not hold $COORDINATE and nothing else: nothing is published" >&2; exit 1; }
+          echo "deployment $ID is VALIDATED and holds $COORDINATE only"
+
+          if [ "$DRY_RUN" != "false" ]; then
+            {
+              echo "Dry run: deployment \`$ID\` is VALIDATED and holds \`$COORDINATE\` only."
+              echo "Nothing was published. Run again with dry_run off to publish it."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "dry run: nothing was published"
+            exit 0
+          fi
+
+          # publish this id; the Portal answers 204 and the deployment goes to PUBLISHING
+          code=$(curl -sS -o publish-answer.txt -w '%{http_code}' -X POST -H "Authorization: Bearer $token" "$api/deployment/$ID")
+          if [ "$code" != "204" ]; then
+            echo "the Portal did not accept the publish request: HTTP $code" >&2
+            cat publish-answer.txt >&2 || true
+            exit 1
+          fi
+          echo "the Portal accepted the publish request for $ID"
+          for _ in $(seq 1 90); do
+            sleep 20
+            status=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" "$api/status?id=$ID") || { echo "the status request failed, asking again"; continue; }
+            state=$(printf '%s' "$status" | jq -r .deploymentState)
+            echo "state $state"
+            case $state in
+              PUBLISHED)
+                {
+                  echo "Deployment \`$ID\` is PUBLISHED: \`$COORDINATE\` is on its way to Maven Central."
+                  echo "https://repo1.maven.org/maven2/ai/quranlab/tajweedformer/$version/"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              FAILED)
+                printf '%s' "$status" | jq .errors
+                echo "the deployment FAILED while publishing" >&2
+                exit 1 ;;
+            esac
+          done
+          echo "the deployment was not PUBLISHED within 30 minutes (last state $state); look at https://central.sonatype.com/publishing/deployments" >&2
+          exit 1

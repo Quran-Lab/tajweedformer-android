@@ -1,9 +1,17 @@
 name: Publish to Maven Central
 
 # Started by hand on a tag (Actions, Publish to Maven Central, Run workflow, Use workflow from: Tags).
-# Tests, then the signed bundle of ai.quranlab:tajweedformer, then the Central Portal upload as USER_MANAGED:
-# the Portal validates it and it waits there. Nothing is released until someone publishes the deployment on
-# central.sonatype.com (the run's summary has the deployment id).
+# Tests, then the signed bundle of ai.quranlab:tajweedformer, then the Central Portal upload as AUTOMATIC: the
+# Portal validates the bundle and, when it passes, publishes it to Maven Central without a person. The run waits
+# for its own deployment and fails, with the Portal's reasons, when validation fails or the deployment is not
+# PUBLISHED within 30 minutes.
+#
+# Automatic since 2026-11-13, by Quran Lab's decision: before, the upload waited on the Portal for someone to
+# press Publish, and every release waited with it. A version published to Maven Central can never be taken back
+# or replaced, so THE TAG IS THE LAST GATE: nothing is tagged before CI on main is green and the release's final
+# check passes, and this workflow runs only on a tag that equals tajweedformer.version, after the tests and the
+# monitor check below. A deployment that an earlier version of this workflow left waiting is published by the
+# workflow "Publish one validated deployment", by its id.
 
 on:
   workflow_dispatch:
@@ -13,10 +21,10 @@ permissions:
 
 jobs:
   publish:
-    name: Test, sign and upload to the Central Portal
+    name: Test, sign, upload to the Central Portal and wait until it is published
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: The tag is the version
@@ -58,7 +66,7 @@ jobs:
           rm -rf build/monitor-check && mkdir -p build/monitor-check
           unzip -o -q tajweedformer/build/distributions/central-bundle-*.zip '*.aar' -d build/monitor-check
           python3 scripts/check_monitor_handlers.py build/monitor-check
-      - name: Upload to the Central Portal (USER_MANAGED) and wait for validation
+      - name: Upload to the Central Portal (AUTOMATIC) and wait until the deployment is PUBLISHED
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
@@ -70,24 +78,30 @@ jobs:
           bundle=$(ls tajweedformer/build/distributions/central-bundle-*.zip)
           id=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" \
             -F "bundle=@$bundle;type=application/octet-stream" \
-            "$api/upload?publishingType=USER_MANAGED&name=ai.quranlab:tajweedformer:$GITHUB_REF_NAME")
+            "$api/upload?publishingType=AUTOMATIC&name=ai.quranlab:tajweedformer:$GITHUB_REF_NAME")
           echo "deployment $id"
-          for _ in $(seq 1 60); do
+          echo "Deployment \`$id\` was uploaded for automatic publishing." >> "$GITHUB_STEP_SUMMARY"
+          # this run's own deployment, by its id, until the Portal says PUBLISHED: 90 times 20 s is 30 minutes
+          state=unknown
+          for _ in $(seq 1 90); do
             sleep 20
-            status=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" "$api/status?id=$id")
+            status=$(curl --fail-with-body -sS -X POST -H "Authorization: Bearer $token" "$api/status?id=$id") || { echo "the status request failed, asking again"; continue; }
             state=$(printf '%s' "$status" | jq -r .deploymentState)
             echo "state $state"
             case $state in
-              VALIDATED)
+              PUBLISHED)
                 {
-                  echo "Deployment \`$id\` passed validation and is waiting on the Central Portal."
-                  echo "Nothing is released yet: publish it at https://central.sonatype.com/publishing/deployments"
+                  echo "Deployment \`$id\` is PUBLISHED: ai.quranlab:tajweedformer:$GITHUB_REF_NAME is on its way to Maven Central."
+                  echo "https://repo1.maven.org/maven2/ai/quranlab/tajweedformer/$GITHUB_REF_NAME/"
                 } >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
               FAILED)
+                echo "::error::The Central Portal refused deployment $id: validation or publishing FAILED. Nothing of $GITHUB_REF_NAME is on Maven Central."
                 printf '%s' "$status" | jq .errors
+                echo "Deployment \`$id\` FAILED on the Central Portal; its reasons are in the run's log." >> "$GITHUB_STEP_SUMMARY"
                 exit 1 ;;
             esac
           done
-          echo "validation did not finish in 20 minutes (deployment $id)" >&2
+          echo "::error::Deployment $id was not PUBLISHED within 30 minutes (last state $state). It may still be published by the Portal: look at https://central.sonatype.com/publishing/deployments before anything is uploaded again."
+          echo "Deployment \`$id\` was not PUBLISHED within 30 minutes (last state $state)." >> "$GITHUB_STEP_SUMMARY"
           exit 1
