@@ -10,7 +10,7 @@ import android.widget.TextView
 // README:begin
 suspend fun quickStart(context: Context, heard: TextView) {
     val client = TajweedClient(context, "qlk_v1_...")       // your key from sdk.quranlab.ai; one Client per process
-    val model = client.model()                              // the first run downloads and verifies the model
+    val model = client.model()                              // the first call downloads and verifies the model
     val session = model.listen(TajweedSessionOptions(endOnSilenceMs = 1500))   // asks for the microphone itself
     session.chunks.collect { chunk -> heard.text = chunk.decoded.text }       // what the model heard so far
 }

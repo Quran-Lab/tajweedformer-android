@@ -14,8 +14,9 @@ package ai.quranlab.tajweedformer.sharing
  *   tap outside, its Compose dialog by back and a click outside) and recorded a cancel as "Not now"; so does this.
  * - No ending at all, so nothing is recorded: the sheet's window goes with its activity (a configuration change that
  *   recreates it, the activity finishing), the Compose host leaves the composition, the app goes to the background
- *   (the sheet is still there when it comes back), the process ends. The consent stays as it was (no answer), and the
- *   next completed session asks again under the same cap of three showings.
+ *   (the sheet is still there when it comes back), the process ends. The consent stays as it was (no answer), and
+ *   the ask counts as a "Not now" (SDK 3.1.5): the next one comes at least 7 sessions later, with the re-ask line,
+ *   under the same cap of three showings. Until 3.1.5 the first sheet came back at the next completed session.
  */
 internal enum class SheetExit {
     SHARE,

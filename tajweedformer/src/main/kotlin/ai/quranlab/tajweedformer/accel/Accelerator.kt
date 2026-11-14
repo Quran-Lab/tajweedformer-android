@@ -57,6 +57,14 @@ internal object Stages {
 
     @JvmField val ORDER = listOf(DOWNLOAD, COMPILE, WARMUP, GOLDEN, MEASURE, PROMOTE)
 
+    /** A promoted key's program loaded again (or a resumed attempt's): reported as [COMPILE]. */
+    const val LOAD = "load"
+
+    /** The stages with a sentinel where the model has not run on the accelerator in the attempt yet (SDK 3.1.5): a
+     *  stop of the process there in the foreground takes the retry budget, and a second one at the same stage ends
+     *  the key. The download writes no sentinel: a stop there leaves nothing to count, and the attempt goes on. */
+    @JvmField val PREPARATION = setOf(COMPILE, LOAD, WARMUP)
+
     /** The stage after [done] ("" = none done yet). */
     @JvmStatic
     fun after(done: String): String = if (done.isEmpty()) DOWNLOAD else ORDER.getOrElse(ORDER.indexOf(done) + 1) { PROMOTE }
@@ -166,6 +174,14 @@ internal interface AcceleratorEnvironment {
     /** Registers [listener] for every time the app becomes active (Android: the first activity started, a rotation
      *  not counted): the accelerator is warmed up then and the next chunk gets the first-chunk limit. */
     fun onAppActive(listener: () -> Unit) {}
+
+    /** Whether the app is in the foreground now (Android: an activity of the app is started); null where the platform
+     *  cannot tell (the desktop JVM): a stop there takes the rule of a stop in the foreground (SDK 3.1.5). */
+    fun foreground(): Boolean? = null
+
+    /** Registers [listener] for every change of [foreground] (Android: the first activity started, the last one
+     *  stopped without a configuration change). */
+    fun onForegroundChange(listener: (Boolean) -> Unit) {}
 
     /** Whether the network is unmetered now (the download stage waits otherwise). */
     fun unmetered(): Boolean = true
@@ -299,6 +315,11 @@ internal data class PromotionRecord(
     val missSessionsAtMs: List<Long> = emptyList(),
     /** Confirmed blank disagreements with the CPU for this key (the second turns the build off for good). */
     val blankDisagreements: Int = 0,
+    /** Counted stops of the process per preparation stage (SDK 3.1.5): the second at the same stage ends the key. */
+    val preparationStops: Map<String, Int> = emptyMap(),
+    /** Stops in the background in a row per stage (SDK 3.1.5): the third counts as a stop in the foreground. A stage
+     *  that completes ends its row. */
+    val backgroundStops: Map<String, Int> = emptyMap(),
 ) {
     val speedup: Double get() = if (accMedianMs > 0 && cpuMedianMs > 0) cpuMedianMs / accMedianMs else Double.NaN
 
@@ -309,6 +330,7 @@ internal data class PromotionRecord(
         "acc_p90_ms" to num(accP90Ms), "promoted_at_ms" to promotedAtMs, "updated_at_ms" to updatedAtMs,
         "deny_counted" to denyCounted, "program_sha256" to programSha, "paused_until_ms" to pausedUntilMs, "pause_cause" to pauseCause,
         "miss_sessions_at_ms" to missSessionsAtMs, "blank_disagreements" to blankDisagreements,
+        "preparation_stops" to preparationStops.toSortedMap(), "background_stops" to backgroundStops.toSortedMap(),
     )
 
     companion object {
@@ -323,11 +345,12 @@ internal data class PromotionRecord(
             fun s(k: String) = o[k] as? String ?: ""
             fun l(k: String, d: Long = 0) = (o[k] as? Double)?.toLong() ?: d
             fun d(k: String) = o[k] as? Double ?: Double.NaN
+            fun counts(k: String) = (o[k] as? Map<*, *>).orEmpty().mapNotNull { (s, n) -> (s as? String)?.let { st -> (n as? Double)?.toInt()?.let { st to it } } }.toMap()
             return PromotionRecord(s("stage"), (o["status"] as? String) ?: PENDING, l("attempt").toInt(), l("failures").toInt(), s("reason"),
                 s("failed_stage"), s("detail"), l("next_attempt_at_ms"), s("launch"), l("compile_ms", -1), d("cpu_median_ms"),
                 d("acc_median_ms"), d("acc_p90_ms"), l("promoted_at_ms"), l("updated_at_ms"), o["deny_counted"] == true, s("program_sha256"),
                 l("paused_until_ms"), s("pause_cause"), (o["miss_sessions_at_ms"] as? List<*>).orEmpty().mapNotNull { (it as? Double)?.toLong() },
-                l("blank_disagreements").toInt())
+                l("blank_disagreements").toInt(), counts("preparation_stops"), counts("background_stops"))
         }
 
         /** 2.0.1's demotions for silence or a late chunk (2.0.2 no longer counts those as faults): failover causes
@@ -351,6 +374,19 @@ internal data class PromotionRecord(
             return r.copy(status = PENDING, stage = Stages.WARMUP, failures = 0, reason = "", detail = "", failedStage = "", nextAttemptAtMs = 0,
                 launch = "", attempt = r.attempt + 1, missSessionsAtMs = emptyList(), blankDisagreements = 0, pausedUntilMs = 0, pauseCause = "")
         }
+
+        /**
+         * The upgrade to 3.1.5 (run once per records file): a key that an earlier SDK ended for good for one stop of the
+         * process at a preparation stage (status final, reason crash at compile, load or warm-up, and no other
+         * failure on its record) gets its retry back: failed, one failure, the stop counted at its stage (a second one
+         * there ends the key), and the retry due at once, so this launch runs it. Every other record stays. Returns null
+         * when [r] stays.
+         */
+        @JvmStatic
+        fun upgradedTo315(r: PromotionRecord): PromotionRecord? {
+            if (r.status != FINAL || r.reason != Reasons.CRASH || r.failures != 1 || r.failedStage !in Stages.PREPARATION) return null
+            return r.copy(status = FAILED, nextAttemptAtMs = 0, launch = "", preparationStops = mapOf(r.failedStage to 1), backgroundStops = emptyMap())
+        }
     }
 }
 
@@ -365,28 +401,49 @@ internal class AcceleratorStore(private val dir: File) {
     private val records = File(dir, "accelerator.json")
     private val lock = Any()
 
-    /** Written and synced to disk before the risky step, naming the key and the stage. */
-    fun armSentinel(key: AcceleratorKey, stage: String) = synchronized(lock) {
+    /** What a process that ended left: the key's id and the stage ("" when the sentinel cannot be read), and whether
+     *  the app was in the foreground when the stage last recorded it (null: not known, as 3.1.4 and earlier wrote it). */
+    data class Sentinel(val keyId: String, val stage: String, val foreground: Boolean?)
+
+    /** Written and synced to disk before the risky step, naming the key, the stage and whether the app is in the
+     *  foreground ([foreground] null: not known, the field is left out). */
+    fun armSentinel(key: AcceleratorKey, stage: String, foreground: Boolean? = null) = synchronized(lock) {
+        writeSentinel(key.id, stage, foreground)
+    }
+
+    private fun writeSentinel(keyId: String, stage: String, foreground: Boolean?) {
         dir.mkdirs()
+        val m = linkedMapOf<String, Any?>("key" to keyId, "stage" to stage)
+        if (foreground != null) m["foreground"] = foreground
         FileOutputStream(sentinel).use { out ->
-            out.write(Json.write(mapOf("key" to key.id, "stage" to stage)).toByteArray())
+            out.write(Json.write(m).toByteArray())
             out.flush()
             out.fd.sync()
         }
     }
 
+    /** The app went to the background or came back while a stage runs: the armed sentinel says so. No sentinel, nothing written. */
+    fun updateSentinel(foreground: Boolean) = synchronized(lock) {
+        val s = left() ?: return@synchronized
+        if (s.keyId.isEmpty() || s.foreground == foreground) return@synchronized
+        try { writeSentinel(s.keyId, s.stage, foreground) } catch (_: Exception) {}
+    }
+
     fun clearSentinel() = synchronized(lock) { sentinel.delete(); Unit }
 
-    /** The key id and stage of a sentinel left by a process that died, or null. */
-    fun leftSentinel(): Pair<String, String>? = synchronized(lock) {
+    /** The sentinel left by a process that ended, or null. */
+    fun left(): Sentinel? = synchronized(lock) {
         if (!sentinel.isFile) return null
         return try {
             val m = Json.parse(sentinel.readText()) as Map<*, *>
-            (m["key"] as String) to (m["stage"] as? String ?: "")
+            Sentinel(m["key"] as String, m["stage"] as? String ?: "", m["foreground"] as? Boolean)
         } catch (_: Exception) {
-            "" to ""
+            Sentinel("", "", null)
         }
     }
+
+    /** The key id and stage of a sentinel left by a process that died, or null. */
+    fun leftSentinel(): Pair<String, String>? = left()?.let { it.keyId to it.stage }
 
     fun record(key: AcceleratorKey): PromotionRecord? = synchronized(lock) { load().second[key.id] }
 
@@ -437,9 +494,13 @@ internal class AcceleratorStore(private val dir: File) {
             @Suppress("UNCHECKED_CAST")
             val install = (m["install"] as? Map<String, Any?>).orEmpty()
             val all = (m["keys"] as? Map<*, *>).orEmpty().entries.associate { (k, v) -> k as String to PromotionRecord.fromJson(v as Map<*, *>) }
-            if ((m["upgrades"] as? List<*>)?.contains(UPGRADE_2_0_2) == true) return install to all
+            val done = (m["upgrades"] as? List<*>).orEmpty()
+            if (UPGRADE_2_0_2 in done && UPGRADE_3_1_5 in done) return install to all
+            var up = all
             // a 2.0.1 file: its blank and deadline demotions are cleared, once (the file is written back with the mark)
-            val up = all.mapValues { (_, r) -> PromotionRecord.upgradedFrom201(r) ?: r }
+            if (UPGRADE_2_0_2 !in done) up = up.mapValues { (_, r) -> PromotionRecord.upgradedFrom201(r) ?: r }
+            // a file of 3.1.4 or earlier: a key ended for one stop at a preparation stage gets its retry back, once
+            if (UPGRADE_3_1_5 !in done) up = up.mapValues { (_, r) -> PromotionRecord.upgradedTo315(r) ?: r }
             try { save(install, up) } catch (_: Exception) {}
             install to up
         } catch (_: Exception) {
@@ -450,8 +511,9 @@ internal class AcceleratorStore(private val dir: File) {
     companion object {
         const val FORMAT = "quranlab.accelerator/2"
 
-        /** The records file's upgrades done ([PromotionRecord.upgradedFrom201]). */
+        /** The records file's upgrades done ([PromotionRecord.upgradedFrom201], [PromotionRecord.upgradedTo315]). */
         const val UPGRADE_2_0_2 = "2.0.2"
-        private val UPGRADES = listOf(UPGRADE_2_0_2)
+        const val UPGRADE_3_1_5 = "3.1.5"
+        private val UPGRADES = listOf(UPGRADE_2_0_2, UPGRADE_3_1_5)
     }
 }

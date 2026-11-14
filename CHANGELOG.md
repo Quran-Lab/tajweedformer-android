@@ -1,5 +1,68 @@
 # Changelog
 
+## 3.1.5
+
+A stop of the app while the accelerator's build is prepared no longer turns the accelerator off for good, and the
+sharing sheet keeps to its timing: never on the install's first launch, and not again at the next take after a sheet
+left without an answer. No call changes.
+
+- **Fixed: one stop of the app during the accelerator's preparation turned the accelerator off for good.** Found by
+  reading the code of 3.1.4 and shown by tests; not observed on a device. In 3.1.3 and 3.1.4, when the app's process
+  ended while the build was being loaded for the NPU, loaded again at a later start, or warmed up, the SDK recorded
+  at the next start a crash of the build, and a crash was never tried again for that model build, OS build and
+  device: the install stayed on the CPU until an OS update or a new model. The preparation runs in the app's own
+  process at low priority, and Android ends background processes to free memory, so an app that was only left
+  during its first preparation could lose the accelerator that way, as could one the learner closed.
+  Now the SDK records with each step of the preparation whether the app is in the foreground (an activity of the
+  app is started), and records it again when the app goes to the background or comes back while the step runs.
+  At the next start:
+  - a stop in the foreground during the load, the load at a later start or the warm-up, before the build has run
+    on the NPU in that attempt, is a failure of the attempt like any other: the preparation is tried again after
+    1 hour, then 6 and 24 hours, and a second stop at the same step turns the accelerator off for good for that
+    build;
+  - a stop during the golden test, or during a take's first call on the accelerator, turns it off for good at
+    once, as before;
+  - a stop while the app was in the background counts nothing, at every step and at a take's first call: no
+    failure and no wait; the preparation goes on at the next start from the step it had reached. The third such
+    stop in a row at the same step counts as a stop in the foreground, so a build that ends the process in the
+    background cannot do so at every start; a step that completes, or a first call that comes back, ends the row;
+  - on the desktop JVM the SDK cannot tell whether the app is in the foreground, and a stop takes the rule of a
+    stop in the foreground.
+  A stop during the download leaves nothing to count, as before: the download goes on at the next start.
+- **The report of such a stop says whether the app was in the foreground.** The issue report `promotion_failed`
+  with cause `crash_on_last_run` carries `foreground`: true, false, or absent when it is not known (a step that
+  3.1.4 or earlier recorded, or the desktop JVM). A stop in the background during the preparation is reported
+  too, with `foreground` false, and is not counted in the accelerator statistics. A stop during the load at a later
+  start is reported with the stage `compile`; 3.1.4 reported it as `session`.
+- **At the first start of 3.1.5, an accelerator that one such stop turned off gets its retry back.** Once per
+  install: a build that 3.1.3 or 3.1.4 turned off for good for a single stop during the load, the load at a later
+  start or the warm-up, with no other failure on its record, is prepared again from that start on, in the same
+  conditions as any preparation; that stop counts as the first at its step. Every other build that was turned off
+  stays off.
+- **Fixed: a sharing sheet left without an answer came back at the next take.** Found by reading the code of 3.1.4.
+  When the SDK's sheet ended without a button and without being closed (its window went with the activity, as on a
+  rotation or when the activity finished; the Compose host left the composition; the process ended while it was
+  shown), nothing was recorded, and the next finished take showed the first sheet again, counted as another of the
+  three asks. Closing the sheet (back, a tap beside it, a drag down) was already "Not now". Now a sheet that ended
+  without an answer counts as "Not now" for the next ask: it comes at least 7 finished takes later, with the re-ask
+  line, and there are three asks at most, as before. The app's `client.sharing.ask()` after such a sheet shows the
+  re-ask line too.
+- **Fixed: the SDK's sheet could appear on the install's first launch.** Found by reading the code of 3.1.4: the
+  sheet was asked for after the first finished take with feedback, also in the first process of a new install. Now
+  the SDK does not ask on the install's first launch, the first process of the install, which the Client's start
+  tells by the absence of a small file it writes in the SDK's folder (an install from before 3.1.5 counts as started
+  before). The takes of the first launch count as finished takes, so the first ask comes after the first finished
+  take of a later launch. The app's `client.sharing.ask()` may still show the sheet on the first launch.
+- Tests, on the JVM (run by CI): `PreparationStopTest`, with a stand-in for the accelerator and for the app's
+  foreground, the end of a process as the file the SDK leaves for it, and a records file as 3.1.4 wrote it. It ran
+  first on the code of 3.1.4: 9 of its 11 tests failed; the two controls (a stop during the golden test, a stop
+  during a take's first call) passed. `PromotionReportsTest` checks the report's new field against the closed
+  schema. `AskScheduleTest`, against a local stand-in of the API, ran first on the sharing code of 3.1.4: 3 of its
+  6 tests failed; the three controls ("Not now" and a closed sheet asked again 7 finished takes later, the app's
+  `ask()` on the first launch, an install from before 3.1.5) passed. The shared vector of the model gate has two more cases, a 429 and a 404 that carry a stop reason: neither
+  is a stop, and the SDK passes both unchanged. No phone with an NPU of the build list ran 3.1.5: the rule is shown
+  on the JVM only, and the foreground hook has run on no device.
+
 ## 3.1.4
 
 The learner's contributor id, device key and recovery code are never replaced when the device cannot read them. No

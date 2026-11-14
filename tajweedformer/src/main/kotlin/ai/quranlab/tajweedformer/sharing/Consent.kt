@@ -7,11 +7,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The consent state machine of recitation sharing, the same in every SDK: asked only after a completed
- * session with feedback (never on first launch); the sheet is shown at most 3 times per install, ever
- * ([asks], the count of sheets shown or handed to the app's own UI): "Not now" may lead to a re-ask at
- * least 7 sessions after the previous ask until the third showing; a yes ends asking for good, whatever
- * deck, wording or SDK version comes later, and so does turning sharing off in the settings. Afterwards
- * only the settings switch turns sharing on or off.
+ * session with feedback (never on the install's first launch: [Sharing.firstLaunch]); the sheet is shown at
+ * most 3 times per install, ever ([asks], the count of sheets shown or handed to the app's own UI): "Not now",
+ * or a sheet that ended without an answer, may lead to a re-ask at least 7 sessions after the previous ask
+ * until the third showing; a yes ends asking for good, whatever deck, wording or SDK version comes later, and
+ * so does turning sharing off in the settings. Afterwards only the settings switch turns sharing on or off.
  *
  * A grant keeps the consent version (and for the app's own wording its text hash) in force at the moment
  * of agreement; every shared session carries that version. Persisted as
@@ -156,11 +156,18 @@ internal class ConsentState internal constructor(private val file: File, private
         save()
     }
 
-    /** The sheet that may be shown now under the cap, or null: a yes, an off switch, or [MAX_ASKS] showings end asking. */
+    /**
+     * The sheet that may be shown now under the cap, or null: a yes, an off switch, or [MAX_ASKS] showings end asking.
+     * The first ask is the first sheet; every later one is the re-ask, and [spaced] (at least 7 sessions after the
+     * previous ask) when the SDK chooses the moment. A sheet that ended without an answer (its window went with the
+     * activity, the process ended while it was shown) counts as "Not now" here: SDK 3.1.5; until then the first
+     * sheet came back at the next completed session.
+     */
     private fun next(spaced: Boolean): Variant? = when {
         asks >= MAX_ASKS -> null
-        consent == Consent.UNKNOWN -> Variant.FIRST
-        consent == Consent.DECLINED && spaced -> Variant.REASK
+        consent == Consent.GRANTED || consent == Consent.FINAL -> null
+        consent == Consent.UNKNOWN && asks == 0 -> Variant.FIRST
+        spaced -> Variant.REASK
         else -> null
     }
 

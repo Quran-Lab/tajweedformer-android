@@ -57,6 +57,30 @@ internal class AndroidAccelerator internal constructor(
 
     override fun onAppActive(listener: () -> Unit) { activeListeners.add(listener) }
 
+    private val foregroundListeners = java.util.concurrent.CopyOnWriteArrayList<(Boolean) -> Unit>()
+
+    /**
+     * Whether an activity of the app is started (SDK 3.1.5). Until the first change it is the process's importance at
+     * construction: a process WorkManager started for the pipeline is not in the foreground, one that shows an
+     * activity is.
+     */
+    @Volatile private var inForeground: Boolean = try {
+        ActivityManager.RunningAppProcessInfo().also { ActivityManager.getMyMemoryState(it) }.importance <=
+            ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+    } catch (_: Exception) {
+        false
+    }
+
+    override fun foreground(): Boolean = inForeground
+
+    override fun onForegroundChange(listener: (Boolean) -> Unit) { foregroundListeners.add(listener) }
+
+    private fun foregroundIs(v: Boolean) {
+        if (inForeground == v) return
+        inForeground = v
+        for (l in foregroundListeners) try { l(v) } catch (_: Exception) {}
+    }
+
     /** The foreground as ProcessLifecycleOwner sees it, without its dependency: the first activity started; a
      *  configuration change (a rotation) is not a new activation. */
     private val Activity = object : android.app.Application.ActivityLifecycleCallbacks {
@@ -66,6 +90,7 @@ internal class AndroidAccelerator internal constructor(
         override fun onActivityStarted(a: android.app.Activity) {
             val first = synchronized(this) { started++ == 0 }
             if (!first) return
+            foregroundIs(true)
             val reopened = !changing
             changing = false
             if (reopened) for (l in activeListeners) try { l() } catch (_: Exception) {}
@@ -76,6 +101,8 @@ internal class AndroidAccelerator internal constructor(
             if (last) {
                 started = 0
                 changing = a.isChangingConfigurations
+                // a rotation stops the last activity and starts it again: not the background
+                if (!changing) foregroundIs(false)
             }
         }
 

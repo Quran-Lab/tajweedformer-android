@@ -530,12 +530,19 @@ internal class StubQlab : AutoCloseable {
 
     // ---- a configured client against this stub ----
 
+    /**
+     * A Client's platform on [storage]. [firstLaunch] false (the default): an install that has started before, so the
+     * marker of an earlier start is there before the Client starts (SDK 3.1.5: the SDK's own sharing ask waits for a
+     * later launch than the first); true: the storage as a new install has it.
+     */
     fun environment(storage: File, scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
                     clock: () -> Long = this.clock, device: DeviceProfile = DeviceProfile("Pixel8", "tensor_g3", 15, "15", "8_16"),
                     debugBuild: Boolean = false, log: (String) -> Unit = {},
-                    keys: ContributorKeyStore? = null, box: SecretBox? = null) =
-        CloudEnvironment(storage, AppIdentity(appId, "3.1", "Recite"), device, keys ?: FileContributorKeyStore(File(storage, "keys")),
+                    keys: ContributorKeyStore? = null, box: SecretBox? = null, firstLaunch: Boolean = false): CloudEnvironment {
+        if (!firstLaunch) File(storage, "cloud/started").let { if (!it.exists()) { it.parentFile.mkdirs(); it.writeText("") } }
+        return CloudEnvironment(storage, AppIdentity(appId, "3.1", "Recite"), device, keys ?: FileContributorKeyStore(File(storage, "keys")),
             box ?: PlainSecretBox, integrity, scheduler, transport, clock, { "built_in" }, { "en-US" }, debugBuild, log = log)
+    }
 
     /** The client's network: offline (an IOException, no answer) while [down]. */
     val transport: HttpTransport = UrlConnectionTransport(5_000, 10_000).let { real ->
@@ -547,6 +554,6 @@ internal class StubQlab : AutoCloseable {
 
     fun cloud(storage: File, options: CloudOptions = CloudOptions(key, contributions = true, apiUrl = base, trustedKeys = listOf(publicKey)),
               scheduler: CloudScheduler = CloudScheduler.Manual, integrity: IntegrityProvider? = IntegrityProvider { h, n -> play(h, n) },
-              clock: () -> Long = this.clock, keys: ContributorKeyStore? = null, box: SecretBox? = null) =
-        QuranLabCloud(options, environment(storage, scheduler, integrity, clock, keys = keys, box = box))
+              clock: () -> Long = this.clock, keys: ContributorKeyStore? = null, box: SecretBox? = null, firstLaunch: Boolean = false) =
+        QuranLabCloud(options, environment(storage, scheduler, integrity, clock, keys = keys, box = box, firstLaunch = firstLaunch))
 }

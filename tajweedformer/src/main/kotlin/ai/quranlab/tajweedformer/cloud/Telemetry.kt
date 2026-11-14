@@ -158,8 +158,9 @@ internal class Telemetry(
         return kept
     }
 
-    /** A promotion attempt ended (or a crash at a session's first accelerator call was found at launch). */
-    fun promotion(e: ai.quranlab.tajweedformer.PromotionEvent) = rec { a ->
+    /** A promotion attempt ended (or a crash at a session's first accelerator call was found at launch). A stop of the
+     *  process in the background that counted nothing is not counted here either (SDK 3.1.5). */
+    fun promotion(e: ai.quranlab.tajweedformer.PromotionEvent) = if (e.background) Unit else rec { a ->
         val p = a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
         if (e.countsAttempt) {
             p.attempts++

@@ -186,8 +186,11 @@ whatever the model's id; none when the device holds no model).
    session on the accelerator; a session never waits for it.
 4. **If anything fails** before promotion (download, compile, a crash or hang, a different result), the CPU
    stays, the reason is recorded, and the step is retried later (after 1, 6 and 24 hours at most; never for a
-   wrong result, a NaN or a crash, until a new model or OS version). Only in good conditions: not in low power mode,
-   battery at 20 % or charging, the device not hot.
+   wrong result, a NaN, or a stop of the app at the golden test or the measurement, until a new model or OS
+   version). A stop of the app at compile, load or warm-up is retried, and a second one there ends it; a stop
+   during the download counts nothing: the attempt goes on at the next launch. A stop while the app was in the
+   background counts nothing, until the third in a row. Only in good conditions: not in low power mode, battery
+   at 20 % or charging, the device not hot.
 5. **If the accelerator fails during a session** (an error, NaN or out-of-range output, or a chunk past its
    deadline), the session switches to the CPU at that chunk: the CPU engine rebuilds its state from the last
    few seconds of audio and redoes the chunk, so no audio is lost and the learner sees at most a short stall.
@@ -203,9 +206,10 @@ whatever the model's id; none when the device holds no model).
      from warm chunks only. A single late chunk is served by the CPU and costs nothing more.
    - **What sets an accelerator aside.** Late chunks in three sessions within 24 hours, or one disagreement with
      the CPU: a few hours' pause, then it serves again (no new test). For good, for that model and OS version:
-     NaN or out-of-range output, a second disagreement with the CPU, a self-test mismatch, or a crash. An error
-     from the accelerator itself sets it aside for a day, then it is tested again (at most three times for that
-     model and OS version). Each switch to the CPU is still reported to Quran Lab, also when it sets nothing aside. An install
+     NaN or out-of-range output, a second disagreement with the CPU, a self-test mismatch, or a stop of the app
+     (in the background: from the third in a row). An error from the accelerator itself sets it aside for a day,
+     then it is tested again (at most three times for that model and OS version). Each switch to the CPU is still
+     reported to Quran Lab, also when it sets nothing aside. An install
      that 2.0.1 had set aside for silence or a late chunk is tested again and promoted again.
 6. **Quran Lab can keep an accelerator off** on matching devices (by device, chip, OS build, delegate or model
    revision) through the signed config; a promoted device then goes back to the CPU at its next session.

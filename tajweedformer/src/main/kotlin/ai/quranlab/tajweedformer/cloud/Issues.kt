@@ -287,6 +287,8 @@ internal class IssueQueue(private val dir: File, private val clock: () -> Long =
             i.lowPower?.let { d["low_power"] = it }
             i.stallMs?.takeIf { it.isFinite() }?.let { d["stall_ms"] = Math.round(it).toInt().coerceIn(0, 600_000) }
             i.attempt?.let { d["attempt"] = it.coerceIn(1, 100) }
+            // a promotion's stop of the process only; absent when not known
+            if (i.kind == AcceleratorIncident.PROMOTION_FAILED && d["cause"] == "crash_on_last_run") i.foreground?.let { d["foreground"] = it }
             return d
         }
 

@@ -401,9 +401,11 @@ class AcceleratorTest : OpenChecked() {
         }
     }
 
+    /** A stop at the golden test or at a session's first call ends the key (SDK 3.1.5: a stop at compile, load or
+     *  warm-up takes the retry budget instead, PreparationStopTest). */
     @Test
     fun theCrashSentinelRecordsACrashAtItsStageNeverRetried() {
-        for (stage in listOf(Stages.COMPILE, "load", Stages.WARMUP, Stages.GOLDEN, Stages.SESSION)) {
+        for (stage in listOf(Stages.GOLDEN, Stages.SESSION)) {
             promotions.clear()
             val store = dir()
             val s = AcceleratorStore(store)
