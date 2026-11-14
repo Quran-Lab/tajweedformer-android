@@ -30,12 +30,12 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the right model for each device (56.5 MB) from our CDN in six regions, verifies it and keeps it up to date.
+**Nothing to host**<br>The SDK downloads the right model for each device (55.5 MB) from our CDN in six regions, verifies it and keeps it up to date.
 
 </td>
 <td valign="top">
 
-**Data for your own judge**<br>The SDK scores nothing. The model's thresholds and the expected units of each ayah come with it as read-only data, so your app can judge a recitation its own way.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, so your app can judge a recitation its own way. The expected units of each ayah do not: with this release and the model build served now, `model.reference` is null.
 
 </td>
 </tr>
@@ -107,7 +107,7 @@ dependencies { implementation("ai.quranlab:tajweedformer:3.1.5") }
 | **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai), for your app's package name. |
 | **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. On another ABI the SDK fails with `runtime_unsupported`. An app that does not ship to Chromebooks keeps `x86_64` out of its release build with one `abiFilters` line. |
 | **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
-| **Download** | The first `client.model()` or `client.prefetch()` downloads the model: 56.5 MB, once (73.5 MB on disk), on any network. `client.prefetch()` does it before the learner taps, and `prefetch(unmeteredOnly = true)` waits for Wi-Fi. A phone with a supported NPU fetches its build later, on an unmetered network only. |
+| **Download** | The first `client.model()` or `client.prefetch()` downloads the model: 55.5 MB, once (68.1 MB on disk), on any network. `client.prefetch()` does it before the learner taps, and `prefetch(unmeteredOnly = true)` waits for Wi-Fi. A phone with a supported NPU fetches its build later, on an unmetered network only. |
 | **Model** | A model comes only from Quran Lab's server, through the Client: the SDK opens only a model it downloaded itself on this device. An app that updates from an SDK before 3.1.0 downloads the model once more. |
 | **Play Integrity** | Since 3.1.0 the SDK depends on Google's Play Integrity library (`com.google.android.play:integrity`; with the ten libraries it brings it adds 33,594 bytes to the example app's release APK shrunk with R8, and 34,420 bytes to its debug APK). Quran Lab can ask for proof that a model download or a shared recording comes from your app as Google Play delivered it, on a real device; the SDK asks Play only when Quran Lab's signed config says so, and continues without it where Play services are missing. You add and set nothing. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
@@ -655,7 +655,7 @@ v4.0-2026-11-10, default context `c16_l64`:
 
 | Profile | What is downloaded | Size |
 | - | - | - |
-| Any Android phone (CPU, always, first) | tokens, calibration, expected table, the shared `layers.zfw` and `frontend.zfw`, the c16_l64 graph and its frames | **56.5 MB** (73.5 MB on disk) |
+| Any Android phone (CPU, always, first) | tokens, calibration, the shared `layers.zfw` and `frontend.zfw`, the c16_l64 graph and its frames | **55.5 MB** (68.1 MB on disk) |
 | + Exynos 2500 NPU (later, unmetered network) | `npu/exynos2500/c16_l64` (9 chained parts) | +18.8 MB as a delta against the CPU weights, else +61.4 MB |
 | + Exynos 2600 NPU (later, unmetered network) | `npu/exynos2600/c16_l64` | +18.1 MB as a delta, else +61.7 MB |
 | + Google Tensor G3, G4, G5 NPU (later, unmetered network) | `npu/tensor_gN/c16_l64` | +84.6, 84.6, 86.0 MB as a delta, else +120.8, 120.8, 121.0 MB |
