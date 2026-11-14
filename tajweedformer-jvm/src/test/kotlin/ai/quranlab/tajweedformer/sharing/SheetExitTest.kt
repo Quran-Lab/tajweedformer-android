@@ -70,7 +70,9 @@ class SheetExitTest : OpenChecked() {
     private fun expected(exit: SheetExit?) = when (exit) {
         SheetExit.SHARE -> Recorded(ConsentState.Consent.GRANTED, asks = 1, yes = 1, no = 0, askedAgainAtTheNextSession = false)
         SheetExit.NOT_NOW, SheetExit.CLOSED -> Recorded(ConsentState.Consent.DECLINED, asks = 1, yes = 0, no = 1, askedAgainAtTheNextSession = false)
-        null -> Recorded(ConsentState.Consent.UNKNOWN, asks = 1, yes = 0, no = 0, askedAgainAtTheNextSession = true)
+        // SDK 3.1.5: no answer is a "Not now" for the next ask (7 sessions later, AskScheduleTest); 3.1.0 to 3.1.4 asked
+        // again at the next session
+        null -> Recorded(ConsentState.Consent.UNKNOWN, asks = 1, yes = 0, no = 0, askedAgainAtTheNextSession = false)
     }
 
     @Test fun eachEndingRecordsWhat310Recorded() {

@@ -28,6 +28,8 @@ internal data class PromotionEvent(
     /** False for a crash found at launch that did not end a pipeline attempt (a session's first call). */
     val countsAttempt: Boolean = true,
     val incident: AcceleratorIncident? = null,
+    /** A stop of the process in the background that counted nothing (SDK 3.1.5): reported, not counted in the statistics. */
+    val background: Boolean = false,
 )
 
 /**
@@ -86,6 +88,9 @@ internal data class AcceleratorIncident(
     val lowPower: Boolean? = null,
     val stallMs: Double? = null,
     val attempt: Int? = null,
+    /** A promotion's `crash_on_last_run`: whether the app was in the foreground when the stage last recorded it; null
+     *  when not known. */
+    val foreground: Boolean? = null,
 ) {
     /** `<stage>:<cause>`. */
     val code: String get() = "$stage:$cause"

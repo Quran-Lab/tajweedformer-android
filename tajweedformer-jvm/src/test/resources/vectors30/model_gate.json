@@ -1,6 +1,6 @@
 {
  "format": "quranlab.sdk-model-gate-vectors/3",
- "about": "SDK 3.1.0: which answers of the server stop a model already on the device (make_model_gate.py; SPEC.md 15.3 and 15.4; every message and fix is the catalogue's). The rule: an answer stops a model exactly when its body carries a `reason` that is one of `stop_reasons`; an answer without a reason never does. `from` is `api` or `cdn` (a model request); `status` and `body` are the answer (both null: no answer). `expect.stops_model`: the refusal is remembered and client.model() and prefetch fail with `expect.error` until a later answer accepts the key. `expect.removes_models` (format 3, always equal to stops_model): with the stop the SDK removes every model build it holds from the device, so the model is downloaded again once the key is accepted. `expect.error`: the error the call raises when it cannot give a model, or null. A stop's error is server_rejected with the reason's entry, or invalid_key for the reasons of `key_reasons`. `model_request_reasons` are refusals of a model request that never stop a model. `app` fills {origin}; `sdk` fills {sdk}.",
+ "about": "SDK 3.1.0: which answers of the server stop a model already on the device (make_model_gate.py; SPEC.md 15.3 and 15.4; every message and fix is the catalogue's). The rule: an answer stops a model exactly when its status is 401 or 403 and its body carries a `reason` that is one of `stop_reasons`; any other status never does, whatever its body says (SPEC 15.3 as of 1.19.2), and neither does an answer without a reason. `from` is `api` or `cdn` (a model request); `status` and `body` are the answer (both null: no answer). `expect.stops_model`: the refusal is remembered and client.model() and prefetch fail with `expect.error` until a later answer accepts the key. `expect.removes_models` (format 3, always equal to stops_model): with the stop the SDK removes every model build it holds from the device, so the model is downloaded again once the key is accepted. `expect.error`: the error the call raises when it cannot give a model, or null. A stop's error is server_rejected with the reason's entry, or invalid_key for the reasons of `key_reasons`. `model_request_reasons` are refusals of a model request that never stop a model. `app` fills {origin}; `sdk` fills {sdk}.",
  "sdk": "3.1.0",
  "app": "org.example.halaqa",
  "stop_reasons": [
@@ -565,6 +565,38 @@
      "message": "Quran Lab refused this app: a_code_from_later.",
      "fix": "Check in sdk.quranlab.ai that the key belongs to this app id and platform and that the app is not blocked."
     }
+   }
+  },
+  {
+   "name": "API 429 rate_limited carrying a stop reason",
+   "about": "A reason of the list under a 429 is not a stop: the answer is the limit, as without the reason.",
+   "from": "api",
+   "status": 429,
+   "body": {
+    "error": "rate_limited",
+    "message": "Slow down.",
+    "reason": "key_revoked"
+   },
+   "expect": {
+    "stops_model": false,
+    "removes_models": false,
+    "error": null
+   }
+  },
+  {
+   "name": "CDN 404 carrying a stop reason",
+   "about": "A reason of the list under a 404 is not a stop: the request failed and the download fails with download_failed, its detail the SDK's own; nothing is remembered and nothing is removed.",
+   "from": "cdn",
+   "status": 404,
+   "body": {
+    "error": "not_found",
+    "message": "No such file.",
+    "reason": "key_revoked"
+   },
+   "expect": {
+    "stops_model": false,
+    "removes_models": false,
+    "error": null
    }
   },
   {

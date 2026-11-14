@@ -668,7 +668,7 @@ class ModelFromServerOnlyTest : OpenChecked() {
         withTimeout(600_000) {
             stub.appId = gate["app"] as String
             val cases = gate["cases"] as List<Map<String, Any?>>
-            assertEquals(32, cases.size)
+            assertEquals(34, cases.size)
             val stops = gate["stop_reasons"] as List<String>
             assertEquals("the SDK's list is the vector's", stops.toSet(), ModelGate.STOP_REASONS)
             assertEquals((gate["key_reasons"] as List<String>).toSet(), ModelGate.KEY_REASONS)
@@ -682,7 +682,11 @@ class ModelFromServerOnlyTest : OpenChecked() {
                 val want = expect["error"] as? Map<String, Any?>
                 val cdn = case["from"] == "cdn"
                 val reason = (case["body"] as? Map<String, Any?>)?.get("reason") as? String
-                assertEquals("$name: the rule (a reason of the list, and only that, stops)", reason != null && reason in stops, stopsModel)
+                val status = (case["status"] as? Number)?.toInt()
+                // SPEC 15.3: a reason of the list stops under a 401 or a 403 only
+                assertEquals("$name: the rule (a reason of the list under a 401 or a 403, and only that, stops)",
+                    (status == 401 || status == 403) && reason != null && reason in stops, stopsModel)
+                assertEquals("$name: the SDK's rule", ModelGate.stops(status ?: 0, reason), stopsModel)
                 if (stopsModel) stopping++
                 val keys = Keys()
 

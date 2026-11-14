@@ -233,6 +233,7 @@ class PromotionReportsTest : OpenChecked() {
             "low_power" to { v -> v is Boolean },
             "stall_ms" to { v -> v is Double && v == Math.floor(v) && v in 0.0..600_000.0 },
             "attempt" to { v -> v is Double && v == Math.floor(v) && v in 1.0..100.0 },
+            "foreground" to { v -> v is Boolean },
         )
         assertTrue("detail.stage and detail.cause are required", d.containsKey("stage") && d.containsKey("cause"))
         for ((k, v) in d) {
@@ -294,6 +295,35 @@ class PromotionReportsTest : OpenChecked() {
             "tolerance" to mapOf("log_probs" to mapOf("token_edits" to 0.0, "lp_mean" to 0.05, "lp_p99" to 1.5), "attr" to mapOf("p_mean" to 0.02)),
             "failed" to listOf("log_probs.token_edits", "log_probs.lp_p99", "attr.p_mean")), g["divergence"])
         assertEquals(2.0, g["attempt"])
+    }
+
+    /** A stop of the process found at launch (SDK 3.1.5, contract 1.22.0): the report says whether the app was in the
+     *  foreground and leaves it out when that is not known; no other report carries it; a stop in the background is
+     *  reported and counts nothing in the statistics. */
+    @Suppress("UNCHECKED_CAST")
+    @Test fun aStopOfTheProcessSaysWhetherTheAppWasInTheForeground() {
+        stub.incidentsAccepted = true
+        val c = cloud()
+        for ((stage, fg) in listOf("compile" to true, "warmup" to false, "golden" to null)) {
+            val inc = incident(AcceleratorIncident.PROMOTION_FAILED, stage, "crash_on_last_run").copy(foreground = fg)
+            c.onPromotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", false, stage, "crash", 1, countsAttempt = fg != false,
+                incident = inc, background = fg == false))
+        }
+        assertEquals(3, c.deliver().second)
+        val sent = stub.seen("/v1/issues").map { it.json!! }
+        sent.forEach { validate(it) }
+        val details = sent.map { it["detail"] as Map<String, Any?> }
+        assertEquals(listOf("compile:crash_on_last_run", "warmup:crash_on_last_run", "golden:crash_on_last_run"), sent.map { it["code"] })
+        assertEquals(listOf(true, false, null), details.map { it["foreground"] })
+        assertEquals(listOf(true, true, false), details.map { it.containsKey("foreground") })
+        for (other in listOf(incident(AcceleratorIncident.PROMOTION_FAILED, "compile", "compile_error"),
+            incident(AcceleratorIncident.FAILOVER, "session", "crash_on_last_run"))) {
+            assertFalse("${other.kind} ${other.cause}", IssueQueue.detail(other.copy(foreground = true)).containsKey("foreground"))
+        }
+        val t = Telemetry(File(dir, "t-background"), clock)
+        t.promotion(PromotionEvent("npu:tensor_g5", "v4.0-2026-11-09", "c16_l64", false, "warmup", "crash", 1, countsAttempt = false,
+            incident = incident(AcceleratorIncident.PROMOTION_FAILED, "warmup", "crash_on_last_run").copy(foreground = false), background = true))
+        assertTrue("a stop in the background was counted", promotions(t).isEmpty())
     }
 
     @Test fun theMessageIsPathStripped() {

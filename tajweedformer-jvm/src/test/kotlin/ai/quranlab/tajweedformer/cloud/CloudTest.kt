@@ -248,7 +248,9 @@ class CloudTest : OpenChecked() {
         assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["surah_ayahs"])
         assertEquals(listOf("ayahs", "surah_ayahs", "coverage"), b["reported"])
         assertFalse(b.containsKey("words"))
-        assertEquals("each finished session with feedback asks while the learner has not answered (the config offers sharing, a sheet is registered; 3 at most)", 2.0, b["share_asked"])
+        // SDK 3.1.5: the sheet left without an answer is a "Not now", so the second take does not ask again (the next ask
+        // would come 7 sessions later); 3.1.4 asked at each of the two
+        assertEquals("the first finished session with feedback asks (the config offers sharing, a sheet is registered); the unanswered sheet is not asked again at the next", 1.0, b["share_asked"])
         for (k in listOf("launches", "rule_checks", "rule_flags", "share_yes", "share_no")) assertFalse(k, b.containsKey(k))
         // nothing that could identify anyone: only the schema's fields (the stub refuses any other)
         val text = String(ev.body)

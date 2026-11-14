@@ -62,9 +62,10 @@ internal data class PromotionTimeouts(
  *    (no failure) in battery saver, below 20 % battery unless charging, or above light thermal throttling.
  * 3. The swap: only at a session start ([engineForNextSession]), to an accelerator already loaded and warm.
  * 4. Failures keep the CPU and record the stage and reason; retries for the key after 1 h, 6 h, 24 h, then none;
- *    golden_mismatch, cpu_mismatch, non_finite and crash are never retried for the key. One attempt in flight, at most
+ *    golden_mismatch, cpu_mismatch and non_finite are never retried for the key. One attempt in flight, at most
  *    one per launch. The crash sentinel is armed around every compile, load, warm-up, golden run and a session's
- *    first accelerator call.
+ *    first accelerator call, with whether the app is in the foreground ([stopFound] reads it at the next launch:
+ *    SDK 3.1.5).
  * 5. In a session ([FailoverEngine]): a failed chunk switches the take to the CPU at once. What it does to the key
  *    depends on its cause ([failingOver]): a missed limit nothing, unless it happened in 3 sessions within 24 h (then
  *    a 6 h pause); a confirmed blank disagreement a 6 h pause, the second one for the key off for good; NaN, inf or
@@ -91,9 +92,16 @@ internal class AcceleratorController @JvmOverloads constructor(
 
         /** Keys whose session sentinel was handled in this process (a session's first call is guarded once). */
         private val firstCallGuarded = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+        /** Stops in the background in a row at one stage that count as a stop in the foreground. */
+        const val BACKGROUND_STOPS_COUNTED = 3
+
+        /** Counted stops at one preparation stage that end the key. */
+        const val PREPARATION_STOPS_FINAL = 2
     }
 
     private val activationHooked = AtomicBoolean(false)
+    private val foregroundHooked = AtomicBoolean(false)
 
     private val _state = MutableStateFlow<AcceleratorState>(AcceleratorState.Cpu("not_started"))
 
@@ -153,17 +161,20 @@ internal class AcceleratorController @JvmOverloads constructor(
     // ------------------------------------------------------------------------------------------------- launch
 
     /**
-     * At launch (never blocks): a sentinel left by a dead process records a `crash` at its stage; the denylist and
-     * an unavailable accelerator keep the CPU; a promoted key is loaded and warmed again in the background; a failed
-     * key waits for its retry time; otherwise the pipeline is scheduled (after the first session on a first install).
+     * At launch (never blocks): a sentinel left by a process that ended is read ([stopFound]); the denylist and an
+     * unavailable accelerator keep the CPU; a promoted key is loaded and warmed again in the background; a failed key
+     * waits for its retry time; otherwise the pipeline is scheduled (after the first session on a first install).
      */
     fun start() {
         startedAtMs = env.nowMs()
         if (activationHooked.compareAndSet(false, true)) try { env.onAppActive { appActivated() } } catch (_: Exception) {}
-        store.leftSentinel()?.let { (id, stage) ->
+        store.left()?.let { s ->
             store.clearSentinel()
-            crashed(id.ifEmpty { key.id }, stage.ifEmpty { Stages.COMPILE })
+            stopFound(s.keyId.ifEmpty { key.id }, s.stage.ifEmpty { Stages.COMPILE }, s.foreground)
         }
+        // while a stage of this process runs, its sentinel says whether the app is in the foreground, also when that
+        // changes (hooked after the last process's sentinel is read, which keeps the state that process recorded)
+        if (foregroundHooked.compareAndSet(false, true)) try { env.onForegroundChange { fg -> store.updateSentinel(fg) } } catch (_: Exception) {}
         denyReason()?.let { return denyHit(it) }
         preparer.unavailable(key)?.let { return set(AcceleratorState.Cpu(it)) }
         val r = store.record(key) ?: PromotionRecord()
@@ -240,19 +251,59 @@ internal class AcceleratorController @JvmOverloads constructor(
 
     private fun schedule(delayMs: Long, unmetered: Boolean) = env.schedule(delayMs, unmetered) { runPipeline() }
 
-    /** A process died at [stage] of key [id]: reason `crash`, never retried for that key. */
-    private fun crashed(id: String, stage: String) {
-        val r = store.record(id) ?: PromotionRecord(attempt = 1)
+    /**
+     * The process ended at [stage] of key [id] (its sentinel was left; SDK 3.1.5). [foreground]: whether the app was in
+     * the foreground when the stage last recorded it, null when not known (a sentinel of 3.1.4 or earlier, the
+     * desktop JVM).
+     *
+     * - In the background a stop counts nothing at any stage: no failure, no wait, the attempt goes on at this launch
+     *   from the stage its record says. A promotion's stop is reported (`foreground` false); one at a session's first
+     *   call is not (the field is a promotion's). The [BACKGROUND_STOPS_COUNTED]th in a row at the same stage counts as
+     *   a stop in the foreground, and the row goes on past it, so the next one is the second counted stop there. A
+     *   stage that completes, the load and warm-up at launch, or a first call that comes back, ends its row.
+     * - In the foreground, or not known: at a preparation stage ([Stages.PREPARATION]: the model has not run on the
+     *   accelerator in this attempt) the retry budget as any failure (1 h, 6 h, 24 h, then none), and the
+     *   [PREPARATION_STOPS_FINAL]th counted stop at the same stage ends the key; at golden, measure or a session's
+     *   first accelerator call it ends the key.
+     */
+    private fun stopFound(id: String, stage: String, foreground: Boolean?) {
+        var r = store.record(id) ?: PromotionRecord(attempt = 1)
         if (r.status == PromotionRecord.FINAL) return
+        val now = env.nowMs()
         val inPipeline = stage != Stages.SESSION
-        store.put(id, r.copy(status = PromotionRecord.FINAL, reason = Reasons.CRASH, failedStage = stage, failures = r.failures + 1,
-            detail = "the process died during $stage", updatedAtMs = env.nowMs()))
+        val reported = if (stage == Stages.LOAD) Stages.COMPILE else stage
+        val attempt = r.attempt.coerceAtLeast(1)
+        var row: Map<String, Int>? = null
+        if (foreground == false) {
+            val n = (r.backgroundStops[stage] ?: 0) + 1
+            row = r.backgroundStops + (stage to n)
+            if (n < BACKGROUND_STOPS_COUNTED) {
+                // not a fault of the build: nothing counted, the attempt goes on where its record says
+                store.put(id, r.copy(backgroundStops = row, updatedAtMs = now))
+                // reported for a promotion (the server opens no incident for it); a session's is not a promotion's
+                if (id == key.id && inPipeline) {
+                    val inc = incident(AcceleratorIncident.PROMOTION_FAILED, reported, Reasons.CRASH, null, attempt = attempt,
+                        message = "the process ended during $stage in the background", foreground = false)
+                    SdkEvents.emit { it.onPromotion(PromotionEvent(key.build, key.revision, key.context, promoted = false, stage = reported,
+                        reason = Reasons.CRASH, attempt = attempt, countsAttempt = false, incident = inc, background = true)) }
+                }
+                return
+            }
+        }
+        val preparation = stage in Stages.PREPARATION
+        val stops = if (preparation) r.preparationStops + (stage to ((r.preparationStops[stage] ?: 0) + 1)) else r.preparationStops
+        val failures = r.failures + 1
+        val final = !preparation || (stops[stage] ?: 0) >= PREPARATION_STOPS_FINAL || failures > MAX_RETRIES
+        val next = if (final) 0L else now + timeouts.backoffMs[(failures - 1).coerceIn(0, timeouts.backoffMs.size - 1)]
+        r = r.copy(status = if (final) PromotionRecord.FINAL else PromotionRecord.FAILED, reason = Reasons.CRASH, failedStage = stage,
+            failures = failures, nextAttemptAtMs = next, preparationStops = stops, backgroundStops = row ?: emptyMap(),
+            detail = "the process ended during $stage" + if (foreground == false) " in the background" else "", updatedAtMs = now)
+        store.put(id, r)
         if (id != key.id) return
-        val incident = incident(if (inPipeline) AcceleratorIncident.PROMOTION_FAILED else AcceleratorIncident.FAILOVER, stage,
-            Reasons.CRASH, null, attempt = r.attempt.coerceAtLeast(1))
+        val incident = incident(if (inPipeline) AcceleratorIncident.PROMOTION_FAILED else AcceleratorIncident.FAILOVER, reported,
+            Reasons.CRASH, null, attempt = attempt, foreground = if (inPipeline) foreground else null)
         SdkEvents.emit { it.onPromotion(PromotionEvent(key.build, key.revision, key.context, promoted = false,
-            stage = if (stage == "load") Stages.COMPILE else stage, reason = Reasons.CRASH, attempt = r.attempt.coerceAtLeast(1),
-            countsAttempt = inPipeline, incident = incident)) }
+            stage = reported, reason = Reasons.CRASH, attempt = attempt, countsAttempt = inPipeline, incident = incident)) }
     }
 
     // ------------------------------------------------------------------------------------------------- sessions
@@ -336,7 +387,8 @@ internal class AcceleratorController @JvmOverloads constructor(
             if (stage in setOf(Stages.WARMUP, Stages.GOLDEN, Stages.MEASURE) && active.get() > 0) return waitForSessions(stage)
             set(AcceleratorState.Preparing(stage))
             r = try {
-                runStage(stage, r)
+                // a stage that completes ends its row of stops in the background (the reload with it)
+                runStage(stage, r).let { done -> done.copy(backgroundStops = done.backgroundStops - stage - Stages.LOAD) }
             } catch (e: StageWait) {
                 return wait(stage, e.what, e.what == "unmetered_network")
             } catch (e: StageAborted) {
@@ -469,7 +521,7 @@ internal class AcceleratorController @JvmOverloads constructor(
      * (its thread is left to finish; [onLate] gets a result that comes after) and the stage fails with [lateReason].
      */
     private fun <T> guarded(stage: String, ms: Long, lateReason: String, onLate: (Any?) -> Unit = {}, body: () -> T): T {
-        store.armSentinel(key, stage)
+        store.armSentinel(key, stage, foregroundNow())
         val box = LinkedBlockingQueue<Result<T>>(1)
         val abandoned = AtomicBoolean(false)
         val t = Thread({
@@ -511,7 +563,8 @@ internal class AcceleratorController @JvmOverloads constructor(
         }
         limits = ChunkLimits(r.accMedianMs, r.accP90Ms)
         val rec = r.copy(stage = Stages.PROMOTE, status = PromotionRecord.PROMOTED, promotedAtMs = env.nowMs(), reason = "", detail = "",
-            failedStage = "", updatedAtMs = env.nowMs(), programSha = try { preparer.programId(key) } catch (_: Exception) { "" })
+            failedStage = "", updatedAtMs = env.nowMs(), programSha = try { preparer.programId(key) } catch (_: Exception) { "" },
+            preparationStops = emptyMap(), backgroundStops = emptyMap())
         store.put(key, rec)
         val ttr = env.nowMs() - startedAtMs
         set(AcceleratorState.Ready(key.soc, ttr, rec.speedup))
@@ -540,8 +593,11 @@ internal class AcceleratorController @JvmOverloads constructor(
         }
         limits = ChunkLimits(r.accMedianMs, r.accP90Ms)
         synchronized(lock) {
-            store.record(key)?.takeIf { it.pausedUntilMs != 0L || it.pauseCause.isNotEmpty() }?.let {
-                store.put(key, it.copy(pausedUntilMs = 0, pauseCause = "", updatedAtMs = env.nowMs()))
+            // loaded and warm again: a pause is over, and so is a row of stops in the background at the load or the
+            // warm-up (a row at a session's first call goes on: that call has not come back yet)
+            val rows = setOf(Stages.LOAD, Stages.WARMUP)
+            store.record(key)?.takeIf { it.pausedUntilMs != 0L || it.pauseCause.isNotEmpty() || it.backgroundStops.keys.any { s -> s in rows } }?.let {
+                store.put(key, it.copy(pausedUntilMs = 0, pauseCause = "", backgroundStops = it.backgroundStops - rows, updatedAtMs = env.nowMs()))
             }
         }
         set(AcceleratorState.Ready(key.soc, env.nowMs() - startedAtMs, r.speedup))
@@ -566,14 +622,17 @@ internal class AcceleratorController @JvmOverloads constructor(
 
     private fun incident(kind: String, stage: String, reason: String, error: Throwable?, attempt: Int? = null, clip: String? = null,
                          divergence: Divergence? = null, message: String? = null, chunk: Int? = null, elapsedMs: Double? = null,
-                         deadlineMs: Double? = null, stallMs: Double? = null): AcceleratorIncident {
+                         deadlineMs: Double? = null, stallMs: Double? = null, foreground: Boolean? = null): AcceleratorIncident {
         val c = try { env.conditions() } catch (_: Exception) { null }
         return AcceleratorIncident(kind = kind, stage = stage, cause = AcceleratorIncident.cause(reason), revision = key.revision,
             context = key.context, accelerator = key.build, error = error, message = error?.message ?: message, chunk = chunk,
             elapsedMs = elapsedMs, deadlineMs = deadlineMs, clip = clip, divergence = divergence, deviceModel = env.deviceModelCode,
             osBuild = env.osBuildReport, chip = key.soc, computeUnits = "npu", delegate = env.delegate, thermal = c?.thermal,
-            lowPower = c?.powerSave, stallMs = stallMs, attempt = attempt)
+            lowPower = c?.powerSave, stallMs = stallMs, attempt = attempt, foreground = foreground)
     }
+
+    /** Whether the app is in the foreground now; null when the platform cannot tell. */
+    private fun foregroundNow(): Boolean? = try { env.foreground() } catch (_: Exception) { null }
 
     // ------------------------------------------------------------------------------------------------- sessions on it
 
@@ -640,9 +699,15 @@ internal class AcceleratorController @JvmOverloads constructor(
 
     override fun firstCall(done: Boolean) {
         if (!done) {
-            if (firstCallGuarded.add(key.id)) store.armSentinel(key, Stages.SESSION) else return
+            if (firstCallGuarded.add(key.id)) store.armSentinel(key, Stages.SESSION, foregroundNow()) else return
         } else {
             store.clearSentinel()
+            // the first call came back: a row of stops in the background at it has ended
+            synchronized(lock) {
+                store.record(key)?.takeIf { Stages.SESSION in it.backgroundStops }?.let {
+                    store.put(key, it.copy(backgroundStops = it.backgroundStops - Stages.SESSION, updatedAtMs = env.nowMs()))
+                }
+            }
         }
     }
 

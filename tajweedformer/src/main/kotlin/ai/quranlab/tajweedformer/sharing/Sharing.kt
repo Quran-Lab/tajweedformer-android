@@ -32,6 +32,28 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     internal val contributor = Contributor(dir, env.contributorKeys, env.secretBox)
     val state = ConsentState(File(dir, "state.json"), env.clock)
 
+    /**
+     * Whether this is the install's first launch: the first process of
+     * the install, told at the Client's start by the absence of the marker of an earlier start ([STARTED], written
+     * now). An install from before 3.1.5 has no marker: its consent state or its registration says it started before.
+     * On the first launch the SDK does not ask (its takes still count as sessions); the app's [askNow] may.
+     */
+    val firstLaunch: Boolean = firstStart()
+
+    private fun firstStart(): Boolean {
+        val cloudDir = File(env.storage, "cloud")
+        val marker = File(cloudDir, STARTED)
+        if (marker.exists()) return false
+        val earlier = File(dir, "state.json").exists() || File(cloudDir, "installed").exists()
+        try {
+            cloudDir.mkdirs()
+            marker.writeText("")
+        } catch (_: Exception) {
+            // not written: the next start is a first launch again, and the SDK does not ask then either
+        }
+        return !earlier
+    }
+
     @Volatile private var ownWording: Map<String, String> = emptyMap()
     @Volatile private var wordedCopy: SharingCopy? = null
 
@@ -369,9 +391,10 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         recorder.takeEnded(e.completed)
         // a take without audio is not a finished session (SPEC 6.1, contract 1.13.0): it never leads to the ask
         if (!e.completed || e.withoutAudio) return
-        // an ask nobody can show is not counted: the sheet goes to the SDK's UI or the app's own
+        // an ask nobody can show is not counted: the sheet goes to the SDK's UI or the app's own; and the SDK never
+        // asks on the install's first launch (the session is counted all the same)
         val show = prompts
-        val v = state.sessionCompleted(e.feedbackShown, available && show != null)
+        val v = state.sessionCompleted(e.feedbackShown, available && show != null && !firstLaunch)
         if (v != null && show != null) {
             cloud.telemetry.shareAsked()
             show(SheetRequest.Consent(v, guardian))
@@ -412,6 +435,9 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
     }
 
     companion object {
+        /** The marker of a Client's start in the cloud folder: its absence at a start is the install's first launch. */
+        const val STARTED = "started"
+
         val ROUTES = setOf("built_in", "wired", "usb", "bluetooth", "car", "continuity", "other", "unknown")
     }
 }
