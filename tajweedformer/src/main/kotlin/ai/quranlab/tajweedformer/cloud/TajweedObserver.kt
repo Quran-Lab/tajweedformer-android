@@ -61,7 +61,9 @@ internal interface TajweedObserver {
 
     data class ModelLoad(val revision: String, val context: String, val backend: String, val ms: Double, val cold: Boolean, val build: String = "")
 
-    data class Download(val revision: String, val profile: String, val bytes: Long, val success: Boolean, val resumed: Boolean, val build: String = "")
+    data class Download(val revision: String, val profile: String, val bytes: Long, val success: Boolean, val resumed: Boolean, val build: String = "",
+                        /** A failed one's telemetry reason: `network`, `http`, `hash_mismatch`, `signature`, `storage`, `other`. */
+                        val failureReason: String? = null)
 
     data class SessionStart(
         /** The model's version. */

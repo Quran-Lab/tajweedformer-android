@@ -11,7 +11,7 @@ permissions:
 jobs:
   jvm:
     name: JVM tests (no engine)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,9 @@ jobs:
 
   engine:
     name: Engine through JNI, and the AAR
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest became 26.04 in November 2026, which has no CMake 3.31.6 (the
+    # version the AAR's native build pins), and every Android release before 3.1.6 was built on 24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4

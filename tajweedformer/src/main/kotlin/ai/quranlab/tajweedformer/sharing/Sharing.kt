@@ -428,6 +428,12 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
         override fun contributorRevoked() { contributor.reset() }
         override fun contributorReadable(): Boolean = !contributor.lost()
         override fun badRequest(route: String) = cloud.report("other", "bad_request:$route")
+        override fun lost(status: Int, code: String) {
+            val rules = ai.quranlab.tajweedformer.cloud.ErrorRules
+            val reason = if (status == 429 && code == "volume_limit") "quota" else rules.reasonOf(status, code, null)
+            cloud.silent(ai.quranlab.tajweedformer.cloud.ErrorCause("sharing", reason, status.takeIf { it in 100..599 },
+                errorCode = rules.token(code, rules.ERROR_CODE)?.takeIf { !it.startsWith("http_") }))
+        }
         override fun log(message: String) { if (env.debugBuild) try { env.log(message) } catch (_: Exception) {} }
         override fun consentInForce(): Boolean = state.granted
         override fun consentCount(): Int = state.changes

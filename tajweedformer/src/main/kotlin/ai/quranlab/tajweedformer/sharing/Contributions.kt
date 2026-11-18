@@ -61,6 +61,8 @@ internal interface SharingGate {
     fun contributorReadable(): Boolean = true
     /** A refusal that is an SDK bug (400): one issue a day. */
     fun badRequest(route: String) {}
+    /** A shared recording that will not be uploaded, or a segment refused for good. */
+    fun lost(status: Int, code: String) {}
     /** A line for the developer's log (debuggable builds). */
     fun log(message: String) {}
     /** The learner's own yes is in force, whatever the signed config says now (its pause is not a no). */
@@ -903,6 +905,7 @@ internal class ContributionOutbox internal constructor(
     /** The capped tier's segment cap: what is up is the session (the audio so far stays valid). */
     private fun finishAtCap(id: String) {
         val rec = synchronized(records) { records[id] } ?: return
+        try { gate.lost(403, "segment_cap") } catch (_: Exception) {}
         rec.state = "uploaded"
         rec.lastError = "segment_cap"
         // a recording of several takes: the list of those inside what went up follows once the capture has ended
@@ -920,6 +923,7 @@ internal class ContributionOutbox internal constructor(
 
     private fun fail(id: String, e: ApiError) {
         val rec = synchronized(records) { records[id] } ?: return
+        try { gate.lost(e.status, e.code) } catch (_: Exception) {}
         rec.state = "failed"
         rec.failCode = e.code
         rec.lastError = e.toString()

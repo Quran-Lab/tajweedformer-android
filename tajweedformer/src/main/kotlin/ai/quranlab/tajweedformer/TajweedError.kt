@@ -33,6 +33,12 @@ public open class TajweedError internal constructor(
 
     override fun toString(): String = "TajweedError($code): $message"
 
+    /** Where the cause of this failure is, set where it is made ([at]); the error report reads it. */
+    @Volatile internal var cause40: ai.quranlab.tajweedformer.cloud.ErrorCause? = null
+
+    /** Counted once as a failure that reached the app (24.1: one occurrence per error, however it is delivered). */
+    internal val reachedApp = java.util.concurrent.atomic.AtomicBoolean(false)
+
     internal companion object {
         /**
          * Any failure as a [TajweedError]: itself when it is one; a refused argument as `invalid_argument`; a server
@@ -44,6 +50,8 @@ public open class TajweedError internal constructor(
             is IllegalArgumentException, is IndexOutOfBoundsException -> TajweedError("invalid_argument", mapOf("detail" to (e.message ?: e.javaClass.simpleName)), e)
             is java.io.IOException -> TajweedError("storage_failed", mapOf("detail" to (e.message ?: e.javaClass.simpleName)), e)
             is kotlinx.coroutines.CancellationException -> TajweedError("cancelled", cause = e)
+            // contract 24.4 rule 4: a device that runs out of memory is `engine_failed`, "not enough memory"
+            is OutOfMemoryError -> TajweedError("engine_failed", mapOf("detail" to "not enough memory"), e)
             else -> TajweedError("engine_failed", mapOf("detail" to (e.message ?: e.javaClass.simpleName)), e)
         }
 
@@ -80,6 +88,35 @@ public open class TajweedError internal constructor(
             else -> null
         }
     }
+}
+
+/**
+ * Names where the cause of this failure is, unless a cause was named
+ * already: the place nearest the failure names it. The platform error's class is read from the error's chain.
+ */
+internal fun <T : TajweedError> T.at(stage: String, reason: String, status: Int? = null, errorCode: String? = null, retries: Int? = null): T {
+    if (cause40 == null) {
+        cause40 = ai.quranlab.tajweedformer.cloud.ErrorCause(stage, reason, status?.takeIf { it in 100..599 },
+            ai.quranlab.tajweedformer.cloud.ErrorRules.platformName(this),
+            ai.quranlab.tajweedformer.cloud.ErrorRules.token(errorCode, ai.quranlab.tajweedformer.cloud.ErrorRules.ERROR_CODE), retries)
+    }
+    return this
+}
+
+/** [at] with a cause made elsewhere (a request's, [ai.quranlab.tajweedformer.cloud.ErrorCause.ofCloud]). */
+internal fun <T : TajweedError> T.at(cause: ai.quranlab.tajweedformer.cloud.ErrorCause): T {
+    if (cause40 == null) cause40 = cause
+    return this
+}
+
+/**
+ * A failure that reaches the app (24.1 item 1): counted once per error as an error report of the process's Quran Lab
+ * cloud, with the stage of its cause. Never throws and never waits.
+ */
+internal fun reachedApp(e: Throwable?) {
+    val t = e as? TajweedError ?: return
+    if (!t.reachedApp.compareAndSet(false, true)) return
+    try { ai.quranlab.tajweedformer.cloud.QuranLabCloud.current?.errorReachedApp(t) } catch (_: Throwable) {}
 }
 
 /**

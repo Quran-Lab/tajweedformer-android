@@ -267,7 +267,13 @@ internal data class ApiError(
 }
 
 /** A request that did not succeed: an error answer, or no answer ([api] null: offline). */
-internal class CloudException(val api: ApiError?, message: String, cause: Throwable? = null) : Exception(message, cause) {
+internal class CloudException(
+    val api: ApiError?,
+    message: String,
+    cause: Throwable? = null,
+    /** The API path of the request (`/v1/config`), when known: an error report's stage. */
+    val path: String? = null,
+) : Exception(message, cause) {
     val offline: Boolean get() = api == null
 
     /** No answer because the system does not let the app use the network (no INTERNET permission). */

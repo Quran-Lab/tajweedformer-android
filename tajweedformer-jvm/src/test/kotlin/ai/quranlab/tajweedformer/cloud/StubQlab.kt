@@ -214,7 +214,8 @@ internal class StubQlab : AutoCloseable {
             "POST /v1/register" -> needToken(s) ?: closed(s, setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"))
                 ?: Reply.json(200, mapOf("ok" to true, "app_id" to "android:org.example.recite", "store_status" to "unlisted"))
             "POST /v1/events" -> needToken(s) ?: events(s)
-            "POST /v1/issues" -> needToken(s) ?: closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames") +
+            "POST /v1/issues" -> needToken(s) ?: issueAnswer?.invoke(s) ?: if (s.json?.get("kind") == "error") errorReport(s) else
+                closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames") +
                 (if (incidentsAccepted && s.json?.get("kind") in setOf("accelerator_failover", "promotion_failed")) setOf("message", "detail") else emptySet()))
                 ?: Reply.json(202, mapOf("ok" to true))
             "POST /v1/uploads" -> uploadStart(s)
@@ -229,6 +230,26 @@ internal class StubQlab : AutoCloseable {
             }
         }
     }
+
+    /** Takes over the answer to `POST /v1/issues` (a 503, a 429) when it returns one. */
+    @Volatile var issueAnswer: ((Seen) -> Reply?)? = null
+
+    /** An error report: the top level of section 7 with
+     *  `error` and without `message`, `frames`, `detail`; the closed `error` object. */
+    private fun errorReport(s: Seen): Reply {
+        closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "error"))?.let { return it }
+        val e = s.json?.get("error") as? Map<*, *> ?: return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error: required"))
+        val allowed = setOf("stage", "reason", "http_status", "error_name", "error_code", "count", "retries", "first_launch", "first_report", "build",
+            "device_model", "ram_tier", "storage_free", "abi", "web")
+        e.keys.firstOrNull { it !in allowed }?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.$it: unknown field")) }
+        if (e["stage"] !in ErrorRules.STAGES || (e["reason"] as? String)?.let { ErrorRules.TOKEN.matches(it) } != true) {
+            return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.stage or error.reason"))
+        }
+        return Reply.json(202, mapOf("ok" to true))
+    }
+
+    /** The error reports the stub accepted (their bodies), in order. */
+    fun errorReports(): List<Map<String, Any?>> = seen("/v1/issues").mapNotNull { it.json }.filter { it["kind"] == "error" }
 
     private fun needKey(s: Seen): Reply? = if (s.headers["x-qlab-key"] == key) null else Reply.error(401, "invalid_key")
 
@@ -325,6 +346,8 @@ internal class StubQlab : AutoCloseable {
     /** Telemetry v2's closed schema (qlab-api src/events2.js), with the 2.0.1 fields. */
     @Suppress("UNCHECKED_CAST")
     private fun events(s: Seen): Reply {
+        // QLAB_BODY_DUMP (a folder): every body sent here is kept, so qlab-api's own schema can be run on them
+        System.getenv("QLAB_BODY_DUMP")?.let { d -> File(d).apply { mkdirs() }.resolve("events-${System.nanoTime()}.json").writeBytes(s.body) }
         if (s.body.size > 32 * 1024) return Reply.error(413, "too_large")
         val o = s.json ?: return Reply.error(400, "invalid_json")
         fun bad(why: String) = Reply.json(400, mapOf("error" to "invalid_body", "message" to why))
@@ -372,6 +395,13 @@ internal class StubQlab : AutoCloseable {
         }
         (o["coverage"] as? Map<String, Any?>)?.keys?.firstOrNull { (it.toIntOrNull() ?: 0) !in 1..114 }?.let { return bad("coverage.$it") }
         if (((o["downloads"] as? List<*>)?.size ?: 0) > 8) return bad("downloads")
+        // a download names its model version, a promotion its accelerator (src/events2.js REVISION, src/accel.js ACCELERATOR)
+        val revision = Regex("^[A-Za-z0-9][A-Za-z0-9._+@-]{0,63}$")
+        (o["downloads"] as? List<Map<String, Any?>>)?.forEachIndexed { i, d -> if (!revision.matches(d["revision"] as? String ?: "")) return bad("downloads[$i].revision") }
+        (o["promotions"] as? List<Map<String, Any?>>)?.forEachIndexed { i, p ->
+            if (!Regex("^(ane|gpu|npu(:[A-Za-z0-9][A-Za-z0-9_.-]{0,23})?)$").matches(p["backend"] as? String ?: "")) return bad("promotions[$i].backend")
+            if (!revision.matches(p["revision"] as? String ?: "")) return bad("promotions[$i].revision")
+        }
         val day = java.time.LocalDate.parse(o["day"] as String)
         if (day.isBefore(java.time.LocalDate.now(java.time.ZoneOffset.UTC).minusDays(7))) return bad("day: older than 7 days")
         if (rid != null && !reports.add(rid)) return Reply.json(202, mapOf("ok" to true, "points" to 0, "duplicate" to true))

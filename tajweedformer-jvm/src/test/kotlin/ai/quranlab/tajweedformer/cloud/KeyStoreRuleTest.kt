@@ -88,10 +88,11 @@ class KeyStoreRuleTest : OpenChecked() {
     private fun filesServed() = served.requests.filter { it.status == 200 && it.path != "manifest.json" }.map { it.path }.toSet()
 
     /** The issue reports about the install key that the server got (the queue is sent first). The stand-in engine of
-     *  these tests fails its self-test, which is reported too and is no part of this rule. */
+     *  these tests fails its self-test, which is reported too and is no part of this rule; so is the error report of a
+     *  call that failed (3.1.6, contract section 24: kind `error`). */
     private fun issues(c: TajweedClient): List<Pair<Any?, Any?>> {
         c.cloud.deliver()
-        return stub.seen("/v1/issues").mapNotNull { it.json }.map { it["kind"] to it["code"] }
+        return stub.seen("/v1/issues").mapNotNull { it.json }.filter { it["kind"] != "error" }.map { it["kind"] to it["code"] }
             .filter { (_, code) -> (code as? String)?.startsWith("self_test") != true }
     }
 

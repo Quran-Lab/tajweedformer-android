@@ -165,6 +165,9 @@ internal object AndroidPlatform {
             Build.VERSION.RELEASE.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: (Build.VERSION.SDK_INT - 19).coerceIn(1, 99),
             Build.VERSION.RELEASE.take(32),
             DeviceProfile.ramTier(mem.totalMem),
+            // contract 24.2: an error report's model code and the process's ABI (a 32-bit process on a 64-bit phone)
+            modelCode = DeviceProfile.modelCode(Build.MODEL),
+            abi = (if (android.os.Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS).firstOrNull(),
         )
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         return CloudEnvironment(

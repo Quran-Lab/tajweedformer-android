@@ -31,6 +31,9 @@ internal class Telemetry(
             if (!v) dropAll()
         }
 
+    /** A sealed report was dropped unsent after 7 days. */
+    @Volatile var expired: () -> Unit = {}
+
     private val lock = Any()
     private var day: String? = null
     private var agg: DayAggregate? = null
@@ -68,7 +71,12 @@ internal class Telemetry(
         val k = DownloadKey(e.revision, DeviceProfile.token(e.profile) ?: "other", e.build)
         val d = a.downloads.getOrPut(k) { DownloadCounts() }
         d.bytes += e.bytes
-        if (e.success) d.success++ else d.failed++
+        if (e.success) d.success++ else {
+            d.failed++
+            // 24.8: under the reason's telemetry name
+            val r = e.failureReason?.takeIf { it in DownloadCounts.FAILURE_REASONS } ?: "other"
+            d.reasons[r] = (d.reasons[r] ?: 0) + 1
+        }
         if (e.resumed) d.resumed++
         persist(force = true)
     }
@@ -161,7 +169,7 @@ internal class Telemetry(
     /** A promotion attempt ended (or a crash at a session's first accelerator call was found at launch). A stop of the
      *  process in the background that counted nothing is not counted here either (SDK 3.1.5). */
     fun promotion(e: ai.quranlab.tajweedformer.PromotionEvent) = if (e.background) Unit else rec { a ->
-        val p = a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
+        val p = a.promotion(PromoKey(Promo.backend(e.backend), ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
         if (e.countsAttempt) {
             p.attempts++
             if (e.promoted) p.promoted++ else if (e.stage in Promo.FAILED_AT) inc(p.failedAt, e.stage)
@@ -177,7 +185,7 @@ internal class Telemetry(
     /** A session switched from the accelerator to the CPU: `failovers` and its cause and stall always (a single missed
      *  limit too: it is still a switch for that session); `demoted` and `reasons.failover` only when it demoted the key. */
     fun failover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = rec { a ->
-        val p = a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
+        val p = a.promotion(PromoKey(Promo.backend(e.backend), ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
         p.failovers++
         inc(p.causes, e.failover.cause.takeIf { it in Promo.CAUSES } ?: "exception")
         Hist.stall(p.stall, e.failover.stallMs)
@@ -190,7 +198,7 @@ internal class Telemetry(
 
     /** A blank stretch the CPU confirmed (no switch): `blank_confirmed_ok`. */
     fun blankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = rec { a ->
-        a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision))).blankConfirmedOk++
+        a.promotion(PromoKey(Promo.backend(e.backend), ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision))).blankConfirmedOk++
         persist(force = true)
     }
 
@@ -369,7 +377,9 @@ internal class Telemetry(
         val out = ArrayList<File>()
         for (f in sealedDir.listFiles() ?: emptyArray()) {
             val m = REPORT_FILE.matchEntire(f.name) ?: continue
-            if (age(m.groupValues[1]) > 7) f.delete() else out.add(f)
+            if (age(m.groupValues[1]) > 7) {
+                if (f.delete()) try { expired() } catch (_: Exception) {}
+            } else out.add(f)
         }
         out.sortedBy { it.name }
     }
@@ -441,6 +451,10 @@ internal object Promo {
         "golden_mismatch", "cpu_mismatch", "failover", "denylist", "other")
     val CAUSES = listOf("exception", "non_finite", "out_of_range", "blank", "deadline")
 
+    /** The entry's backend as the server's schema has it: an accelerator whose SoC is unknown is `npu:unknown`, as a take
+     *  names it (its key's build is `npu:-`, which the server refused with the whole report until 3.1.5). */
+    fun backend(b: String): String = if (b == "npu:-") "npu:unknown" else b
+
     /** The entry as the payload has it (and as the day file keeps it): zero counts and empty objects left out. */
     fun json(k: PromoKey, c: PromoCounts, store: Boolean = false): Map<String, Any?> {
         fun cap(n: Int) = n.coerceIn(0, 10_000_000)
@@ -478,7 +492,22 @@ internal object Promo {
     }
 }
 
-internal class DownloadCounts(var bytes: Long = 0, var success: Int = 0, var failed: Int = 0, var resumed: Int = 0)
+internal class DownloadCounts(var bytes: Long = 0, var success: Int = 0, var failed: Int = 0, var resumed: Int = 0,
+                              /** Contract 24.8: the failed downloads by their telemetry reason (`network`, `http`, `hash_mismatch`,
+                               *  `signature`, `storage`, `other`). */
+                              val reasons: MutableMap<String, Int> = LinkedHashMap()) {
+    fun copy(): DownloadCounts = DownloadCounts(bytes, success, failed, resumed, LinkedHashMap(reasons))
+
+    fun add(o: DownloadCounts) {
+        bytes += o.bytes; success += o.success; failed += o.failed; resumed += o.resumed
+        for ((k, v) in o.reasons) reasons[k] = (reasons[k] ?: 0) + v
+    }
+
+    companion object {
+        /** The names of 24.8, in the server's order. */
+        val FAILURE_REASONS = listOf("network", "http", "hash_mismatch", "signature", "storage", "other")
+    }
+}
 
 internal class Cohort {
     var sessions = 0
@@ -563,7 +592,7 @@ internal class DayAggregate {
         "cohorts" to cohorts.map { (k, c) -> TelemetryPayload.cohortJson(k, c, store = true) },
         "coverage" to coverage.withIndex().filter { it.value > 0 }.associate { it.index.toString() to it.value },
         "downloads" to downloads.map { (k, d) -> linkedMapOf("revision" to k.revision, "build" to k.build, "profile" to k.profile, "bytes" to d.bytes,
-            "success" to d.success, "failed" to d.failed, "resumed" to d.resumed) },
+            "success" to d.success, "failed" to d.failed, "resumed" to d.resumed, "failure_reasons" to d.reasons) },
         "launches" to launches, "ayahs" to ayahs, "words" to words, "rule_checks" to ruleChecks, "rule_flags" to ruleFlags,
         "share" to linkedMapOf("asked" to shareAsked, "yes" to shareYes, "no" to shareNo),
         "promotions" to promotions.map { (k, c) -> Promo.json(k, c, store = true) },
@@ -602,7 +631,9 @@ internal class DayAggregate {
                 val o = x as Map<String, Any?>
                 a.downloads[DownloadKey(o["revision"] as String, o["profile"] as String, o["build"] as? String ?: "")] = DownloadCounts(
                     (o["bytes"] as? Double)?.toLong() ?: 0, (o["success"] as? Double)?.toInt() ?: 0,
-                    (o["failed"] as? Double)?.toInt() ?: 0, (o["resumed"] as? Double)?.toInt() ?: 0)
+                    (o["failed"] as? Double)?.toInt() ?: 0, (o["resumed"] as? Double)?.toInt() ?: 0,
+                    (o["failure_reasons"] as? Map<String, Any?>)?.entries?.mapNotNull { (k, v) -> (v as? Double)?.toInt()?.let { k to it } }
+                        ?.toMap(LinkedHashMap()) ?: LinkedHashMap())
             }
             fun n(v: Any?) = (v as? Double)?.toInt() ?: 0
             a.launches = n(m["launches"]); a.ayahs = n(m["ayahs"]); a.words = n(m["words"])
@@ -719,8 +750,8 @@ internal object TelemetryPayload {
         val kept = sorted.take(MAX_COHORTS).map { it.key to Cohort().apply { merge(it.value) } }.toMutableList()
         for (e in sorted.drop(MAX_COHORTS)) kept.last().second.merge(e.value)
         val dl = a.downloads.entries.toList()
-        val dlKept = dl.take(MAX_DOWNLOADS).map { it.key to DownloadCounts(it.value.bytes, it.value.success, it.value.failed, it.value.resumed) }
-        for (e in dl.drop(MAX_DOWNLOADS)) dlKept.last().second.let { d -> d.bytes += e.value.bytes; d.success += e.value.success; d.failed += e.value.failed; d.resumed += e.value.resumed }
+        val dlKept = dl.take(MAX_DOWNLOADS).map { it.key to it.value.copy() }
+        for (e in dl.drop(MAX_DOWNLOADS)) dlKept.last().second.add(e.value)
         val dev = LinkedHashMap<String, Any?>()
         dev["class"] = ctx.device.deviceClass
         ctx.device.soc?.let { dev["soc"] = it }
@@ -746,6 +777,9 @@ internal object TelemetryPayload {
             o["success"] = cap(d.success)
             o["failed"] = cap(d.failed)
             o["resumed"] = cap(d.resumed)
+            // 24.8: the failed ones by reason, zero reasons left out
+            val reasons = DownloadCounts.FAILURE_REASONS.mapNotNull { r -> d.reasons[r]?.takeIf { it > 0 }?.let { r to cap(it) } }
+            if (reasons.isNotEmpty()) o["failure_reasons"] = reasons.toMap(LinkedHashMap())
             o
         }
         // 2.0.1: the delta's id and counters, each left out when zero

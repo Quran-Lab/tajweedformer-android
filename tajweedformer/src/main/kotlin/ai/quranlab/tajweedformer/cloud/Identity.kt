@@ -39,8 +39,17 @@ internal data class DeviceProfile(
     val osVersion: String,
     /** `lt2|2_4|4_8|8_16|ge16`. */
     val ramTier: String? = null,
+    /** Contract 24.2 (error reports, native only): the model code as `Build.MODEL` says it, spaces as `_`
+     *  (`SM-A155F`, `Pixel_8`), never a name or a serial; null where the platform has none (the JVM). */
+    val modelCode: String? = null,
+    /** Contract 24.2: the process's ABI (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`; the desktop JVM `arm64`, `x86_64`). */
+    val abi: String? = null,
 ) {
     companion object {
+        /** [modelCode] from `Build.MODEL`: spaces as `_`; null unless it is a token of 24.2 (never cut into one). */
+        @JvmStatic
+        fun modelCode(model: String?): String? = model?.trim()?.replace(' ', '_')?.takeIf { ErrorRules.DEVICE_MODEL.matches(it) }
+
         private val TOKEN = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$")
 
         /** A token the schema takes from free text: unsafe characters dropped, at most 24. */

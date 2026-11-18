@@ -46,9 +46,9 @@ internal class QuranLabApi(
         val r = try {
             http.send(HttpRequest(method, base + path, h, bytes))
         } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}", e)
+            throw CloudException(null, "$method $path: ${e.message}", e, path)
         }
-        if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}")
+        if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}", path = path)
         return r
     }
 
@@ -83,7 +83,7 @@ internal class QuranLabApi(
         if (modelVersion != null) q.append("&model_version=${enc(modelVersion)}")
         val extra = if (etag != null) mapOf("if-none-match" to etag) else emptyMap()
         val r = call("GET", "/v1/config$q", cred, extra = extra, expectOk = false)
-        if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}")
+        if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}", path = "/v1/config")
         return r
     }
 
@@ -116,7 +116,7 @@ internal class QuranLabApi(
         cred.apply(h)
         h["content-type"] = "application/json"
         return try { http.send(HttpRequest(method, base + path, h, body)) } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}")
+            throw CloudException(null, "$method $path: ${e.message}", e, path)
         }
     }
 

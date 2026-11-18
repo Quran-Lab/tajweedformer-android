@@ -2,6 +2,8 @@ package ai.quranlab.tajweedformer
 
 import ai.quranlab.tajweedformer.accel.AcceleratorState
 import ai.quranlab.tajweedformer.cloud.CloudOptions
+import ai.quranlab.tajweedformer.cloud.ErrorCause
+import ai.quranlab.tajweedformer.cloud.ErrorRules
 import ai.quranlab.tajweedformer.cloud.ModelGate
 import ai.quranlab.tajweedformer.cloud.ModelRequestHeaders
 import ai.quranlab.tajweedformer.cloud.QuranLabCloud
@@ -111,10 +113,12 @@ public class TajweedClient internal constructor(
      * interrupted thread and fails with "cancelled"): a cancel is not an error of the app's call.
      */
     private suspend inline fun <T> tracked(body: () -> T): T = try {
-        guard(body)
+        guardQuiet(body)
     } catch (e: TajweedError) {
         currentCoroutineContext().ensureActive()
         lastErrorCode = e.code
+        // contract 24.1: the failure reached the app (a cancel did not: it left above as the coroutine's)
+        reachedApp(e)
         throw e
     }
 
@@ -408,7 +412,7 @@ public class TajweedClient internal constructor(
         cloud.modelVersion = version
         var cfg: RemoteConfig? = cloud.currentConfig
         // a config asked with another pin (or with none) does not say what the server has for this one
-        if (refresh || cfg == null || cfg.recommendedRevision == null || !cloud.configAskedWith(version)) cfg = cloud.refreshConfig()
+        if (refresh || cfg == null || cfg.recommendedRevision == null || !cloud.configAskedWith(version)) cfg = cloud.refreshConfig(silentReport = false)
         val appId = platform.cloud.app.bundleId
         // a refusal that stops the model (SPEC 15.3): no model, also not one on the device. One of a model request, once
         // the API has accepted the key again, is asked of the CDN again ([admit])
@@ -427,16 +431,38 @@ public class TajweedClient internal constructor(
                 Target(id, repo, build, cfg.recommendedVersion, folder, ModelStore.folderUrl(cfg.base ?: platform.modelsUrl, repo, build, folder))
             } else null
         } else null
-        if (fromConfig != null && (version == null || fromConfig.version == null || fromConfig.version == version || cfg?.pinUnavailable == version)) return fromConfig
+        if (fromConfig != null && (version == null || fromConfig.version == null || fromConfig.version == version || cfg?.pinUnavailable == version)) {
+            cloud.reportModel = fromConfig.version to fromConfig.build
+            return fromConfig
+        }
         val last = current()
-        if (last != null && (version == null || last.version == version) && File(dir(last), ModelManifest.FILE_NAME).isFile) return last
-        if (refused != null) throw refused
+        if (last != null && (version == null || last.version == version) && File(dir(last), ModelManifest.FILE_NAME).isFile) {
+            cloud.reportModel = last.version to last.build
+            return last
+        }
+        val cause = cloud.lastConfigCause
+        if (refused != null) throw refused.at(cause?.takeIf { it.reason == "refused" } ?: ErrorCause("config", "refused", errorCode = cloud.stopReason))
         // the server answered and offers this SDK no model build (none is published for it yet): not a missing
         // connection, and nothing to retry in a loop (the config refresh is the retry)
-        if (cfg != null && r == null) throw RecognizerException.ModelUnavailable()
+        if (cfg != null && r == null) throw RecognizerException.ModelUnavailable().at("config", "unavailable")
         // no answer because the system does not let the app use the network: that is what to fix, not the connection
-        if (cloud.lastConfigError == QuranLabCloud.NOT_PERMITTED) throw RecognizerException.NetworkNotPermitted()
-        throw RecognizerException.NeedsConnection()
+        if (cloud.lastConfigError == QuranLabCloud.NOT_PERMITTED) throw RecognizerException.NetworkNotPermitted().at(cause ?: ErrorCause("config", "network"))
+        // contract 24.4: an answer of the server (a 5xx, a 429, a 503 network_blocked, a redirect) and a config that does not
+        // verify, has expired or cannot be read are `download_failed` naming it; only no answer at all is `needs_connection`.
+        // The token gates the config (rule 3a): a token request that failed decides it the same way
+        if (cause != null && ErrorRules.codeFor(cause.stage, cause.reason, cause.httpStatus, "none", cause.errorCode) == "download_failed") {
+            throw RecognizerException.DownloadFailed("config", configFailure(cause)).at(cause)
+        }
+        throw RecognizerException.NeedsConnection().at(cause ?: ErrorCause("config", "network"))
+    }
+
+    /** What answered a config request that failed, for `download_failed`'s detail. */
+    private fun configFailure(c: ErrorCause): String = when (c.reason) {
+        "signature" -> "the signed config does not verify"
+        "expired" -> "the signed config has expired"
+        "parse" -> "the signed config cannot be read"
+        "timeout" -> "the server did not answer in time"
+        else -> c.httpStatus?.let { "the server answered $it" } ?: "the server's answer failed"
     }
 
     /** The protocol of the last answer to a model request of this Client (`diagnose().downloadProtocol`): in memory only. */
@@ -491,7 +517,28 @@ public class TajweedClient internal constructor(
     } catch (e: RecognizerException.DownloadFailed) {
         throw when {
             e.cause is NetworkNotPermitted -> RecognizerException.NetworkNotPermitted(e)
-            e.cause is java.io.IOException -> RecognizerException.NeedsConnection(e)
+            else -> specific(e, if (anyFileOf(store)) "partial" else "none")
+        }
+    }
+
+    /** Whether any file of the build is on the device (its kept files, or a part of one): contract 24.4's "nothing". */
+    private fun anyFileOf(store: ModelStore): Boolean = try {
+        store.root.walkTopDown().any { it.isFile && it.name != ModelManifest.FILE_NAME && it.length() > 0 }
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Contract 24.4: the code the app gets for a download that failed is the specific one for its cause and for what of
+     * the build is on the device ([onDevice]): `needs_connection` only when no request got an answer and nothing is on
+     * the device; a write on a full volume `storage_full`, another write that failed `storage_failed`; the rest stays.
+     */
+    private fun specific(e: RecognizerException.DownloadFailed, onDevice: String, need: Long = 0): TajweedError {
+        val c = ErrorCause.of(e)
+        return when (ErrorRules.codeFor(c.stage, c.reason, c.httpStatus, onDevice, c.errorCode)) {
+            "needs_connection" -> RecognizerException.NeedsConnection(e)
+            "storage_full" -> RecognizerException.StorageFull(need, try { platform.freeSpace?.invoke(modelsDir) ?: modelsDir.usableSpace } catch (_: Exception) { 0L }).at(c)
+            "storage_failed" -> RecognizerException.StorageFailed(e.path, e)
             else -> e
         }
     }
@@ -516,7 +563,7 @@ public class TajweedClient internal constructor(
         if (missing.isNotEmpty()) {
             val need = missing.sumOf { it.size + it.localSize }
             val free = platform.freeSpace?.invoke(store.root)
-            if (free != null && free < need) throw RecognizerException.StorageFull(need, free)
+            if (free != null && free < need) throw RecognizerException.StorageFull(need, free).at("storage", "quota")
             if (!background) owe(unmeteredOnly)
         }
         var got = false
@@ -532,8 +579,8 @@ public class TajweedClient internal constructor(
             // stopped: a download that resumes
             val x = if (e !is RecognizerException.DownloadFailed) e else when {
                 e.cause is NetworkNotPermitted -> RecognizerException.NetworkNotPermitted(e)
-                !got && e.cause is java.io.IOException -> RecognizerException.NeedsConnection(e)
-                else -> e
+                else -> specific(e, if (got || missing.size < ModelProfile.cpu(m, ctx).size || anyFileOf(store)) "partial" else "none",
+                    missing.sumOf { it.size + it.localSize })
             }
             if (!retryable(x)) settle(job = !background)
             throw x
@@ -576,7 +623,7 @@ public class TajweedClient internal constructor(
     /** Whether a download that failed this way may go on later by itself: the network, a failure of the server (5xx,
      *  after the call's own resumes), or the call was ended. */
     private fun retryable(e: TajweedError): Boolean = e is RecognizerException.NeedsConnection ||
-        (e is RecognizerException.DownloadFailed && (e.reason == "cancelled" || RetryPlan.resumable(e)))
+        (e is RecognizerException.DownloadFailed && (e.reason == "cancelled" || RetryPlan.resumable(e) || e.cause40?.stage == "config"))
 
     /**
      * Continues, blocking, a download of the model that the app started and did not finish (SDK 3.1.3): the platform's
@@ -648,7 +695,20 @@ public class TajweedClient internal constructor(
                 if (removalOwed.exists()) removeModelsForStop()
             },
         )
-        val m = TajweedModel.of(folder, host)
+        val m = try {
+            TajweedModel.of(folder, host)
+        } catch (e: TajweedError) {
+            // contract 24.3: the engine opening the model (a file it found damaged is the build's check, `verify`)
+            val oom = generateSequence<Throwable>(e) { it.cause }.take(8).any { it is OutOfMemoryError }
+            throw when (e) {
+                is RecognizerException.ChecksumMismatch -> e.at("verify", "hash")
+                is RecognizerException.SignatureInvalid -> e.at("verify", "signature")
+                is RecognizerException.ModelIncompatible -> e.at("model_open", "incompatible")
+                is RecognizerException.ModelMissing -> e.at("model_open", "missing")
+                is RecognizerException.ModelLoadFailed, is RecognizerException.ManifestInvalid -> e.at("model_open", "invalid")
+                else -> e.at("model_open", if (oom) "memory" else "engine")
+            }
+        }
         // a build promoted in an earlier launch loads and warms its accelerator now, in the background
         if (platform.accelerator != null) {
             Thread({ try { mc.startPromoted() } catch (_: Exception) {} }, "tajweedformer-npu-warm").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()

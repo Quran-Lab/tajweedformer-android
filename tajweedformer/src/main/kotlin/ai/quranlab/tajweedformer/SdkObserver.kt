@@ -179,6 +179,8 @@ internal data class DownloadResult(
     val ranged: Boolean = false,
     /** Body bytes per protocol the answers came over (`http/1.1`, `h2`, `h3`), with every protocol an answer came over. */
     val protocols: Map<String, Long> = emptyMap(),
+    /** A failed download's telemetry reason: `network`, `http`, `hash_mismatch`, `signature`, `storage`, `other`. */
+    val failureReason: String? = null,
 ) {
     /** The protocol that carried most of the bytes (also when none came), or null when no answer came. */
     val protocol: String? get() = protocols.entries.maxByOrNull { it.value }?.key

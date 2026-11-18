@@ -18,8 +18,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Runs [body]; whatever it throws leaves as a [TajweedError] (a coroutine's cancellation stays what it is). */
+/**
+ * Runs [body]; whatever it throws leaves as a [TajweedError] (a coroutine's cancellation stays what it is). This is
+ * where a failure reaches the app: it is counted as an error report.
+ */
 internal inline fun <T> guard(body: () -> T): T = try {
+    guardQuiet(body)
+} catch (e: TajweedError) {
+    reachedApp(e)
+    throw e
+}
+
+/** [guard] without the report, for a caller that reports the error itself once it knows it reaches the app. */
+internal inline fun <T> guardQuiet(body: () -> T): T = try {
     body()
 } catch (e: CancellationException) {
     throw e
@@ -102,7 +113,7 @@ public class TajweedSession internal constructor(
         } catch (e: CancellationException) {
             chunkChannel.close(RecognizerException.Cancelled())
         } catch (e: Throwable) {
-            chunkChannel.close(TajweedError.of(e))
+            chunkChannel.close(TajweedError.of(e).also { reachedApp(it) })
         } finally {
             taken.value = Int.MAX_VALUE
         }
@@ -389,6 +400,7 @@ public class TajweedSession internal constructor(
             pump.join()
             result.complete(TajweedHeads(heads.only(select), vocabulary, 0, options.topK, finalDecoded))
             settle(counts = reason != TajweedEvent.Ended.Reason.ERROR)
+            if (error != null) reachedApp(error)
             if (reason != null) eventChannel.trySend(TajweedEvent.Ended(reason, error))
         } catch (e: CancellationException) {
             inner.cancel()
@@ -397,6 +409,7 @@ public class TajweedSession internal constructor(
             throw e
         } catch (e: Throwable) {
             val failure = error ?: TajweedError.of(e)
+            reachedApp(failure)
             inner.cancel()
             settle(counts = false)
             result.completeExceptionally(failure)

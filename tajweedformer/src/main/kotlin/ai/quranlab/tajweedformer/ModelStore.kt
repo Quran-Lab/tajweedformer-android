@@ -49,20 +49,22 @@ internal class ModelStore @JvmOverloads constructor(
         if (refresh || !local.isFile) {
             try {
                 val bytes = fetchBytes(ModelManifest.FILE_NAME)
-                val m = ModelManifest.accept(bytes, verifier, expectBuild, expectVersion)
+                val m = try { ModelManifest.accept(bytes, verifier, expectBuild, expectVersion) } catch (x: TajweedError) { throw x.ofManifest("manifest") }
                 root.mkdirs()
                 val tmp = File(root, ModelManifest.FILE_NAME + ".tmp")
                 tmp.writeBytes(bytes)
                 Files.move(tmp.toPath(), local.toPath(), StandardCopyOption.REPLACE_EXISTING)
                 cached = m
                 return m
-            } catch (e: RecognizerException.DownloadFailed) {
-                if (!local.isFile) throw e
+            } catch (e: TajweedError) {
+                // contract 24.8: a failure of the manifest counts in the day's downloads too, under its build's version
+                manifestFailed(e)
+                if (e !is RecognizerException.DownloadFailed || !local.isFile) throw e
                 SdkEvents.emit { it.onError("manifest", e) }
             }
         }
-        if (!local.isFile) throw RecognizerException.ModelMissing("no ${ModelManifest.FILE_NAME} in ${root.path}")
-        val m = ModelManifest.accept(local.readBytes(), verifier, expectBuild, expectVersion)
+        if (!local.isFile) throw RecognizerException.ModelMissing("no ${ModelManifest.FILE_NAME} in ${root.path}").at("verify", "missing")
+        val m = try { ModelManifest.accept(local.readBytes(), verifier, expectBuild, expectVersion) } catch (x: TajweedError) { throw x.ofManifest("verify") }
         cached = m
         return m
     }
@@ -72,11 +74,32 @@ internal class ModelStore @JvmOverloads constructor(
         try {
             modelRequest(transport, baseUrl + path, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
                 val bytes = r.body.readBytes()
-                if (bytes.size > MAX_MANIFEST_BYTES) throw RecognizerException.DownloadFailed(path, "too large")
+                if (bytes.size > MAX_MANIFEST_BYTES) throw RecognizerException.DownloadFailed(path, "too large").at("manifest", "invalid_answer", r.code)
                 return bytes
             }
         } catch (e: IOException) {
-            throw RecognizerException.DownloadFailed(path, "network: ${e.message}", e)
+            throw RecognizerException.DownloadFailed(path, "network: ${e.message}", e).tagged(path, "network", e)
+        }
+    }
+
+    /** A manifest that did not verify, as its stage names it: fetched (`manifest`) or on the device (`verify`). */
+    private fun TajweedError.ofManifest(stage: String): TajweedError = when (this) {
+        is RecognizerException.SignatureInvalid -> at(stage, "signature")
+        is RecognizerException.ManifestInvalid -> at(stage, if (stage == "manifest") "parse" else "invalid")
+        is RecognizerException.ModelIncompatible -> at(stage, "incompatible")
+        is RecognizerException.ChecksumMismatch -> at(stage, "hash")
+        else -> this
+    }
+
+    /** A fetch of the manifest failed: one failed download of the build the config named. */
+    private fun manifestFailed(e: TajweedError) {
+        val build = expectBuild ?: return
+        try {
+            ModelIds.expect(build, expectVersion)
+            val reason = ai.quranlab.tajweedformer.cloud.ErrorRules.telemetryReason(ai.quranlab.tajweedformer.cloud.ErrorCause.of(e).reason)
+            val r = DownloadResult(ModelManifest.FILE_NAME, "manifest", 0, 0, 0, false, e.code, revision = build, failureReason = reason)
+            SdkEvents.emit { it.onDownloadFinished(r) }
+        } catch (_: Exception) {
         }
     }
 

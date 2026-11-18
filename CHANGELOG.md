@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.1.6
+
+Every analytics report reaches Quran Lab again, and every failure a learner meets now reaches Quran Lab as a small
+error report, so a problem in your app can be found without the learner's help. A few error codes are more exact. No
+call changes.
+
+- **Error reports.** When a call of the SDK fails for your app (any `TajweedError` except your own misuse:
+  `invalid_argument`, `client_exists`, `session_open`, `session_closed`, `cancelled`), or when the SDK goes on from a
+  failure without telling you (Quran Lab's server refused or failed the launch's config, a statistics report was
+  refused, a shared recording will not be uploaded), the SDK sends one short report: where the failure started, why,
+  the HTTP status, the exception's class, how many times it happened that day, and the device's model code, memory
+  tier, free space and ABI. Never audio, text, a name, an identifier, a path, a URL or an error message. At most one
+  report a day for each failure, with its count. Quran Lab can turn them off in the signed config; `Analytics.OFF`
+  keeps covering the analytics only.
+- **More exact error codes.** `needs_connection` now always means that no request got an answer and the model is
+  not on the device. When Quran Lab's server answered instead (a 5xx, a 429 or a redirect to the config or to
+  the app token asked for before it, or a config that does not verify or has expired), the call fails with
+  `download_failed`, and its message says what answered ("the server answered 503"); 3.1.5 said
+  `needs_connection`. A download that timed out is `download_failed` too. A model file
+  whose bytes do not match after its download is `checksum_mismatch` (it was `download_failed`), and a file that
+  cannot be written on the device fails at once with `storage_full` or `storage_failed` instead of being tried again
+  as a network failure. The advice for `download_failed` stands: call again later, the download resumes.
+- **Failed downloads count in your statistics**, by reason (network, server, hash, signature, storage).
+- **Fixed: Quran Lab refused some analytics reports whole, and the SDK deleted them.** Seen from 3.0.0 to 3.1.5: the
+  sample clips fetched beside a model at its first open were counted as a download of no model version, and an
+  accelerator fallback outside a take was counted under the backend `npu` without its chip. A refused report lost
+  the day's takes, minutes and launches with it. Both values are now put right.
+
 ## 3.1.5
 
 A stop of the app while the accelerator's build is prepared no longer turns the accelerator off for good, and the

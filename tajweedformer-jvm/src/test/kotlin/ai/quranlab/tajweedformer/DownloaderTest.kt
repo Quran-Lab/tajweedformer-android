@@ -211,8 +211,10 @@ class DownloaderTest : OpenChecked() {
         try {
             s.downloader.fetch(e)
             fail()
-        } catch (x: RecognizerException.DownloadFailed) {
-            assertTrue(x.reason, x.reason.contains("do not match") || x.reason.contains("more than"))
+        } catch (x: TajweedError) {
+            // contract 24.4 rule 6: a file whose hash differs is `checksum_mismatch` (until 4.0 `download_failed`)
+            assertTrue(x.message, x is RecognizerException.ChecksumMismatch ||
+                (x is RecognizerException.DownloadFailed && x.reason.contains("more than")))
         }
         assertFalse(File(root, fe.storedPath + ".part").exists())
         assertFalse(File(root, "frontend.zfw").exists())

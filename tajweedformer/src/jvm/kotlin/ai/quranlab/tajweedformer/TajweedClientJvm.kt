@@ -22,6 +22,18 @@ import java.io.File
  * `client.background()` and `client.foreground()` when the app has one. Set `options.appId` and
  * `options.appVersion` to the app's own.
  */
+/** The process's ABI as an error report names it: `arm64`, `x86_64` (`x86_64_mac` on a Mac), `x86`. */
+internal fun jvmAbi(arch: String? = System.getProperty("os.arch"), os: String? = System.getProperty("os.name")): String? {
+    val a = arch?.lowercase() ?: return null
+    val mac = os?.lowercase()?.startsWith("mac") == true
+    return when (a) {
+        "aarch64", "arm64" -> "arm64"
+        "amd64", "x86_64" -> if (mac) "x86_64_mac" else "x86_64"
+        "x86", "i386", "i686" -> "x86"
+        else -> null
+    }
+}
+
 @JvmOverloads
 public fun TajweedClient(key: String, storage: File, options: TajweedClientOptions = TajweedClientOptions()): TajweedClient {
     val dir = options.storage ?: storage
@@ -30,7 +42,7 @@ public fun TajweedClient(key: String, storage: File, options: TajweedClientOptio
         storage = dir,
         app = AppIdentity(options.appId ?: "ai.quranlab.tajweedformer.desktop", AppIdentity.cleanVersion(options.appVersion)),
         device = DeviceProfile(DeviceProfile.deviceClass(System.getProperty("os.arch") ?: "jvm"), null,
-            os.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: 1, os.take(32)),
+            os.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: 1, os.take(32), abi = jvmAbi()),
         contributorKeys = FileContributorKeyStore(File(dir, "keys")),
         secretBox = PlainSecretBox,
     )

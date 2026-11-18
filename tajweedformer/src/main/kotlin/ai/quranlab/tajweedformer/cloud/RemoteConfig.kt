@@ -230,7 +230,14 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
     }
 }
 
-internal class ConfigRejected(message: String) : Exception(message)
+internal class ConfigRejected(message: String) : Exception(message) {
+    /** The error report's reason: `expired`, `parse` (not a JSON object, not `v` 1), else `signature`. */
+    val reason: String get() = when {
+        message == "expired" -> "expired"
+        message == "body is not a JSON object" || message == "v is not 1" -> "parse"
+        else -> "signature"
+    }
+}
 
 /**
  * The last good signed config on disk (`<storage>/cloud/config.*`): the exact body, its signature,

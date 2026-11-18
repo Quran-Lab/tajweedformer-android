@@ -66,6 +66,8 @@ tasks.withType<Test>().configureEach {
     // except the copies kept in src/test/resources)
     for (k in listOf("TJ_V4_DIR", "TJ_V4_TRANSPORT_DIR", "TJ_TEST_PUBLIC_KEY", "TJ_NPU_DIR", "TJ_NPU_GOLDEN", "TJ_NPU_WORK", "TJ_NPU_2500_GOLDEN",
         "TJ_SELFTEST_TOKENS_OUT", "TJ_VECTORS_DIR", "TJ_ERRORS_JSON",
+        // contract section 24 (sdk_4.0.0/vectors of the contract): ErrorReports40VectorsTest compares its copy of errors_40.json
+        "TJ_VECTORS40_DIR",
         // the real reference table (ReferenceTableTest): the index of the local model folders, and the source table
         "TJ_LOCAL30", "TJ_EXPECTED_TJ3",
         // how many times SharingOffTest runs each of its cases (the shared file says 20; a race passes most single
