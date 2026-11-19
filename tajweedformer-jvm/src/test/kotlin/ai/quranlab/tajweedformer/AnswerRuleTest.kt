@@ -318,7 +318,8 @@ class AnswerRuleTest : OpenChecked() {
         // two "complete" ranges that are not the file's bytes
         ranges(root, ByteArray(bytesOf(large).size) { 0x44 })
         server.requests.clear()
-        assertEquals("a file whose stored ranges are not the file's passed", "download_failed", fails(s, e)?.code)
+        // contract 24.4 rule 6: a file whose hash differs is `checksum_mismatch` (until 4.0 `download_failed`)
+        assertEquals("a file whose stored ranges are not the file's passed", "checksum_mismatch", fails(s, e)?.code)
         assertEquals("only the missing range was asked for: ${server.of(BIG)}", 1, server.of(BIG).size)
         assertEquals("the set that failed its hash is still on the device", emptyList<String>(),
             root.walk().filter { it.isFile && it.name.contains(".part") }.map { it.name }.toList())

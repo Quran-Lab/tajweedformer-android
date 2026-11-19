@@ -27,8 +27,8 @@ import androidx.compose.ui.platform.ComposeView
 /**
  * The sheet's device check: an app's screen with the SDK's consent sheet over it, as the SDK shows it, the Views
  * dialog ([SharingDialogs.consentDialog], what `SharingDialogs.consent` shows) or the Compose sheet ([ConsentDialog],
- * what `SharingSheetHost` shows). A host starts it with the extras `kit` (views or compose), `lang`, `end` (open
- * scrolled to the end) and `guardian`, then ends the sheet with the system's own key and touch events (`adb shell
+ * what `SharingSheetHost` shows). A host starts it with the extras `kit` (views or compose), `lang` and `end` (open
+ * scrolled to the end), then ends the sheet with the system's own key and touch events (`adb shell
  * input`), a configuration change, the home key or a force-stop. Every step goes to the log under the tag `TJ_SHEET`:
  * `shown`, each `exit` with its [ai.quranlab.tajweedformer.sharing.SheetExit], `recreated`, `resumed` and the sheet's
  * geometry. No client, no network, no key: an ending is written to the log, not recorded anywhere.
@@ -37,7 +37,7 @@ class SheetHostActivity : ComponentActivity() {
     private val logTag = "TJ_SHEET"
     private var dialog: Dialog? = null
 
-    private class Shown(val copy: SharingCopy, val guardian: Boolean, val end: Boolean)
+    private class Shown(val copy: SharingCopy, val end: Boolean)
 
     private var compose by mutableStateOf<Shown?>(null)
 
@@ -59,7 +59,7 @@ class SheetHostActivity : ComponentActivity() {
         screen.addView(ComposeView(this).apply {
             setContent {
                 compose?.let { s ->
-                    ConsentDialog(s.copy, ConsentState.Variant.FIRST, s.guardian, SharingStyle(), startAtEnd = s.end) { exit ->
+                    ConsentDialog(s.copy, ConsentState.Variant.FIRST, SharingStyle(), startAtEnd = s.end) { exit ->
                         // as SharingSheetHost: the request is done
                         Log.i(logTag, "exit compose $exit")
                         compose = null
@@ -86,16 +86,15 @@ class SheetHostActivity : ComponentActivity() {
         val kit = i.getStringExtra("kit") ?: return
         val copy = SharingCopy.forLanguage(i.getStringExtra("lang") ?: "en")
         val end = i.getBooleanExtra("end", false)
-        val guardian = i.getBooleanExtra("guardian", false)
         if (kit == "views") {
-            val dlg = SharingDialogs.consentDialog(this, copy, ConsentState.Variant.FIRST, guardian, SharingTheme(), end) { Log.i(logTag, "exit views $it") }
+            val dlg = SharingDialogs.consentDialog(this, copy, ConsentState.Variant.FIRST, SharingTheme(), end) { Log.i(logTag, "exit views $it") }
             dialog = dlg
             dlg.show()
             dlg.window?.decorView?.postDelayed({ geometry(dlg) }, 1200)
         } else {
-            compose = Shown(copy, guardian, end)
+            compose = Shown(copy, end)
         }
-        Log.i(logTag, "shown $kit ${copy.lang} end=$end guardian=$guardian")
+        Log.i(logTag, "shown $kit ${copy.lang} end=$end")
     }
 
     /** The Views sheet as laid out on this screen: the insets it got, its top, its bar, the labels' lines. */

@@ -11,12 +11,10 @@ import android.graphics.Typeface
 import android.view.View
 import android.widget.Button
 import android.widget.ImageView
-import android.widget.Switch
 import android.widget.TextView
 import androidx.compose.foundation.shape.CutCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.semantics.Role
@@ -24,7 +22,6 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
-import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -37,8 +34,8 @@ import kotlin.math.abs
 /**
  * What the consent sheet's design asks of a drawing, checked on both of the SDK's drawings (the Views dialog and the
  * Compose sheet) as Android's own renderer lays them out: the deck's lines whole and nothing else, the name in every
- * language whatever the theme, both buttons the same size at every text size, the guardian's share button disabled
- * until the switch is on, the direction the deck's and not the device's, and the 4.5 to 1 fallback of an accent.
+ * language whatever the theme, both buttons the same size at every text size, both enabled from the start (SDK 4.0:
+ * one sheet for every app), the direction the deck's and not the device's, and the 4.5 to 1 fallback of an accent.
  */
 class SheetLayoutTest : SheetTestBase() {
     private val languages = SharingCopy.LANGUAGES
@@ -57,25 +54,25 @@ class SheetLayoutTest : SheetTestBase() {
     }
 
     @Test fun everyLineOfTheDeckIsDrawnWholeAndNothingElse() {
-        for (lang in languages) for (guardian in listOf(false, true)) for (variant in listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK)) {
-            val case = Case(lang, variant = variant, guardian = guardian)
-            val want = expectedLines(case.copy, variant, guardian)
+        for (lang in languages) for (variant in listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK)) {
+            val case = Case(lang, variant = variant)
+            val want = expectedLines(case.copy, variant)
             use(case)
             val (screen, _) = views(case)
             shoot(screen) {
-                assertEquals("views $lang guardian=$guardian $variant", want, screen.texts().map { it.text.toString() }.toSet())
+                assertEquals("views $lang $variant", want, screen.texts().map { it.text.toString() }.toSet())
             }
             val c = compose(case)
             shoot(c) {
                 val drawn = c.nodes(merged = false).mapNotNull { it.text() }.toSet()
-                assertEquals("compose $lang guardian=$guardian $variant", want, drawn)
+                assertEquals("compose $lang $variant", want, drawn)
             }
         }
     }
 
     /**
-     * SPEC 11.8: what both drawings draw, in each of the eight languages, in the learner's and the
-     * guardian's variant, first ask and reask, holds nowhere the sentence that deck 2026-11-12.1 added. The sentence is
+     * SPEC 11.8: what both drawings draw, in each of the eight languages, first ask and reask, holds
+     * nowhere the sentence that deck 2026-11-12.1 added. The sentence is
      * known only by its length and SHA-256 per language (the JVM tests' `sharing_vectors/deck_2026-11-12.1_added.json`,
      * made by the release tooling from the contract's archived deck); a drawn text holds it when a window of that
      * length has that hash.
@@ -93,21 +90,21 @@ class SheetLayoutTest : SheetTestBase() {
         fun holds(t: String, f: Pair<Int, String>): Boolean = (0..t.length - f.first).any { i ->
             md.digest(t.substring(i, i + f.first).toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) } == f.second
         }
-        for (lang in languages) for (guardian in listOf(false, true)) for (variant in listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK)) {
-            val case = Case(lang, variant = variant, guardian = guardian)
+        for (lang in languages) for (variant in listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK)) {
+            val case = Case(lang, variant = variant)
             val f = added.getValue(lang)
             use(case)
             val (screen, _) = views(case)
             shoot(screen) {
                 val drawn = screen.texts().map { it.text.toString() }
                 assertTrue("views $lang: nothing drawn", drawn.size > 5)
-                assertTrue("views $lang guardian=$guardian $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
+                assertTrue("views $lang $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
             }
             val c = compose(case)
             shoot(c) {
                 val drawn = c.nodes(merged = false).mapNotNull { it.text() }
                 assertTrue("compose $lang: nothing drawn", drawn.size > 5)
-                assertTrue("compose $lang guardian=$guardian $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
+                assertTrue("compose $lang $variant: the sentence that deck 2026-11-12.1 added is drawn", drawn.none { holds(it, f) })
             }
         }
     }
@@ -119,10 +116,10 @@ class SheetLayoutTest : SheetTestBase() {
             titleTypeface = Typeface.MONOSPACE, dark = true)
         val style = SharingStyle(container = Color(0xFF101820), content = Color(0xFFF0E6D2), accent = Color(0xFFE3B26A), shape = CutCornerShape(4.dp),
             secondaryContent = Color(0xFFB0A890), cornerRadius = 4.dp, titleFont = FontFamily.Monospace, bodyFont = FontFamily.Serif, dark = true)
-        for (lang in languages) for (themed in listOf(false, true)) for (guardian in listOf(false, true)) {
-            val case = if (themed) Case(lang, guardian = guardian, theme = everything, style = style, dark = true) else Case(lang, guardian = guardian)
+        for (lang in languages) for (themed in listOf(false, true)) {
+            val case = if (themed) Case(lang, theme = everything, style = style, dark = true) else Case(lang)
             val c = case.copy
-            val title = c[if (guardian) "sheet.guardian.title" else "sheet.title"]
+            val title = c["sheet.title"]
             use(case)
             val (screen, _) = views(case)
             shoot(screen) {
@@ -154,17 +151,17 @@ class SheetLayoutTest : SheetTestBase() {
         }
     }
 
-    /** At 100 % and 200 % text, on the 320 dp phone, in every language and both variants: same width, same height, two lines at most. */
+    /** At 100 % and 200 % text, on the 320 dp phone, in every language: same width, same height, two lines at most. */
     @Test fun bothButtonsAreTheSameSize() {
-        for (scale in listOf(1f, 2f)) for (lang in languages) for (guardian in listOf(false, true)) {
-            val case = Case(lang, guardian = guardian, fontScale = scale, screen = Screens.NARROW)
+        for (scale in listOf(1f, 2f)) for (lang in languages) {
+            val case = Case(lang, fontScale = scale, screen = Screens.NARROW)
             val c = case.copy
             use(case)
             val (screen, frame) = views(case)
             shoot(screen) {
                 val share = frame.panel.bar.share
                 val notNow = frame.panel.bar.notNow
-                val what = "views $lang guardian=$guardian ${scale}x"
+                val what = "views $lang ${scale}x"
                 assertEquals("$what: width", share.width, notNow.width)
                 assertEquals("$what: height", share.height, notNow.height)
                 assertEquals("$what: the same type in both labels", share.textSize, notNow.textSize, 0f)
@@ -176,9 +173,9 @@ class SheetLayoutTest : SheetTestBase() {
             val v = compose(case)
             shoot(v) {
                 val nodes = v.nodes()
-                val share = nodes.button(c[if (guardian) "sheet.guardian.share" else "sheet.share"])
+                val share = nodes.button(c["sheet.share"])
                 val notNow = nodes.button(c["sheet.not_now"])
-                val what = "compose $lang guardian=$guardian ${scale}x"
+                val what = "compose $lang ${scale}x"
                 assertEquals("$what: width", share.rect().width, notNow.rect().width, 0.5f)
                 assertEquals("$what: height", share.rect().height, notNow.rect().height, 0.5f)
                 assertTrue("$what: at least 52 dp", share.rect().height >= px(SheetDesign.BUTTON_HEIGHT) - 1)
@@ -194,7 +191,7 @@ class SheetLayoutTest : SheetTestBase() {
      * handle, the handle, 8 below) is the sheet's background, the handle's own pixels aside. Both drawings.
      */
     @Test fun nothingOfTheColumnShowsInTheGrabbersRow() {
-        for (case in listOf(Case("en", end = true), Case("en", guardian = true, end = true), Case("ar", end = true, dark = true),
+        for (case in listOf(Case("en", end = true), Case("ar", end = true, dark = true),
             Case("en", fontScale = 2f, end = true))) {
             use(case)
             val bg = case.theme.look(ctx, case.copy).colors.background or (0xFF shl 24)
@@ -216,13 +213,17 @@ class SheetLayoutTest : SheetTestBase() {
                         off++
                     }
                 }
-                assertEquals("$name ${case.lang} ${case.fontScale}x guardian=${case.guardian}: pixels in the grabber's row that are not the background, first $first", 0, off)
+                assertEquals("$name ${case.lang} ${case.fontScale}x: pixels in the grabber's row that are not the background, first $first", 0, off)
             }
         }
     }
 
-    @Test fun theShareButtonIsDisabledUntilTheGuardiansSwitchIsOn() {
-        val case = Case("en", guardian = true, end = true)
+    /**
+     * SDK 4.0: one sheet for every app, with no switch in it. Both buttons are enabled from the
+     * start, and each calls its own answer once.
+     */
+    @Test fun bothButtonsAreEnabledAndEachCallsItsOwnAnswer() {
+        val case = Case("en", end = true)
         val c = case.copy
         use(case)
         var shared = 0
@@ -231,46 +232,24 @@ class SheetLayoutTest : SheetTestBase() {
         shoot(screen) {
             val share = frame.panel.bar.share
             val notNow = frame.panel.bar.notNow
-            val sw = screen.all<SheetSwitch>().single()
-            val row = sw.parent as View
-            assertFalse("the share button starts disabled", share.isEnabled)
-            assertEquals(SheetDesign.DISABLED_ALPHA, share.alpha, 0f)
-            assertTrue("Not now is always enabled", notNow.isEnabled && notNow.alpha == 1f)
-            assertFalse(sw.isChecked)
-            val info = row.createAccessibilityNodeInfo()
-            assertEquals("the row is one switch for TalkBack", Switch::class.java.name, info.className)
-            assertTrue(info.isCheckable && !info.isChecked)
-            row.performClick()
-            assertTrue("the switch on enables share", sw.isChecked && share.isEnabled && share.alpha == 1f)
-            assertTrue(row.createAccessibilityNodeInfo().isChecked)
-            row.performClick()
-            assertFalse("the switch off disables it again", sw.isChecked || share.isEnabled)
-            row.performClick()
+            assertTrue("no switch on the sheet", screen.all<SheetSwitch>().isEmpty())
+            assertTrue("share is enabled", share.isEnabled && share.alpha == 1f)
+            assertTrue("Not now is enabled", notNow.isEnabled && notNow.alpha == 1f)
             share.performClick()
             notNow.performClick()
             assertEquals("each button calls its own answer once", 1 to 1, shared to declined)
         }
         val v = compose(case, onShare = { shared++ }, onNotNow = { declined++ })
-        val enabled = ArrayList<Boolean>()
-        shoot(v, count = 4) { frame ->
+        shoot(v) {
             val nodes = v.nodes()
-            val share = nodes.button(c["sheet.guardian.share"])
+            val share = nodes.button(c["sheet.share"])
             val notNow = nodes.button(c["sheet.not_now"])
-            val sw = nodes.single { it.config.getOrNull(SemanticsProperties.Role) == Role.Switch }
-            enabled += !share.config.contains(SemanticsProperties.Disabled)
-            assertFalse("Not now is always enabled", notNow.config.contains(SemanticsProperties.Disabled))
-            assertEquals("the switch's row reads its line", c["sheet.guardian.confirm"], sw.text())
-            if (frame == 0) {
-                assertEquals(ToggleableState.Off, sw.config[SemanticsProperties.ToggleableState])
-                sw.config[SemanticsActions.OnClick].action!!.invoke()
-                Snapshot.sendApplyNotifications()
-            } else if (frame == 3) {
-                assertEquals(ToggleableState.On, sw.config[SemanticsProperties.ToggleableState])
-                share.config[SemanticsActions.OnClick].action!!.invoke()
-                notNow.config[SemanticsActions.OnClick].action!!.invoke()
-            }
+            assertTrue("no switch on the sheet", nodes.none { it.config.getOrNull(SemanticsProperties.Role) == Role.Switch })
+            assertFalse("share is enabled", share.config.contains(SemanticsProperties.Disabled))
+            assertFalse("Not now is enabled", notNow.config.contains(SemanticsProperties.Disabled))
+            share.config[SemanticsActions.OnClick].action!!.invoke()
+            notNow.config[SemanticsActions.OnClick].action!!.invoke()
         }
-        assertEquals("compose: disabled until the switch, then enabled: $enabled", listOf(false, true), listOf(enabled.first(), enabled.last()))
         assertEquals("compose: each button calls its own answer once", 2 to 2, shared to declined)
     }
 
@@ -398,7 +377,7 @@ class SheetLayoutTest : SheetTestBase() {
      * neither cuts a glyph (the pictures 08 show both).
      */
     @Test fun theViewsAndComposeDrawingsAgree() {
-        for (case in listOf(Case("en"), Case("ar"), Case("en", guardian = true, end = true), Case("fr", variant = ConsentState.Variant.REASK),
+        for (case in listOf(Case("en"), Case("ar"), Case("en", end = true), Case("fr", variant = ConsentState.Variant.REASK),
             Case("en", screen = Screens.NARROW), Case("ar", screen = Screens.TABLET, dark = true))) {
             val c = case.copy
             use(case)
@@ -410,21 +389,21 @@ class SheetLayoutTest : SheetTestBase() {
             }
             val v = compose(case)
             shoot(v) {
-                val lines = expectedLines(c, case.variant, case.guardian)
+                val lines = expectedLines(c, case.variant)
                 for (n in v.nodes(merged = false)) {
                     val t = n.text() ?: continue
                     if (t !in lines) continue
                     val want = placed[t] ?: error("views did not draw: $t")
                     val got = n.rect()
                     // a button's label is centred in its button: compare the buttons (merged) instead
-                    if (t == c["sheet.not_now"] || t == c[if (case.guardian) "sheet.guardian.share" else "sheet.share"]) continue
-                    val what = "${case.lang} ${if (case.guardian) "guardian " else ""}${case.fontScale}x: \"${t.take(24)}\""
+                    if (t == c["sheet.not_now"] || t == c["sheet.share"]) continue
+                    val what = "${case.lang} ${case.fontScale}x: \"${t.take(24)}\""
                     assertEquals("$what top", want[1].toFloat(), got.top, 3f)
                     assertEquals("$what height", (want[3] - want[1]).toFloat(), got.height, 3f)
                     if (c.rtl) assertEquals("$what right", want[2].toFloat(), got.right, 3f) else assertEquals("$what left", want[0].toFloat(), got.left, 3f)
                 }
                 val nodes = v.nodes()
-                val share = nodes.button(c[if (case.guardian) "sheet.guardian.share" else "sheet.share"]).rect()
+                val share = nodes.button(c["sheet.share"]).rect()
                 val bar = placed["#bar"]!!
                 assertTrue("${case.lang}: the share button sits in the bar in both", abs(share.top - (bar[1] + px(SheetDesign.DIVIDER + SheetDesign.BAR_TOP))) <= 3f)
             }

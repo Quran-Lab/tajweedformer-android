@@ -78,7 +78,8 @@ class SharingTakesTest : OpenChecked() {
     }
 
     private fun end(c: QuranLabCloud, completed: Boolean = true) =
-        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = true))
+        // SDK 4.0: a completed session is one with speech (SHARE_ASK_40 20.2)
+        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = true, speechFrames = if (completed) 250 else 0))
 
     /** One take: started now, its audio, ended when the audio is through. */
     private fun take(c: QuranLabCloud, x: FloatArray, rate: Int = 16_000, completed: Boolean = true) {
@@ -834,7 +835,7 @@ class SharingTakesTest : OpenChecked() {
     @Test fun audioWaitingForTheEncoderIsBounded() {
         val c = cloud()
         val gate = java.util.concurrent.CountDownLatch(1)
-        val capture = ShareCapture(c.sharing.outbox, { _, _ -> ByteArray(0) }, "built_in", { gate.await(); true }, catchUpMs = 50)
+        val capture = ShareCapture(c.sharing.outbox, { _, _, _ -> ByteArray(0) }, "built_in", { gate.await(); true }, catchUpMs = 50)
         val second = FloatArray(16_000)
         try {
             var most = 0L
@@ -854,7 +855,7 @@ class SharingTakesTest : OpenChecked() {
         assertFalse("nothing of it is kept", capture.folder.exists())
 
         // an encoder that keeps up is never the limit: three minutes of audio as fast as it is given, all of it encoded
-        val live = ShareCapture(c.sharing.outbox, { rate, route ->
+        val live = ShareCapture(c.sharing.outbox, { rate, route, _ ->
             ShareCapture.sessionJson("4.0.0", "mock", null, "share-2026-11-09", "c".repeat(32), null, null, "2026-11-11", "phone", 14, rate, route)
         }, "built_in", { true })
         repeat(180) { live.append(second, 0, second.size, 16_000) }
@@ -906,8 +907,24 @@ class SharingTakesTest : OpenChecked() {
         assertEquals(takeMaps(0 to 0, 2_500 to 7_000), stub.takes[joined])
         assertEquals(1, settle(c, apart).takes)
 
-        // not a whole number from 0 to 10000: the default, 3000
-        for (bad in listOf<Any>("5", 20_000, 2.5, true)) {
+        // SDK 4.0 (section 23): 15000, Quran Lab's window, joins a take 12 s later, and the take list the server takes
+        // (gaps up to 60000) carries the 12000
+        stub.flags = stub.flags + ("share_join_ms" to 15_000)
+        c.refreshConfig()
+        assertEquals(15_000, c.currentConfig!!.flags.shareJoinMs)
+        take(c, noise(2.5))
+        now += 12_000
+        take(c, noise(2.5))
+        val long = open(c)
+        now += 15_001
+        take(c, noise(2.5))
+        assertNotEquals("15001 ms later: a new recording", long, open(c))
+        windowPasses(c, 15_000)
+        assertEquals(2, settle(c, long).takes)
+        assertEquals(takeMaps(0 to 0, 2_500 to 12_000), stub.takes[long])
+
+        // not a whole number from 0 to 60000: the default, 3000
+        for (bad in listOf<Any>("5", 60_001, 2.5, true)) {
             stub.flags = stub.flags + ("share_join_ms" to bad)
             c.refreshConfig()
             assertEquals("share_join_ms $bad", 3_000, c.currentConfig!!.flags.shareJoinMs)
@@ -950,7 +967,7 @@ class SharingTakesTest : OpenChecked() {
         val revision = open(c)
         assertNotEquals("another model revision", rate, revision)
         now += 500
-        c.sharing.state.grant("share-2026-11-01", byGuardian = false)
+        c.sharing.state.grant("share-2026-11-01")
         take(c, noise(2.5, 48_000), 48_000)
         val consent = open(c)
         assertNotEquals("another consent version", revision, consent)
@@ -987,7 +1004,7 @@ class SharingTakesTest : OpenChecked() {
         stub.batch = 6
         val c = cloud()
         val shown = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { synchronized(shown) { shown.add(it) } }
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); synchronized(shown) { shown.add(it) } }
         val sessions = c.sharing.state.sessions
         take(c, noise(12.0))
         val id = open(c)

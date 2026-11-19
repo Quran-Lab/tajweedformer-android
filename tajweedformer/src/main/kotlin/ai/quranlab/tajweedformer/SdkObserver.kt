@@ -31,18 +31,9 @@ internal interface SdkObserver {
     /** A recognizer opened its engines (the CPU engine, and the NPU when chosen). */
     fun onModelLoad(load: ModelLoadInfo) {}
 
-    /** The accelerator's state changed: preparing (with its stage), ready (with its time to ready), disabled (with
-     *  the reason), or cpu (none for this device). */
-    fun onAcceleratorState(state: ai.quranlab.tajweedformer.accel.AcceleratorState, key: ai.quranlab.tajweedformer.accel.AcceleratorKey) {}
 
-    /** A promotion attempt ended: promoted, or failed at a stage (the `promotions` telemetry; a failure is an incident). */
-    fun onPromotion(event: PromotionEvent) {}
 
-    /** A session switched from the accelerator to the CPU (the `promotions` telemetry's failovers, and an incident). */
-    fun onFailover(event: AcceleratorFailoverEvent) {}
 
-    /** The CPU confirmed a blank stretch of an accelerator take (the `promotions` telemetry's `blank_confirmed_ok`). */
-    fun onBlankConfirmed(event: BlankConfirmedEvent) {}
 
     /**
      * The audio of a take exactly as the app pushed it, before any resampling: mono float in -1..1 at
@@ -110,6 +101,8 @@ internal data class SessionStats(
     val audioMs: Long = 0,
     /** The compute time of the take's chunks, each in whole microseconds, summed. */
     val computeUs: Long = 0,
+    /** The `Ended` reason of a take that ended by itself (`SILENCE`, `BACKGROUND`, ...), null after the app's finish. */
+    val endedBy: String? = null,
 ) {
     val rtf: Double get() = if (audioSeconds > 0) computeSeconds / audioSeconds else 0.0
     val meanChunkMs: Double get() = if (chunks > 0) 1000.0 * computeSeconds / chunks else 0.0
@@ -179,6 +172,8 @@ internal data class DownloadResult(
     val ranged: Boolean = false,
     /** Body bytes per protocol the answers came over (`http/1.1`, `h2`, `h3`), with every protocol an answer came over. */
     val protocols: Map<String, Long> = emptyMap(),
+    /** A failed download's telemetry reason: `network`, `http`, `hash_mismatch`, `signature`, `storage`, `other`. */
+    val failureReason: String? = null,
 ) {
     /** The protocol that carried most of the bytes (also when none came), or null when no answer came. */
     val protocol: String? get() = protocols.entries.maxByOrNull { it.value }?.key

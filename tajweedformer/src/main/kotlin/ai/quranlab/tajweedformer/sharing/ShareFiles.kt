@@ -9,7 +9,8 @@ import java.security.MessageDigest
  * The files of one shared session in its outbox folder (`<storage>/outbox/<id>/`), as the Swift
  * SDK lays them out: `session.json` (what POST /v1/uploads gets), `capture.json` (the pre-skip and,
  * since 2.0.1, the bit rate of every segment opened so far, written when a segment opens so recovery
- * can read it), `seg-NNNNN.opus` and a marker `seg-NNNNN.json` per closed segment (`n`, `bytes`,
+ * can read it; SDK 4.0: `codec` and `rate` for a FLAC recording), `seg-NNNNN.opus` (`seg-NNNNN.oga` for FLAC,
+ * SHARING_40.md 19.4) and a marker `seg-NNNNN.json` per closed segment (`n`, `bytes`,
  * `sha256`, `granule`, `bitrate`), `end.json` once the session ended, and the outbox's own `item.json`.
  * Since 2.0.3 a recording that holds two or more takes also has `takes.json` (`{"takes":[{"start_ms","gap_ms"}]}`,
  * rewritten when a take joins), which the outbox sends after the last segment.
@@ -21,6 +22,37 @@ internal object ShareFiles {
     const val TAKES = "takes.json"
 
     fun name(n: Int): String = "seg-%05d".format(n)
+
+    /** The segment files' suffix: Opus, or SDK 4.0's Ogg FLAC (SHARING_40.md 19.4.4). */
+    const val OPUS = ".opus"
+    const val FLAC = ".oga"
+
+    /** The audio block of the recording's `session.json` (kept until the item goes), or null. */
+    private fun audio(folder: File): Map<*, *>? = readJson(File(folder, SESSION))?.get("audio") as? Map<*, *>
+
+    /** Whether the recording in [folder] is FLAC: its `session.json` says so (it stays after the upload), else its
+     *  `capture.json` (an Opus one has no `codec`). */
+    fun flac(folder: File): Boolean =
+        audio(folder)?.let { it["codec"] == "flac" } ?: (readJson(File(folder, CAPTURE))?.get("codec") == "flac")
+
+    /** The suffix of the segments of the recording in [folder]. */
+    fun suffix(folder: File): String = if (flac(folder)) FLAC else OPUS
+
+    /** Segment [n]'s file name in [folder]. */
+    fun segment(folder: File, n: Int): String = name(n) + suffix(folder)
+
+    /** The rate of the recording's granule positions: 48000 for Opus, the capture rate for FLAC. */
+    fun granuleRate(folder: File): Int {
+        if (!flac(folder)) return 48_000
+        val r = (audio(folder)?.get("sample_rate") as? Double) ?: (readJson(File(folder, CAPTURE))?.get("rate") as? Double)
+        return r?.toInt()?.takeIf { it > 0 } ?: 48_000
+    }
+
+    /** The samples at the start the granule positions count but the audio does not: Opus' pre-skip, 0 for FLAC. */
+    fun preSkip(folder: File): Long {
+        if (flac(folder)) return 0
+        return (readJson(File(folder, CAPTURE))?.get("preSkip") as? Double)?.toLong() ?: 312
+    }
 
     /** A closed segment: size, hash, where the stream stood, and its bit rate (null in a 2.0.0 marker: 192 kbit/s). */
     data class Marker(val n: Int, val bytes: Long, val sha256: String, val granule: Long, val bitrate: Int? = null)
@@ -58,7 +90,7 @@ internal object ShareFiles {
 
     /** Closes segment [n]: its marker, from the file as it is on disk. */
     fun mark(folder: File, n: Int, granule: Long, bitrate: Int? = null) {
-        val (bytes, sha) = sha256(File(folder, name(n) + ".opus")) ?: throw java.io.IOException("no segment $n")
+        val (bytes, sha) = sha256(File(folder, segment(folder, n))) ?: throw java.io.IOException("no segment $n")
         val o = linkedMapOf<String, Any?>("n" to n, "bytes" to bytes, "sha256" to sha, "granule" to granule)
         bitrate?.let { o["bitrate"] = it }
         writeJson(File(folder, name(n) + ".json"), o)
@@ -68,18 +100,23 @@ internal object ShareFiles {
      * `capture.json`: the pre-skip, the bit rate of each segment opened so far, and [consent], the count of consent
      * changes at the recording's creation ([ConsentState.changes]). The file stays on the device; it is never sent.
      */
-    fun writeCapture(folder: File, preSkip: Int, bitrates: List<Int>, consent: Int = 0) =
-        writeJson(File(folder, CAPTURE), linkedMapOf("preSkip" to preSkip, "bitrates" to bitrates, "consent" to consent))
+    fun writeCapture(folder: File, preSkip: Int, bitrates: List<Int>, consent: Int = 0, flacRate: Int? = null) =
+        writeJson(File(folder, CAPTURE), linkedMapOf<String, Any?>("preSkip" to preSkip, "bitrates" to bitrates, "consent" to consent).apply {
+            if (flacRate != null) {
+                put("codec", "flac")
+                put("rate", flacRate)
+            }
+        })
 
     /** The count of consent changes a recording was made under; 0 for one made before SDK 3.0.1. */
     fun stamp(folder: File): Int = (readJson(File(folder, CAPTURE))?.get("consent") as? Double)?.toInt() ?: 0
 
-    /** Seconds of audio in [markers] (from their granule positions; segment 1 from 0), those [skip] says not to count left out. */
-    fun seconds(markers: List<Marker>, skip: (Marker) -> Boolean = { false }): Double {
+    /** Seconds of audio in [markers] (from their granule positions at [rate]; segment 1 from 0), those [skip] says not to count left out. */
+    fun seconds(markers: List<Marker>, rate: Int = 48_000, skip: (Marker) -> Boolean = { false }): Double {
         var prev = 0L
         var s = 0.0
         for (m in markers) {
-            if (!skip(m)) s += maxOf(0L, m.granule - prev) / 48_000.0
+            if (!skip(m)) s += maxOf(0L, m.granule - prev) / rate.toDouble()
             prev = m.granule
         }
         return s
@@ -114,7 +151,7 @@ internal object ShareFiles {
     /**
      * The takes of a recording, or null when it has one take (no file) or the file is not a take list: the first
      * entry with gap 0 and `start_ms` 0 to [MAX_FIRST_START_MS] (its pre-roll, SDK 3.0: at most a second; the server
-     * takes up to 5000), `start_ms` strictly increasing, each gap 0 to 10000, at most [TakeJoin.MAX_TAKES] entries.
+     * takes up to 5000), `start_ms` strictly increasing, each gap 0 to 60000, at most [TakeJoin.MAX_TAKES] entries.
      */
     fun takes(folder: File): List<Take>? {
         val list = readJson(File(folder, TAKES))?.get("takes") as? List<*> ?: return null
@@ -153,13 +190,16 @@ internal object ShareFiles {
     fun recover(folder: File): Boolean {
         val cap = readJson(File(folder, CAPTURE))
         if (cap == null) { folder.deleteRecursively(); return false }
-        val preSkip = (cap["preSkip"] as? Double)?.toLong() ?: 312
+        val preSkip = preSkip(folder)
+        val rate = granuleRate(folder)
+        val suffix = suffix(folder)
         val bitrates = (cap["bitrates"] as? List<*>)?.map { (it as? Double)?.toInt() } ?: emptyList()
         val marked = markers(folder).map { it.n }.toSet()
-        val open = (folder.listFiles() ?: emptyArray()).filter { it.name.matches(Regex("^seg-\\d{5,}\\.opus$")) }
-            .mapNotNull { it.name.substring(4, it.name.length - 5).toIntOrNull() }.filter { it !in marked }.sorted()
+        val open = (folder.listFiles() ?: emptyArray()).filter { it.name.startsWith("seg-") && it.name.endsWith(suffix) }
+            .mapNotNull { it.name.substring(4, it.name.length - suffix.length).takeIf { d -> d.length >= 5 && d.all(Char::isDigit) }?.toIntOrNull() }
+            .filter { it !in marked }.sorted()
         for (n in open) {
-            val audio = File(folder, name(n) + ".opus")
+            val audio = File(folder, name(n) + suffix)
             val d = try { audio.readBytes() } catch (_: Exception) { ByteArray(0) }
             val (keep, granule) = wholePages(d)
             if (keep == 0) { audio.delete(); continue }
@@ -168,7 +208,7 @@ internal object ShareFiles {
         }
         val last = markers(folder).lastOrNull()
         if (last == null) { folder.deleteRecursively(); return false }
-        val ms = maxOf(0L, last.granule - preSkip) / 48
+        val ms = maxOf(0L, last.granule - preSkip) * 1000 / rate
         trimTakes(folder, ms)
         writeEnd(folder, End(ms.toInt(), false))
         return true

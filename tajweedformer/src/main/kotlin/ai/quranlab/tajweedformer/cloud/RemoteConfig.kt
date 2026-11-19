@@ -17,7 +17,7 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
     val expiresAt: Long get() = (raw["expires_at"] as? Double)?.toLong() ?: 0
     val flags: Flags = Flags.parse(raw["flags"])
 
-    /** The model to load: `{model, model_id, folder, revision, source}`, or null. */
+    /** The model to load: `{model, model_id, folder, revision, version, source}` and, for SDK 4.0, `key_id`; or null. */
     @Suppress("UNCHECKED_CAST")
     val recommended: Map<String, Any?>? get() = raw["recommended"] as? Map<String, Any?>
 
@@ -34,6 +34,12 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
      */
     val inferenceContext: String? get() = ((raw["inference"] as? Map<*, *>)?.get("context") as? String)?.takeIf { it.isNotEmpty() }
 
+    /**
+     * `share_ask` (SHARE_ASK_40 20.3): at the top level of a 4.0 config, never in `flags`; as it came (null when
+     * absent), read field by field by [ai.quranlab.tajweedformer.sharing.ShareAsk.resolveConfig].
+     */
+    val shareAsk: Any? get() = raw["share_ask"]
+
     /** `flags.min_sdk`: the oldest SDK version the server serves this app's platform, when it sets one. */
     val minSdk: String? get() = ((raw["flags"] as? Map<*, *>)?.get("min_sdk") as? String)?.takeIf { ai.quranlab.tajweedformer.ModelManifest.isVersion(it) }
 
@@ -44,23 +50,10 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
             return if (p["status"] == "unavailable") p["version"] as? String else null
         }
 
-    /** Where model files are served (qlab-api signs it): `https://cdn.quranlab.ai/models`, or null when absent or not https. */
-    val base: String? get() = (raw["base"] as? String)?.takeIf { safeBase.matches(it) }
-
-    private val safeBase = Regex("^https://[A-Za-z0-9.-]+(:\\d+)?(/[A-Za-z0-9._~/-]*)?$")
-
     /**
-     * The recommended model's folder URL for [ai.quranlab.tajweedformer.ModelStore]: [base] (else [fallback]) +
-     * `/{model}/{revision}/{folder}/`. Null when the config recommends no model.
+     * The key id of the recommended build, or null. The 4.0 config names no folder for models (no `base`): the lease answer does.
      */
-    fun modelBaseUrl(fallback: String = ai.quranlab.tajweedformer.ModelStore.MODELS_URL): String? {
-        val r = recommended ?: return null
-        val model = r["model"] as? String ?: return null
-        val rev = r["revision"] as? String ?: return null
-        val folder = r["folder"] as? String ?: (r["model_id"] as? String)?.let { "sdk/$it" } ?: return null
-        return ai.quranlab.tajweedformer.ModelStore.folderUrl(base ?: fallback, model, rev, folder)
-    }
-
+    val recommendedKeyId: String? get() = (recommended?.get("key_id") as? String)?.takeIf { KEY_ID.matches(it) }
 
     @Suppress("UNCHECKED_CAST")
     val denylist: List<Map<String, Any?>> get() = (raw["denylist"] as? List<Any?>)?.mapNotNull { it as? Map<String, Any?> } ?: emptyList()
@@ -163,7 +156,7 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
         val cappedLimits: Map<String, Any?> = emptyMap(),
         /**
          * `share_join_ms` (SDK 2.0.3): how long a shared recording stays open for the next take, in ms. A whole number
-         * 0 to 10000; absent or anything else 3000; 0 never joins takes.
+         * 0 to 60000 (SDK 4.0, section 23; 3.x: 0 to 10000); absent or anything else 3000; 0 never joins takes.
          */
         val shareJoinMs: Int = ai.quranlab.tajweedformer.sharing.TakeJoin.DEFAULT_WINDOW_MS,
         /**
@@ -172,7 +165,23 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
          * token at all.
          */
         val playIntegrityProjectNumber: Long? = null,
+        /** SDK 4.0 (17.1): `recited` (absent or true: the SDK counts the recited ayahs itself; false: only the app's
+         *  reports count) and `recited_twins` (absent or true: the context rule's copy exception in another surah). */
+        val recited: Boolean = true,
+        val recitedTwins: Boolean = true,
+        /** SDK 4.0 (17.8, 17.9): `metrics`, group to boolean, absent = on: juz, hours, lengths, learner, repeats, health, judged. */
+        val metrics: Map<String, Boolean> = emptyMap(),
+        /** SDK 4.0 (SHARING_40 19.3): `share_flac`, true only: a recording captured at a rate other than 48000 is
+         *  shared lossless (Ogg FLAC at its capture rate); absent or anything else: Opus as before. */
+        val shareFlac: Boolean = false,
+        /** SDK 4.0: `accel_min_speedup`, the speedup (CPU median chunk ms / accelerator median) a build needs to be
+         *  promoted after its golden test, as a JSON number; [ai.quranlab.tajweedformer.core.AcceleratorSpeed.minSpeedup]
+         *  makes missing, below 1.0 or not finite 1.0. */
+        val accelMinSpeedup: Double? = null,
     ) {
+        /** Whether a group of 17.8 or 17.9 is on. */
+        fun metric(group: String): Boolean = metrics[group] != false
+
         /** The tier for a platform: the flag, else the documented default (`attested` for android). */
         fun trust(platform: String): String = uploadTrust[platform] ?: when (platform) {
             "web" -> "off"
@@ -197,6 +206,11 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
                     cappedLimits = m["capped_limits"] as? Map<String, Any?> ?: emptyMap(),
                     shareJoinMs = ai.quranlab.tajweedformer.sharing.TakeJoin.window(m["share_join_ms"]),
                     playIntegrityProjectNumber = (m[ModelGate.PLAY_INTEGRITY_FLAG] as? String)?.takeIf { DIGITS.matches(it) }?.toLongOrNull(),
+                    recited = m["recited"] as? Boolean ?: true,
+                    recitedTwins = m["recited_twins"] as? Boolean ?: true,
+                    metrics = (m["metrics"] as? Map<String, Any?>)?.mapNotNull { (k, v) -> (v as? Boolean)?.let { k to it } }?.toMap() ?: emptyMap(),
+                    shareFlac = m["share_flac"] == true,
+                    accelMinSpeedup = (m["accel_min_speedup"] as? Number)?.toDouble(),
                 )
             }
         }
@@ -205,6 +219,9 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
     companion object {
         /** The key id of a raw 32-byte Ed25519 public key: the first 8 bytes of its SHA-256, hex. */
         @JvmStatic
+        /** A build's key id as the config and the manifest name it: 32 lower-case hex. */
+        private val KEY_ID = Regex("^[0-9a-f]{32}$")
+
         fun keyId(publicKey: ByteArray): String = sha256(publicKey).copyOf(8).hex()
 
         /**
@@ -230,7 +247,14 @@ internal class RemoteConfig internal constructor(val raw: Map<String, Any?>, val
     }
 }
 
-internal class ConfigRejected(message: String) : Exception(message)
+internal class ConfigRejected(message: String) : Exception(message) {
+    /** The error report's reason: `expired`, `parse` (not a JSON object, not `v` 1), else `signature`. */
+    val reason: String get() = when {
+        message == "expired" -> "expired"
+        message == "body is not a JSON object" || message == "v is not 1" -> "parse"
+        else -> "signature"
+    }
+}
 
 /**
  * The last good signed config on disk (`<storage>/cloud/config.*`): the exact body, its signature,

@@ -112,6 +112,13 @@ internal class TokenProvider(
         attestationProblem = why
     }
 
+    /** A token the SDK 4.0 attest answered with (the install keys' attest, contract 18.4.3): kept as the cached one. */
+    @Synchronized
+    fun adopt(t: AppToken) {
+        save(t)
+        try { issued() } catch (_: Exception) {}
+    }
+
     /** After a 401 `invalid_token`: the next [token] call fetches a new one. */
     @Synchronized
     fun invalidate() {

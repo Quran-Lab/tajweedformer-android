@@ -30,6 +30,13 @@ import java.util.concurrent.Executors
  * telemetry v2 schema. Records every request; any request with an `Origin` header is refused as an
  * `apps` key's would be.
  */
+/** The 4.0 fields of a telemetry body (SPEC 17.1, 17.8, 17.9) and the app-reported ones among them (qlab-api
+ *  sdk4-server's EVENTS4 and REPORTABLE4; TelemetryEvents4Test runs its own validator on the SDK's bodies). */
+internal val FIELDS_40 = setOf("app_ayahs", "app_surah_ayahs", "juz_ayahs", "hour_speech_s", "take_s", "session_s", "learner", "learner_gap",
+    "streak", "repeat_ayahs", "recited_takes", "lease", "judged", "judged_surah_ayahs", "correct_surah_ayahs", "judged_tenure", "trend")
+internal val REPORTABLE_40 = listOf("app_ayahs", "app_surah_ayahs", "words", "rule_checks", "rule_flags", "judged", "judged_surah_ayahs",
+    "correct_surah_ayahs", "judged_tenure", "trend")
+
 internal class StubQlab : AutoCloseable {
     class Seen(val method: String, val path: String, val query: String, val headers: Map<String, String>, val body: ByteArray) {
         @Suppress("UNCHECKED_CAST")
@@ -60,7 +67,7 @@ internal class StubQlab : AutoCloseable {
      *  2.0.0 server: such a body is a 400. */
     @Volatile var incidentsAccepted = false
     @Volatile var flags: Map<String, Any?> = mapOf("analytics" to true, "issues" to true, "contributions" to true, "upload_trust" to mapOf("android" to "attested"),
-        "play_integrity_project_number" to PROJECT_NUMBER)
+        "play_integrity_project_number" to PROJECT_NUMBER, "metrics" to emptyMap<String, Any?>())
     /** More top-level fields of the signed config (`sdk_latest`, `accel_deny`, fields no SDK knows). */
     @Volatile var extra: Map<String, Any?> = emptyMap()
     /** The config's `inference` field (the portal's Response time); null: absent. A 3.x install gets no `tajweed` block. */
@@ -214,7 +221,8 @@ internal class StubQlab : AutoCloseable {
             "POST /v1/register" -> needToken(s) ?: closed(s, setOf("platform", "bundle_id", "app_name", "app_version", "sdk_version", "model_revision", "new_install"))
                 ?: Reply.json(200, mapOf("ok" to true, "app_id" to "android:org.example.recite", "store_status" to "unlisted"))
             "POST /v1/events" -> needToken(s) ?: events(s)
-            "POST /v1/issues" -> needToken(s) ?: closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames") +
+            "POST /v1/issues" -> needToken(s) ?: issueAnswer?.invoke(s) ?: if (s.json?.get("kind") == "error") errorReport(s) else
+                closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "frames") +
                 (if (incidentsAccepted && s.json?.get("kind") in setOf("accelerator_failover", "promotion_failed")) setOf("message", "detail") else emptySet()))
                 ?: Reply.json(202, mapOf("ok" to true))
             "POST /v1/uploads" -> uploadStart(s)
@@ -229,6 +237,26 @@ internal class StubQlab : AutoCloseable {
             }
         }
     }
+
+    /** Takes over the answer to `POST /v1/issues` (a 503, a 429) when it returns one. */
+    @Volatile var issueAnswer: ((Seen) -> Reply?)? = null
+
+    /** An error report: the top level of section 7 with
+     *  `error` and without `message`, `frames`, `detail`; the closed `error` object. */
+    private fun errorReport(s: Seen): Reply {
+        closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "error"))?.let { return it }
+        val e = s.json?.get("error") as? Map<*, *> ?: return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error: required"))
+        val allowed = setOf("stage", "reason", "http_status", "error_name", "error_code", "count", "retries", "first_launch", "first_report", "build",
+            "device_model", "ram_tier", "storage_free", "abi", "web")
+        e.keys.firstOrNull { it !in allowed }?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.$it: unknown field")) }
+        if (e["stage"] !in ErrorRules.STAGES || (e["reason"] as? String)?.let { ErrorRules.TOKEN.matches(it) } != true) {
+            return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.stage or error.reason"))
+        }
+        return Reply.json(202, mapOf("ok" to true))
+    }
+
+    /** The error reports the stub accepted (their bodies), in order. */
+    fun errorReports(): List<Map<String, Any?>> = seen("/v1/issues").mapNotNull { it.json }.filter { it["kind"] == "error" }
 
     private fun needKey(s: Seen): Reply? = if (s.headers["x-qlab-key"] == key) null else Reply.error(401, "invalid_key")
 
@@ -325,18 +353,23 @@ internal class StubQlab : AutoCloseable {
     /** Telemetry v2's closed schema (qlab-api src/events2.js), with the 2.0.1 fields. */
     @Suppress("UNCHECKED_CAST")
     private fun events(s: Seen): Reply {
+        // QLAB_BODY_DUMP (a folder): every body sent here is kept, so qlab-api's own schema can be run on them
+        System.getenv("QLAB_BODY_DUMP")?.let { d -> File(d).apply { mkdirs() }.resolve("events-${System.nanoTime()}.json").writeBytes(s.body) }
         if (s.body.size > 32 * 1024) return Reply.error(413, "too_large")
         val o = s.json ?: return Reply.error(400, "invalid_json")
         fun bad(why: String) = Reply.json(400, mapOf("error" to "invalid_body", "message" to why))
         val top = setOf("v", "day", "product", "platform", "sdk_version", "app_version", "device", "cohorts", "coverage", "downloads",
             "report_id", "launches", "ayahs", "surah_ayahs", "words", "rule_checks", "rule_flags", "share_asked", "share_yes", "share_no",
-            "promotions", "reported")
+            "promotions", "reported") + FIELDS_40
         o.keys.firstOrNull { it !in top }?.let { return bad("json.$it: unknown field") }
-        // SDK 3.0: `reported` lists exactly those of the six app-reported fields that are in the body
-        val six = listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags")
+        // SDK 3.0: `reported` lists exactly those of the app-reported fields that are in the body; from 4.0 (17.1) the
+        // measured `ayahs` and `surah_ayahs` are never listed, the app's are `app_*`, and `coverage` is not sent
+        val v40 = ai.quranlab.tajweedformer.ModelManifest.versionAtLeast(o["sdk_version"] as? String ?: "0", "4.0.0")
+        val six = if (v40) REPORTABLE_40 else listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags")
         val reported = (o["reported"] as? List<Any?>) ?: emptyList()
         if (reported.any { it !in six } || reported.toSet().size != reported.size) return bad("reported: unknown or repeated name")
         for (k in six) if (o.containsKey(k) != (k in reported)) return bad("reported: $k")
+        if (v40 && o.containsKey("coverage")) return bad("coverage: not from 4.0")
         val rid = o["report_id"] as? String
         if (o.containsKey("report_id") && (rid == null || !Regex("^[0-9a-f]{32}$").matches(rid))) return bad("report_id")
         for (k in listOf("launches", "ayahs", "words", "share_asked", "share_yes", "share_no")) {
@@ -372,17 +405,28 @@ internal class StubQlab : AutoCloseable {
         }
         (o["coverage"] as? Map<String, Any?>)?.keys?.firstOrNull { (it.toIntOrNull() ?: 0) !in 1..114 }?.let { return bad("coverage.$it") }
         if (((o["downloads"] as? List<*>)?.size ?: 0) > 8) return bad("downloads")
+        // a download names its model version, a promotion its accelerator (src/events2.js REVISION, src/accel.js ACCELERATOR)
+        val revision = Regex("^[A-Za-z0-9][A-Za-z0-9._+@-]{0,63}$")
+        (o["downloads"] as? List<Map<String, Any?>>)?.forEachIndexed { i, d -> if (!revision.matches(d["revision"] as? String ?: "")) return bad("downloads[$i].revision") }
+        (o["promotions"] as? List<Map<String, Any?>>)?.forEachIndexed { i, p ->
+            if (!Regex("^(ane|gpu|npu(:[A-Za-z0-9][A-Za-z0-9_.-]{0,23})?)$").matches(p["backend"] as? String ?: "")) return bad("promotions[$i].backend")
+            if (!revision.matches(p["revision"] as? String ?: "")) return bad("promotions[$i].revision")
+        }
         val day = java.time.LocalDate.parse(o["day"] as String)
         if (day.isBefore(java.time.LocalDate.now(java.time.ZoneOffset.UTC).minusDays(7))) return bad("day: older than 7 days")
         if (rid != null && !reports.add(rid)) return Reply.json(202, mapOf("ok" to true, "points" to 0, "duplicate" to true))
         return Reply.json(202, mapOf("ok" to true, "points" to cohorts.size * 7))
     }
 
+    /** SDK 4.0 (SHARING_40.md 19.4.4): the uploads started as FLAC, whose URLs end `.oga`. */
+    private val flacUploads: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
     private fun urls(id: String, from: Int, status: Int): Reply {
         val b = synchronized(this) { ++batches }
         val exp = System.currentTimeMillis() / 1000 + 604_800
+        val ext = if (id in flacUploads) "oga" else "opus"
         val list = (from until from + batch).map { n ->
-            mapOf("n" to n, "expires_at" to exp, "url" to "$base/r2/qlab-contributions/v1/$id/seg-%05d.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%%3Bhost&X-Amz-Signature=b$b-$n".format(n))
+            mapOf("n" to n, "expires_at" to exp, "url" to "$base/r2/qlab-contributions/v1/$id/seg-%05d.$ext?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%%3Bhost&X-Amz-Signature=b$b-$n".format(n))
         }
         return Reply.json(status, mapOf("id" to id, "urls" to list))
     }
@@ -398,13 +442,27 @@ internal class StubQlab : AutoCloseable {
         if (!Regex("^[0-9a-f]{32}$").matches(id)) return Reply.error(400, "invalid_body")
         // consent_text_sha256: the 2.0.1 server's field (custom wording), 64 lower-case hex next to a custom- version
         closed(s, setOf("format", "audio", "decode", "consent_version", "contributor", "contributor_key", "recovery_hash", "day", "device_class", "os_major",
-            "consent_text_sha256", "take_seq", "gap_ms_prev"))?.let { return it }
+            "consent_text_sha256", "take_seq", "gap_ms_prev", "device_model"))?.let { return it }
         val o = s.json!!
         (o["consent_text_sha256"] as? String)?.let { h ->
             if (!Regex("^[0-9a-f]{64}$").matches(h) || o["consent_version"] != "custom-" + h.take(24)) return Reply.error(400, "invalid_body")
         }
-        (o["audio"] as Map<String, Any?>).keys.firstOrNull { it !in setOf("codec", "container", "sample_rate", "channels", "input_sample_rate", "input_route") }
+        val audio = o["audio"] as Map<String, Any?>
+        audio.keys.firstOrNull { it !in setOf("codec", "container", "sample_rate", "channels", "input_sample_rate", "input_route", "bits_per_sample") }
             ?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "json.audio.$it")) }
+        // SHARING_40.md 19.5 as qlab-api checks it
+        (o["device_model"] as? String)?.let { if (!Regex("^[A-Za-z0-9][A-Za-z0-9 _.,+()/-]{0,63}$").matches(it)) return Reply.error(400, "invalid_body") }
+        if (o.containsKey("device_model") && o["device_model"] !is String) return Reply.error(400, "invalid_body")
+        val rate = (audio["sample_rate"] as? Double)?.toInt()
+        when (audio["codec"]) {
+            "flac" -> {
+                val sdk = ((o["decode"] as? Map<String, Any?>)?.get("sdk_version") as? String)?.substringBefore('.')?.toIntOrNull() ?: 0
+                if (rate == null || rate !in 8_000..192_000 || rate == 48_000 || audio["bits_per_sample"] != 16.0 || sdk < 4 ||
+                    (audio["input_sample_rate"] != null && (audio["input_sample_rate"] as? Double)?.toInt() != rate)) return Reply.error(400, "invalid_body")
+            }
+            "opus" -> if (rate != 48_000 || audio.containsKey("bits_per_sample")) return Reply.error(400, "invalid_body")
+            else -> return Reply.error(400, "invalid_body")
+        }
         (o["decode"] as Map<String, Any?>).keys.firstOrNull { it !in setOf("model_revision", "model_build", "backend", "weights_sha256", "sdk_version") }
             ?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "json.decode.$it")) }
         (o["gap_ms_prev"] as? Double)?.let { g -> if (g < 0 || g > 3_600_000 || g % 100 != 0.0) return Reply.error(400, "invalid_body") }
@@ -416,6 +474,7 @@ internal class StubQlab : AutoCloseable {
         if (prev != null && prev != k) return Reply.error(409, "contributor_key_mismatch")
         if (prev == null && k != null) bound[c] = k
         val again = starts().count { it.headers["x-qlab-id"] == id } > 1
+        if (audio["codec"] == "flac") flacUploads.add(id)
         return urls(id, 1, if (again) 200 else 201)
     }
 
@@ -451,7 +510,8 @@ internal class StubQlab : AutoCloseable {
      * `POST /v1/uploads/{id}/takes` (SDK 2.0.3) as the server checks it: the token and `x-qlab-contributor`, the upload
      * known under that contributor (404 `not_found` otherwise), 410 for a deleted upload, a closed body
      * `{"takes":[{"start_ms","gap_ms"}]}` of 2 to 256 entries, the first `{0, 0}`, `start_ms` whole and strictly
-     * increasing and no further than the received audio plus 1000 ms, `gap_ms` 0 to 10000 in hundreds. The list
+     * increasing and no further than the received audio plus 1000 ms, `gap_ms` 0 to 60000 in hundreds (qlab-api
+     * 462b997; 10000 before). The list
      * replaces any earlier one; 204.
      */
     @Suppress("UNCHECKED_CAST")
@@ -480,7 +540,7 @@ internal class StubQlab : AutoCloseable {
             if (i == 0 && (at != 0.0 || gap != 0.0)) return bad("json.takes[0]: 0, 0")
             if (i > 0 && at <= last) return bad("json.takes[$i].start_ms: not increasing")
             if (at > received + 1000) return bad("json.takes[$i].start_ms: past the received audio ($received ms)")
-            if (gap < 0 || gap > 10_000 || gap % 100 != 0.0) return bad("json.takes[$i].gap_ms")
+            if (gap < 0 || gap > 60_000 || gap % 100 != 0.0) return bad("json.takes[$i].gap_ms")
             last = at
         }
         takes[id] = list as List<Map<String, Any?>>

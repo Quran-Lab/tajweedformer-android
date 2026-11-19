@@ -7,7 +7,7 @@ import ai.quranlab.tajweedformer.cloud.StubQlab
 import ai.quranlab.tajweedformer.cloud.TajweedObserver
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -27,16 +27,21 @@ class SheetExitTest : OpenChecked() {
     private lateinit var stub: StubQlab
     private val dirs = ArrayList<File>()
 
-    @Before fun up() { stub = StubQlab() }
+    @Before fun up() {
+        stub = StubQlab()
+        // the clients' clock moves on by days to the re-asks (SHARE_ASK_40): the signed config outlasts them
+        stub.expiresIn = 400L * 86_400
+    }
 
     @After fun down() {
         dirs.forEach { it.deleteRecursively() }
         if (::stub.isInitialized) stub.close()
     }
 
-    private fun cloud(storage: File, guardian: Boolean = false): QuranLabCloud {
-        val c = stub.cloud(storage, CloudOptions(stub.key, contributions = true, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey),
-            audience = if (guardian) CloudOptions.Audience.CHILDREN else CloudOptions.Audience.GENERAL))
+    private fun cloud(storage: File, ready: Boolean = true): QuranLabCloud {
+        // SDK 4.0: an install past its first day, so its first good take asks (SHARE_ASK_40)
+        if (ready && !File(storage, "sharing/state.json").exists()) AskKit.store(storage, AskKit.ready(stub.clock()))
+        val c = stub.cloud(storage, CloudOptions(stub.key, contributions = true, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)))
         c.refreshConfig()
         return c
     }
@@ -44,7 +49,8 @@ class SheetExitTest : OpenChecked() {
     /** A completed session with feedback: when the rules allow, the SDK counts an ask and hands its sheet over. */
     private fun completedSession(c: QuranLabCloud) {
         c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", sampleRate = 16_000, inputRoute = "built_in", decodeBackend = "mock"))
-        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, true, feedbackShown = true))
+        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, true, feedbackShown = true, speechFrames = AskKit.MINUTE_FRAMES))
+        c.sharing.settleNow()
     }
 
     /** What 3.1.0 recorded for an ending: the stored answer, the asks counted, the telemetry's yes and no. */
@@ -80,16 +86,16 @@ class SheetExitTest : OpenChecked() {
             val storage = Files.createTempDirectory("tj-exit").toFile().also { dirs.add(it) }
             val c = cloud(storage)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
             completedSession(c)
-            assertEquals("$how: the ask is counted before the sheet shows", listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST, false)), asked)
+            assertEquals("$how: the ask is counted once the sheet shows", listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST)), asked)
             assertEquals(how, 1, c.sharing.state.asks)
             if (how.startsWith("the app going to the background")) {
                 c.background()
                 assertEquals("$how: nothing recorded while away", ConsentState.Consent.UNKNOWN, c.sharing.state.consent)
                 c.foreground()
             }
-            exit?.record(c.sharing, guardian = false)
+            exit?.record(c.sharing)
             c.background()
             // the counters of every report sealed since the install (one per send point)
             val t = HashMap<String, Double>()
@@ -97,11 +103,11 @@ class SheetExitTest : OpenChecked() {
             // the stored answer, as a restart reads it
             val again = cloud(storage)
             val askedAgain = ArrayList<Sharing.SheetRequest>()
-            again.sharing.prompts = { askedAgain.add(it) }
+            again.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); askedAgain.add(it) }
             val stored = again.sharing.state.consent
             val storedAsks = again.sharing.state.asks
             // after a yes a session would start a recording: the SDK's own question, whether it may ask now, says the same
-            val askedAgainNow = if (stored == ConsentState.Consent.GRANTED) again.sharing.askNow() != null else {
+            val askedAgainNow = if (stored == ConsentState.Consent.GRANTED) again.sharing.askNow() else {
                 completedSession(again)
                 askedAgain.isNotEmpty()
             }
@@ -110,47 +116,61 @@ class SheetExitTest : OpenChecked() {
             assertEquals("$how: one ask counted in telemetry", 1.0, t["share_asked"])
             if (got.askedAgainAtTheNextSession) {
                 assertEquals("$how: no answer, so the first sheet again, counted as the second ask",
-                    listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST, false)), askedAgain)
+                    listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST)), askedAgain)
                 assertEquals(how, 2, again.sharing.state.asks)
             }
         }
     }
 
-    /** "Not now" and the sheet closed without a button are the same no: a re-ask 7 sessions later, the third one final. */
+    /**
+     * "Not now" and the sheet closed without a button are the same no: re-asks 14 days and 7 sessions, then 30 days and
+     * 10 sessions later (SDK 4.0, one good take a day here), the third one final. The re-asks are cards (deck
+     * 2026-11-15.1 has their lines), dismissed.
+     */
     @Test fun aClosedSheetIsANotNowUpToTheThirdAsk() {
         for (exit in listOf(SheetExit.NOT_NOW, SheetExit.CLOSED)) {
             val storage = Files.createTempDirectory("tj-exit").toFile().also { dirs.add(it) }
             val c = cloud(storage)
             val at = ArrayList<Int>()
-            c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) exit.record(c.sharing, guardian = false) }
-            for (i in 1..30) {
+            c.sharing.prompts = {
+                when (it) {
+                    is Sharing.SheetRequest.Consent -> { it.shown(); exit.record(c.sharing) }
+                    is Sharing.SheetRequest.Card -> { it.shown(); it.notNow() }
+                    else -> {}
+                }
+            }
+            for (i in 0..60) {
                 val before = c.sharing.state.asks
+                if (i > 0) {
+                    stub.skewMs += ShareAsk.DAY_MS
+                    c.sharing.launched()
+                }
                 completedSession(c)
                 if (c.sharing.state.asks > before) at.add(i)
             }
-            assertEquals("$exit: the first ask, then 7 sessions apart", listOf(1, 8, 15), at)
+            assertEquals("$exit: the first ask, then 14 and 30 days apart", listOf(0, 14, 44), at)
             assertEquals("$exit: the third no is final", ConsentState.Consent.FINAL, cloud(storage).sharing.state.consent)
-            assertNull(c.sharing.askNow())
+            assertFalse(c.sharing.askNow())
         }
     }
 
-    /** The guardian variant: Share records the guardian's yes; closing it is a no, as 3.1.0's guardian sheet. */
-    @Test fun theGuardiansSheet() {
+    /**
+     * SDK 4.0: one sheet for every app. Recording an ending takes the sharing only (no variant),
+     * Share records the learner's yes, closing the sheet a no.
+     */
+    @Test fun theOneSheetsShareAndClose() {
+        assertEquals(listOf(listOf<Class<*>>(Sharing::class.java)),
+            SheetExit::class.java.declaredMethods.filter { it.name == "record" }.map { it.parameterTypes.toList() })
         for (exit in listOf(SheetExit.SHARE, SheetExit.CLOSED)) {
             val storage = Files.createTempDirectory("tj-exit").toFile().also { dirs.add(it) }
-            val c = cloud(storage, guardian = true)
+            val c = cloud(storage)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
             completedSession(c)
-            assertEquals(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST, true), asked.single())
-            exit.record(c.sharing, guardian = true)
-            val stored = cloud(storage, guardian = true).sharing.state
-            if (exit == SheetExit.SHARE) {
-                assertEquals(ConsentState.Consent.GRANTED, stored.consent)
-                assertEquals("the yes is the guardian's", true, stored.guardian)
-            } else {
-                assertEquals(ConsentState.Consent.DECLINED, stored.consent)
-            }
+            assertEquals(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST), asked.single())
+            exit.record(c.sharing)
+            val stored = cloud(storage).sharing.state
+            assertEquals(exit.name, if (exit == SheetExit.SHARE) ConsentState.Consent.GRANTED else ConsentState.Consent.DECLINED, stored.consent)
         }
     }
 }

@@ -1,6 +1,5 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.engine.EngineReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
@@ -65,11 +64,14 @@ public class TajweedReference internal constructor(
     private val store: ModelStore?,
     /** SHA-256 of the model's tokens.txt: the table must have been built for the same vocabulary. */
     private val tokensSha256: String,
+    /** SDK 4.0: whether the Core has the table in its device form (installed with the model); null: a plain file. */
+    private val installed: (() -> Boolean)? = null,
+    /** SDK 4.0: the open model's table (the Core reads it at the first lookup, R3); null: none. */
+    private val table: (() -> ReferenceTable)? = null,
 ) {
-    private var table: EngineReference? = null
     private val lock = Any()
 
-    private fun inPlace(): Boolean = files.all { e ->
+    private fun inPlace(): Boolean = installed?.invoke() ?: files.all { e ->
         val f = File(dir, e.localPath)
         if (store != null) store.downloader.isInPlace(e) else f.isFile && f.length() == e.localSize
     }
@@ -79,7 +81,8 @@ public class TajweedReference internal constructor(
 
     /**
      * Downloads and verifies the reference data, once; a no-op when it is on the device. Without a connection, or
-     * when the download fails, the error is `reference_missing`.
+     * when the download fails, the error is `reference_missing`. SDK 4.0: the model brings its reference data with it
+     * when it opens, so this is a no-op then; one fetched later is ready from the next `client.model()`.
      */
     public suspend fun fetch() {
         if (inPlace()) return
@@ -97,20 +100,9 @@ public class TajweedReference internal constructor(
         }
     }
 
-    private fun open(): EngineReference = synchronized(lock) {
-        table ?: run {
-            if (!inPlace()) throw RecognizerException.ReferenceMissing()
-            val main = files.firstOrNull { it.localPath.endsWith(".zfx") } ?: files.first()
-            // the lookup is the engine's: one reader of the table for the four SDKs
-            if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) throw ai.quranlab.tajweedformer.engine.TajweedJni.unavailable("the reference lookup")
-            val t = EngineReference(File(dir, main.localPath))
-            val made = t.tokensSha256()
-            if (made != null && !made.equals(tokensSha256, ignoreCase = true)) {
-                t.close()
-                throw RecognizerException.ManifestInvalid("the reference data was built for another vocabulary than this model's tokens")
-            }
-            t.also { table = it }
-        }
+    private fun open(): ReferenceTable = synchronized(lock) {
+        if (!inPlace()) throw RecognizerException.ReferenceMissing()
+        table?.invoke() ?: throw RecognizerException.ReferenceMissing(IllegalStateException("no reader for this build's reference data"))
     }
 
     /**
@@ -128,10 +120,12 @@ public class TajweedReference internal constructor(
     /** The word (0-based) of each unit of [units], as the table has it (a word bar belongs to the word before it). */
     internal fun wordOfUnit(surah: Int, ayah: Int): IntArray? = open().units(surah, ayah)?.second
 
-    internal fun close() = synchronized(lock) {
-        table?.close()
-        table = null
-    }
+    internal fun close() {}
+}
+
+/** A reference table's lookup: the ayah's unit ids and, per unit, its word (0-based); null for an ayah it does not have. */
+internal fun interface ReferenceTable {
+    fun units(surah: Int, ayah: Int): Pair<IntArray, IntArray>?
 }
 
 /** The ayah counts of the 114 surahs, for validating a surah and ayah range an app passes in. */

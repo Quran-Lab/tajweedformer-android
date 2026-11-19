@@ -65,7 +65,10 @@ internal object ModelProfile {
 
     /** Roles that are data an app may ask for, or that only SDK 2.x reads: the 2.x expected table (`expected`, never
      *  downloaded or read by 3.0) and the reference data (`reference`, downloaded only when the app fetches it). */
-    @JvmField val DATA_ROLES = setOf("expected", REFERENCE_ROLE)
+    @JvmField val DATA_ROLES = setOf("expected", REFERENCE_ROLE, "recited", "recited-index")
+
+    /** SDK 4.0: the recited-ayah index (quranlab-core's role `recited`): fetched by the SDK after a take, for the count. */
+    const val RECITED_ROLE = "recited"
 
     /** The reference data of [m] (role `reference`: the expected units of each ayah), empty when the build has none. */
     @JvmStatic

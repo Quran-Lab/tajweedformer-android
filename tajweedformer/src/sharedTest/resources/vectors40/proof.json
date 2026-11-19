@@ -1,0 +1,53 @@
+{
+ "section": "PROTECTED_MODEL.md 18.6.3",
+ "note": "Test keys only, made by protected40.py from fixed labels (stream(label, n): SHA-256 of the label and a 32-bit little-endian counter, concatenated). No SDK trusts them.",
+ "release": "4.0.0-c1",
+ "k_chal_hex": "dc899abed4e0da295b41688dbee293ceeae8041f31831a0e67e05839afd0b949",
+ "message": "'quranlab-core-proof 1\\n' || challenge || '\\n' || install hash (32 bytes) || integrity digest (32 bytes) || target || '\\n' || signals (u32 LE)",
+ "cmac_rfc4493": [
+  {
+   "key_hex": "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+   "message_hex": "",
+   "cmac_hex": "028962f61b7bf89efc6b551f4667d983",
+   "source": "NIST SP 800-38B D.3 (AES-256)"
+  },
+  {
+   "key_hex": "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+   "message_hex": "6bc1bee22e409f96e93d7e117393172a",
+   "cmac_hex": "28a7023f452e8f82bd4bf28d8c37c35c",
+   "source": "NIST SP 800-38B D.3 (AES-256)"
+  }
+ ],
+ "cases": [
+  {
+   "challenge": "c1.1790000300.3OTNneikYy1d2YD912buJA.Vk7sl49ksj3z05fNAN4FtQ",
+   "install_hash_hex": "58316444c870b99438a949ed96f229456efd658f5b9e2b442cf644e71f64e087",
+   "integrity_digest_hex": "e9d320d232b7922f7c1478bea45f1bb983ca146db5da349857262b4143d92e46",
+   "target": "android-arm64-v8a",
+   "signals": 0,
+   "message_hex": "717572616e6c61622d636f72652d70726f6f6620310a63312e313739303030303330302e334f544e6e65696b5979316432594439313262754a412e566b37736c34396b736a337a3035664e414e344674510a58316444c870b99438a949ed96f229456efd658f5b9e2b442cf644e71f64e087e9d320d232b7922f7c1478bea45f1bb983ca146db5da349857262b4143d92e46616e64726f69642d61726d36342d7638610a00000000",
+   "proof_hex": "727ad029f5813773647564f803e32dab",
+   "proof_b64u": "cnrQKfWBN3NkdWT4A-Mtqw"
+  },
+  {
+   "challenge": "c1.1790000301.BsMvz1fs6NVzXsKrm8D-bQ.Vqk8Tdnrsv6yZ_kLryUg1g",
+   "install_hash_hex": "55d12e431586f6d89b27251c6c372ad3d459ceae50b78d37a568b3eadb38ef6c",
+   "integrity_digest_hex": "294dff0e2420b8323fb5a21a31faa3831c9e62c79cd8516176d5c3ea29cf2b3d",
+   "target": "wasm32-simd",
+   "signals": 32,
+   "message_hex": "717572616e6c61622d636f72652d70726f6f6620310a63312e313739303030303330312e42734d767a316673364e567a58734b726d38442d62512e56716b3854646e72737636795a5f6b4c7279556731670a55d12e431586f6d89b27251c6c372ad3d459ceae50b78d37a568b3eadb38ef6c294dff0e2420b8323fb5a21a31faa3831c9e62c79cd8516176d5c3ea29cf2b3d7761736d33322d73696d640a20000000",
+   "proof_hex": "0a3608a4426166a6950f22940cafb466",
+   "proof_b64u": "CjYIpEJhZqaVDyKUDK-0Zg"
+  },
+  {
+   "challenge": "c1.1790000302.0K9kv_cH94TgzHtpYAWrVw.Bqd9z0FFWydVhiAJr676EQ",
+   "install_hash_hex": "834fd0c061b4aecd863f03ce47cc6927a2f99b6d25739683c34bf88ad4365d22",
+   "integrity_digest_hex": "1b74da4c1d4edd46d02ee45fb5eafbad0592a00aede9eb3415c52fc6528e0ed6",
+   "target": "ios-arm64",
+   "signals": 5,
+   "message_hex": "717572616e6c61622d636f72652d70726f6f6620310a63312e313739303030303330322e304b396b765f6348393454677a4874705941577256772e427164397a304646577964566869414a7236373645510a834fd0c061b4aecd863f03ce47cc6927a2f99b6d25739683c34bf88ad4365d221b74da4c1d4edd46d02ee45fb5eafbad0592a00aede9eb3415c52fc6528e0ed6696f732d61726d36340a05000000",
+   "proof_hex": "2bdb80129100cef277d9a8e317c9079a",
+   "proof_b64u": "K9uAEpEAzvJ32ajjF8kHmg"
+  }
+ ]
+}

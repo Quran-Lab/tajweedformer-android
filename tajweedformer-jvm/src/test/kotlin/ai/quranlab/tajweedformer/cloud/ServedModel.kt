@@ -75,7 +75,7 @@ internal class ServedModel private constructor(
     private val prefix = "/$REPO/$build/$FOLDER/"
     private val server: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
 
-    /** What `ClientPlatform.modelsUrl` is set to. */
+    /** The folder a lease answer names for the served build. */
     val url: String get() = "http://127.0.0.1:${server.address.port}"
 
     /** The `recommended` entry of a signed config that names this build. */

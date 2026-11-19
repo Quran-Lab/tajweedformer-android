@@ -324,7 +324,7 @@ class SharingOffTest(private val name: String, @Suppress("unused") private val r
             "on disk when the call returned: ${if (case.action == "off") left else all}"
         }
         if (case.action == "delete") {
-            check("sharing_is_off_after_an_accepted_delete", !c.sharing.isOn && c.sharing.state.consent == ConsentState.Consent.FINAL && c.sharing.askNow() == null) {
+            check("sharing_is_off_after_an_accepted_delete", !c.sharing.isOn && c.sharing.state.consent == ConsentState.Consent.FINAL && !c.sharing.askNow()) {
                 "sharing on: ${c.sharing.isOn}, consent ${c.sharing.state.consent}"
             }
         }
@@ -416,7 +416,7 @@ class SharingOffTest(private val name: String, @Suppress("unused") private val r
         check("nothing_unsent_on_device", !delete.isAlive && thrown == null && result == Sharing.Deletion.ACCEPTED && all.isEmpty()) {
             "the delete answered $result ${thrown ?: ""}; on disk: $all"
         }
-        check("sharing_is_off_after_an_accepted_delete", !c.sharing.isOn && c.sharing.state.consent == ConsentState.Consent.FINAL && c.sharing.askNow() == null) {
+        check("sharing_is_off_after_an_accepted_delete", !c.sharing.isOn && c.sharing.state.consent == ConsentState.Consent.FINAL && !c.sharing.askNow()) {
             "sharing on: ${c.sharing.isOn}, consent ${c.sharing.state.consent}"
         }
         c.sharing.setOn(true)

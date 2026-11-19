@@ -42,7 +42,12 @@ internal class ModelManifest(
     private val rawToleranceRaw: Any? = null,
     /** The build id when the manifest was read from its file: the first 40 hex of the file's SHA-256. */
     private val buildId: String? = null,
+    /** SDK 4.0: the build's files are QLE1 containers under this key id; null for a plain build. */
+    val encryption: Encryption? = null,
 ) {
+    /** `"encryption": {"scheme": "qle1", "key_id": "<32 lowercase hex>", "root": <1 to 9>}` (exactly these three keys). */
+    data class Encryption(val scheme: String, val keyId: String, val root: Int)
+
     /**
      * The build this manifest is: the first 40 hex digits of the SHA-256 of the signed manifest.json (what the config
      * names as `revision` and the CDN path carries). Diagnostics and keys only; an app selects by [version].
@@ -165,7 +170,9 @@ internal class ModelManifest(
     }
     /** How a file is stored on the server. */
     enum class Encoding(val key: String) {
-        IDENTITY("identity"), GZIP("gzip");
+        IDENTITY("identity"), GZIP("gzip"),
+        /** SDK 4.0: a QLE1 container (CDN form, contract 18.2); `decoded` is the plaintext, which only the Core sees. */
+        QLE1("qle1");
 
         companion object {
             fun of(key: String): Encoding =
@@ -206,10 +213,14 @@ internal class ModelManifest(
         val encoding: Encoding,
         val decoded: Decoded? = null,
     ) {
-        /** The path the SDK keeps the file at: the decoded path for gzip, else [path]. */
+        /** The path the SDK keeps the file at: the decoded path for gzip and qle1, else [path]. A qle1 file is kept as
+         *  its container (the CDN form, then the Core's device form), never decoded by the SDK. */
         val localPath: String get() = decoded?.path ?: path
-        val localSize: Long get() = decoded?.size ?: size
-        val localSha256: String get() = (decoded?.sha256 ?: sha256).lowercase()
+        /** The kept bytes' size and SHA-256: the decoded file's for gzip, the container's for qle1 and identity. */
+        val localSize: Long get() = if (encoding == Encoding.GZIP) decoded!!.size else size
+        val localSha256: String get() = (if (encoding == Encoding.GZIP) decoded!!.sha256 else sha256).lowercase()
+        /** The plaintext's SHA-256: the decoded file's for gzip and qle1 (signed in the manifest). */
+        val plainSha256: String get() = (decoded?.sha256 ?: sha256).lowercase()
 
         fun forPlatform(platform: String): Boolean = "*" in platforms || platform in platforms
     }
@@ -256,6 +267,7 @@ internal class ModelManifest(
             s.append("engine_format $engineFormat\ncoreml_format $coremlFormat\ntokens $tokens\n")
             s.append("tokens_sha256 ${tokensSha256.lowercase()}\ndefault_context $defaultContext\n")
             s.append("contexts ${contexts.joinToString(",")}\n")
+            encryption?.let { s.append("encryption ${it.scheme} ${it.keyId} ${it.root}\n") }
             if (withTolerance) for (k in toleranceText.keys.sortedWith { a, b -> compareUtf8(a, b) }) s.append("golden_tolerance $k ${toleranceText[k]}\n")
             if (withRaw) {
                 val lines = rawTolerance.flatMap { (b, t) -> t.lines.map { (h, tail) -> "$b $h" to tail } }
@@ -297,31 +309,32 @@ internal class ModelManifest(
         }
         if (toleranceRaw != null) m["golden_tolerance"] = toleranceRaw
         if (rawToleranceRaw != null) m["golden_raw_tolerance"] = rawToleranceRaw
+        encryption?.let { m["encryption"] = sortedMapOf<String, Any?>("scheme" to it.scheme, "key_id" to it.keyId, "root" to it.root) }
         if (signature != null) m["signature"] = signature
         return Json.write(m)
     }
 
     fun withSignature(signature: String?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, signature, toleranceRaw, version, rawToleranceRaw,
+        defaultContext, contexts, files, signature, toleranceRaw, version, rawToleranceRaw, null, encryption,
     )
 
     /** The same manifest with another `golden_tolerance` field (null: none), unsigned. */
     fun withTolerance(raw: Any?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, null, raw, version, rawToleranceRaw,
+        defaultContext, contexts, files, null, raw, version, rawToleranceRaw, null, encryption,
     )
 
     /** The same manifest with another `golden_raw_tolerance` field (as [Json.parse] gives it; null: none), unsigned. */
     fun withRawTolerance(raw: Any?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, null, toleranceRaw, version, raw,
+        defaultContext, contexts, files, null, toleranceRaw, version, raw, null, encryption,
     )
 
     /** The same manifest with another `version` (null: a 2.x build's manifest), unsigned. */
     fun withVersion(version: String?) = ModelManifest(
         format, modelId, family, revision, minSdkVersion, engineFormat, coremlFormat, tokens, tokensSha256,
-        defaultContext, contexts, files, null, toleranceRaw, version, rawToleranceRaw,
+        defaultContext, contexts, files, null, toleranceRaw, version, rawToleranceRaw, null, encryption,
     )
 
     /** The model can run in this SDK: format 3, [minSdkVersion] at or below [sdkVersion], engine
@@ -432,6 +445,7 @@ internal class ModelManifest(
             parse(String(bytes, Charsets.UTF_8), hex(MessageDigest.getInstance("SHA-256").digest(bytes)).take(40))
 
         private val HEX64 = Regex("^[0-9a-fA-F]{64}$")
+        private val KEY_ID = Regex("^[0-9a-f]{32}$")
         private val TOKEN = Regex("^[^\\s]+$")
 
         /** Parses a format 3 manifest.json; throws [RecognizerException.ManifestInvalid]. */
@@ -475,7 +489,7 @@ internal class ModelManifest(
                 val decoded = J.objOrNull(o, "decoded")?.let { d ->
                     Decoded(tok(d, "path", "$w.decoded.path"), J.long(d, "size", "$w.decoded.size"), sha(d, "sha256", "$w.decoded.sha256"))
                 }
-                if ((encoding == Encoding.GZIP) != (decoded != null)) throw JsonException("$w: a gzip file has a decoded entry, an identity one none")
+                if ((encoding != Encoding.IDENTITY) != (decoded != null)) throw JsonException("$w: a gzip or qle1 file has a decoded entry, an identity one none")
                 FileEntry(
                     tok(o, "path", "$w.path"), J.long(o, "size", "$w.size"), sha(o, "sha256", "$w.sha256"), platforms,
                     tok(o, "soc", "$w.soc"), tok(o, "context", "$w.context"), tok(o, "role", "$w.role"),
@@ -483,6 +497,16 @@ internal class ModelManifest(
                 )
             }
             val contexts = J.list(m, "contexts").map { it as? String ?: throw JsonException("contexts") }
+            val encryption = m["encryption"]?.let { e ->
+                val o = e as? Map<*, *> ?: throw JsonException("encryption is not an object")
+                if (o.keys != setOf("scheme", "key_id", "root")) throw JsonException("encryption has other keys than scheme, key_id and root")
+                val scheme = o["scheme"] as? String
+                val kid = o["key_id"] as? String
+                val root = (o["root"] as? Double)?.takeIf { it == Math.floor(it) && it in 1.0..9.0 }?.toInt()
+                if (scheme != "qle1" || kid == null || !KEY_ID.matches(kid) || root == null) throw JsonException("encryption is not {qle1, 32 lowercase hex, 1 to 9}")
+                Encryption(scheme, kid, root)
+            }
+            if (encryption == null && files.any { it.encoding == Encoding.QLE1 }) throw JsonException("a qle1 file in a manifest without encryption")
             // golden_tolerance never fails the manifest (the CPU path does not depend on it); a bad entry is exact
             ModelManifest(
                 format = format,
@@ -502,6 +526,7 @@ internal class ModelManifest(
                 version = version,
                 rawToleranceRaw = rawTol,
                 buildId = buildId,
+                encryption = encryption,
             )
         } catch (e: JsonException) {
             throw RecognizerException.ManifestInvalid(e.message ?: "not JSON")
@@ -606,10 +631,22 @@ internal class ManifestVerifier @JvmOverloads constructor(
                 throw RecognizerException.ManifestInvalid("${f.path} names context ${f.context}, not one of ${m.contexts}")
             }
         }
-        val tokens = m.files.firstOrNull { it.path == m.tokens && it.encoding == ModelManifest.Encoding.IDENTITY }
-            ?: throw RecognizerException.ManifestInvalid("${m.tokens} is not listed as an identity file")
-        if (tokens.sha256.lowercase() != m.tokensSha256.lowercase()) {
+        // the tokens file: an identity file in a plain build, a qle1 container (its plaintext signed) in an encrypted one
+        val tokens = m.files.firstOrNull { it.localPath == m.tokens && (it.encoding == ModelManifest.Encoding.IDENTITY || it.encoding == ModelManifest.Encoding.QLE1) }
+            ?: throw RecognizerException.ManifestInvalid("${m.tokens} is not listed as an identity or qle1 file")
+        if (tokens.plainSha256 != m.tokensSha256.lowercase()) {
             throw RecognizerException.ManifestInvalid("tokens_sha256 does not match ${m.tokens}")
+        }
+        if (m.encryption != null) {
+            // 18.2.5: every entry is a container except the calibration at calibration.json and the self-test set under
+            // selftest/, which stay plain
+            for (f in m.files) {
+                val plain = plainAllowed(f.role, f.localPath)
+                if (plain == (f.encoding == ModelManifest.Encoding.QLE1)) {
+                    throw RecognizerException.ManifestInvalid("${f.path}: role ${f.role} is ${if (plain) "plain" else "encrypted"} in an encrypted build")
+                }
+                if (f.encoding == ModelManifest.Encoding.QLE1 && f.path != f.localPath + ".qle") throw RecognizerException.ManifestInvalid("${f.path} is not its decoded path and .qle")
+            }
         }
         if (m.contexts.isEmpty() || m.defaultContext !in m.contexts) {
             throw RecognizerException.ManifestInvalid("default_context ${m.defaultContext} is not one of ${m.contexts}")
@@ -627,6 +664,14 @@ internal class ManifestVerifier @JvmOverloads constructor(
         )
 
         private fun bytes(vararg v: Int) = ByteArray(v.size) { v[it].toByte() }
+
+        /** 18.2.5's `plain_allowed`: the calibration at `calibration.json` and the self-test set under `selftest/`. */
+        @JvmStatic
+        fun plainAllowed(role: String, decodedPath: String): Boolean = when (role) {
+            "calibration" -> decodedPath == "calibration.json"
+            "selftest" -> decodedPath.startsWith("selftest/") && decodedPath.length > 9 && safePath(decodedPath)
+            else -> false
+        }
 
         /** Relative, '/'-separated, no empty, `.` or `..` part, no backslash or drive colon. */
         internal fun safePath(p: String): Boolean =

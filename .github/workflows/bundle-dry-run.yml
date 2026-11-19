@@ -33,7 +33,7 @@ jobs:
   bundle:
     name: Test, sign and show the bundle (no upload)
     if: github.ref_type == 'branch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -44,36 +44,28 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
           python3 scripts/check_bundle_steps.py
       # bundle-steps:begin
-      - name: Engine submodule
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/ci-engine.sh engine
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
-        run: |
-          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
-      # the same tests as the CI workflow, in the same way (the 2.x list named test classes that 3.0 does not have)
+      # SDK 4.0: the AAR carries the Quran Lab Core, never built here: its Android binaries come from this release's
+      # folder on cdn.quranlab.ai, checked against native/core/CORE_RELEASE (scripts/ci-core.sh)
+      - name: The Quran Lab Core's Android binaries for this version, checked against native/core/CORE_RELEASE
+        run: bash scripts/ci-core.sh "$VERSION" "$RUNNER_TEMP/qlcore"
+      # the same tests as the CI workflow, in the same way
       - name: libopus for the sharing tests (built first, so no sharing test ever skips)
-        run: bash scripts/opus/build_opus_host.sh
-      - name: JVM tests (no engine; libopus required)
+        run: echo "TAJWEEDFORMER_OPUS_LIBRARY=$(bash scripts/opus/build_opus_host.sh)" >> "$GITHUB_ENV"
+      - name: JVM tests (libopus required; the tests that need the Core's test release skip)
         run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
-      - name: JVM tests with the engine (the host JNI library is built; the model-dependent ones skip without the model)
-        run: |
-          ./gradlew --no-daemon :tajweedformer-jvm:cleanTest :tajweedformer-jvm:test -Pnative \
-            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
-            --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
       - name: The Compose module's unit tests (the sharing sheet's layout and screenshot tests), before anything is signed or uploaded
         run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
-      - name: Signed bundle of both artifacts (the core's AAR with arm64-v8a, armeabi-v7a and x86_64, the Compose module's AAR; each with sources, javadoc, POM, signatures, checksums)
+      - name: Signed bundle of both artifacts (the core's AAR with the Quran Lab Core for arm64-v8a, armeabi-v7a and x86_64, the Compose module's AAR; each with sources, javadoc, POM, signatures, checksums)
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
         run: |
           [ -n "$SIGNING_KEY" ] || { echo "no SIGNING_KEY secret" >&2; exit 1; }
-          # the core's task builds and zips both publications, and fails when a file of either is missing
+          # the core's task builds and zips both publications, and fails when a file of either is missing (the Core,
+          # its bridge and the Opus encoder for every ABI among them)
           ./gradlew --no-daemon :tajweedformer:centralBundle
           unzip -l tajweedformer/build/distributions/central-bundle-*.zip
           for a in tajweedformer tajweedformer-compose; do

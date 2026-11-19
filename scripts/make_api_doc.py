@@ -1,11 +1,12 @@
-"""Writes docs/api.md of the Android SDK: every public declaration, read from the sources.
+"""Writes docs/api.md and NAMES.md of the Android SDK: every public declaration, read from the sources.
 
   python scripts/make_api_doc.py [--check]
 
 The library is in Kotlin's explicit API mode, so what is public says `public`. For each source file with a public
 top-level declaration this lists the type's signature line and its public members' signature lines, as written in
 the code (annotations and bodies left out). PublicContractTest fails when docs/api.md lacks the name of a
-public declaration, so the page cannot fall behind the code. --check only reports differences.
+public declaration, so the page cannot fall behind the code. NAMES.md is the short form: every public type with the
+names of its public functions and properties, one row each. --check only reports differences.
 """
 import os
 import re
@@ -88,11 +89,83 @@ def build():
     return "\n".join(doc).rstrip() + "\n"
 
 
-text = build()
-path = os.path.join(WT, "docs", "api.md")
+TYPE = re.compile(r"^public (?:(?:data|sealed|abstract|open|enum|annotation|fun|value|companion) )*(class|object|interface)(?: (\w+))?")
+
+
+def kind_of(sig, m):
+    if sig.startswith("public companion"):
+        return "companion object"
+    for k in ("enum", "data", "sealed", "annotation", "abstract", "fun"):
+        if f" {k} " in f" {sig} ".replace("public ", "", 1):
+            return f"{k} {m.group(1)}" if k != "fun" else "fun interface"
+    return m.group(1)
+
+
+def names():
+    """NAMES.md: per source set, one row per public type: its kind, its public functions and its properties."""
+    doc = ["# Public names\n",
+           "Every public type and function of the Android SDK, read from the sources by `scripts/make_api_doc.py` (the",
+           "signatures are in [docs/api.md](docs/api.md)). Package `ai.quranlab.tajweedformer` unless the row names a",
+           "sub-package; a nested type is written `Outer.Inner`. Anything not listed is internal: the library is in Kotlin's",
+           "explicit API mode, and the Quran Lab Core inside it has no public Kotlin name at all.\n"]
+    for folder, title in SETS:
+        rows = []
+        for d, _, ns in os.walk(os.path.join(WT, folder)):
+            for n in ns:
+                if not n.endswith(".kt"):
+                    continue
+                pkg = ""
+                for l in open(os.path.join(d, n), encoding="utf-8"):
+                    if l.startswith("package "):
+                        pkg = l.split()[1].strip()
+                        break
+                stack = []
+                top = {"kind": "top-level functions", "name": n, "funs": [], "props": [], "pkg": pkg}
+                for depth, sig in declarations(os.path.join(d, n)):
+                    del stack[depth:]
+                    m = TYPE.match(sig)
+                    if m:
+                        name = m.group(2) or "Companion"
+                        row = {"kind": kind_of(sig, m), "name": (stack[-1]["name"] + "." if stack else "") + name,
+                               "funs": [], "props": [], "pkg": pkg}
+                        rows.append(row)
+                        stack.append(row)
+                        continue
+                    owner = stack[-1] if stack else top
+                    f = re.search(r"\bfun (?:<[^>]+> )?([\w.]+)\(", sig)
+                    p = re.search(r"\b(?:val|var) (?:<[^>]+> )?([\w.]+)\s*:", sig)
+                    if sig.startswith("public constructor"):
+                        owner["funs"].append("constructor")
+                    elif f:
+                        owner["funs"].append(f.group(1))
+                    elif p:
+                        owner["props"].append(p.group(1))
+                if top["funs"] or top["props"]:
+                    rows.append(top)
+        if not rows:
+            continue
+        rows.sort(key=lambda r: (r["pkg"], r["name"].lower()))
+        doc.append(f"## {title}\n")
+        doc.append("| Type | Kind | Functions | Properties |")
+        doc.append("|---|---|---|---|")
+        for r in rows:
+            sub = r["pkg"].replace("ai.quranlab.tajweedformer", "").lstrip(".")
+            name = f"`{r['name']}`" + (f" ({sub})" if sub else "")
+            fs = ", ".join(f"`{x}`" for x in dict.fromkeys(r["funs"]))
+            ps = ", ".join(f"`{x}`" for x in dict.fromkeys(r["props"]))
+            doc.append(f"| {name} | {r['kind']} | {fs} | {ps} |")
+        doc.append("")
+    return "\n".join(doc).rstrip() + "\n"
+
+
+outputs = [(os.path.join(WT, "docs", "api.md"), build()), (os.path.join(WT, "NAMES.md"), names())]
 if "--check" in sys.argv:
-    same = os.path.exists(path) and open(path, encoding="utf-8").read().replace("\r\n", "\n") == text
-    print("docs/api.md is current" if same else "docs/api.md differs from the sources")
-    sys.exit(0 if same else 1)
-open(path, "w", encoding="utf-8", newline="\n").write(text)
-print(len(text.splitlines()), "lines")
+    ok = True
+    for path, text in outputs:
+        same = os.path.exists(path) and open(path, encoding="utf-8").read().replace("\r\n", "\n") == text
+        print(os.path.relpath(path, WT), "is current" if same else "differs from the sources")
+        ok = ok and same
+    sys.exit(0 if ok else 1)
+for path, text in outputs:
+    open(path, "w", encoding="utf-8", newline="\n").write(text)
+    print(os.path.relpath(path, WT), len(text.splitlines()), "lines")

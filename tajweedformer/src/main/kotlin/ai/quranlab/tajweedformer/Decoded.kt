@@ -99,12 +99,7 @@ internal object Decoder {
         val lp = heads[HeadId.LOG_PROBS] ?: return Decoded(emptyList(), emptyList(), emptyList(), ranked, probabilities)
         val w = HeadId.LOG_PROBS.width
         val conf = heads[HeadId.CONF]
-        val t2 = heads.top2 ?: run {
-            if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) {
-                throw RecognizerException.EngineNotAvailable("the decoded layer's top-2 is the engine's (zf_tajweed_top2)")
-            }
-            ai.quranlab.tajweedformer.engine.TajweedJni.top2(lp, heads.n40, w)
-        }
+        val t2 = heads.top2 ?: TopK.top2(lp, heads.n40, w)
         val frames = ArrayList<CtcFrame>(heads.n40)
         for (t in 0 until heads.n40) {
             frames.add(CtcFrame(frameOffset + t, t2[5 * t].toInt(), t2[5 * t + 2], t2[5 * t + 1].toInt(), t2[5 * t + 3]))
@@ -172,11 +167,8 @@ internal class Ranked(val head: HeadId, val frames: Int, val k: Int, val ids: In
             require(head.kind != HeadKind.LOGIT) { "${head.key} is a single logit: it has no ranking" }
             require(k in 1..head.width) { "k $k is not 1..${head.width} for ${head.key}" }
             val v = heads[head] ?: throw NoSuchElementException("${head.key} is absent")
-            if (!ai.quranlab.tajweedformer.engine.TajweedJni.available) {
-                throw RecognizerException.EngineNotAvailable("the decoded layer's ranking is the engine's (zf_tajweed_topk)")
-            }
             val frames = heads.frames(head)
-            val r = ai.quranlab.tajweedformer.engine.TajweedJni.topk(v, frames, head.width, k)
+            val r = TopK.topk(v, frames, head.width, k)
             val n = frames * k
             return Ranked(head, frames, k, IntArray(n) { r[3 * it].toInt() }, FloatArray(n) { r[3 * it + 1] }, FloatArray(n) { r[3 * it + 2] })
         }

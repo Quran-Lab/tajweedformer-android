@@ -1,6 +1,5 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.engine.ExactTajweedEngine
 import org.junit.Rule
 import org.junit.rules.TestRule
 import org.junit.runner.Description
@@ -43,7 +42,7 @@ internal class NothingLeftOpen(private val graceMs: Long = GRACE_MS) : TestRule 
         /** How long an end that is on its way may take, ms. */
         const val GRACE_MS = 3_000L
 
-        private fun streamLive(): Boolean = try { ExactTajweedEngine.streamLive } catch (_: Throwable) { false }
+        private fun streamLive(): Boolean = try { ai.quranlab.tajweedformer.core.CoreTajweedEngine.streamLive } catch (_: Throwable) { false }
 
         /** What was made since [before] and is still open after the grace time; empty when nothing is. */
         fun leftOpen(before: Map<Any, String>, streamBefore: Boolean, graceMs: Long = GRACE_MS): List<String> {

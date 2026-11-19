@@ -1,142 +1,143 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.cloud.android.KeystoreInstallKey
+import ai.quranlab.tajweedformer.core.android.KeystoreIdentity
+import ai.quranlab.tajweedformer.core.android.KeystoreStateVault
+import android.content.pm.PackageManager
 import android.os.Build
-import android.security.keystore.KeyInfo
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
-import org.junit.Assume
-import org.junit.FixMethodOrder
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.junit.runners.MethodSorters
 import java.io.File
-import java.security.KeyStore
-import javax.crypto.SecretKey
-import javax.crypto.SecretKeyFactory
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.SecureRandom
+import java.security.Signature
+import java.security.cert.CertificateFactory
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
 
 /**
- * The install record's key on a real phone (SPEC 15.2): the Android Keystore's HMAC key that [KeystoreInstallKey] makes,
- * through the same [InstallRecords] the Client uses. Stand-in files only: no model, no network, no Quran Lab key. Its
- * own key aliases, so the SDK's own key on the phone is never touched.
+ * The install's keys of SDK 4.0 on a real phone, in the Android Keystore through
+ * [KeystoreIdentity] and [KeystoreStateVault]. No network, no Quran Lab key, no model. Every key it makes is deleted.
  *
- * 1. [aTheKeyAndTheRecords]: no key yet reads as "no key"; the key is made; a `downloading` and an `installed` record
- *    are written and read back as valid; NEW instances (what a new process makes) read the record as valid; a record
- *    made with another Keystore key is not valid. The key and the `installed` record are left for 2.
- * 2. [bAfterARelaunch]: run alone in a second `am instrument` (a new process): the record written by 1 is valid; then
- *    the key is deleted, and the state is "no key" (a null MAC, no record valid, a sweep deletes the folder), not "the
- *    key store failed". Everything this test made is removed. In a run of the whole class it runs after 1 in the same
- *    process.
+ * - The agreement key is made NEW with the attest's challenge: EC P-256 `PURPOSE_AGREE_KEY` from API 31, RSA-2048
+ *   `PURPOSE_DECRYPT` (OAEP SHA-1) below (the Alcatel 1 is API 30); StrongBox where the phone has it. Its certificate
+ *   chain comes back leaf first, the leaf's key is the key, and the leaf carries the challenge (Key Attestation).
+ * - What the Core asks of it works: ECDH with an ephemeral P-256 key gives the same x coordinate as the other side
+ *   computes; RSA-OAEP with SHA-1 and MGF1-SHA-1 opens what the server's WebCrypto form wrapped.
+ * - The signing key signs, and the signature verifies with its SPKI (the attest's and the lease's `install_sig`).
+ * - A refused attest deletes the new key and keeps the old; an accepted one deletes the old.
+ * - The state vault seals and opens; its counter only rises.
  *
- * Each step logs its time (tag InstallKeyDevice): key creation, and one record check, the check the Client makes
- * before a model opens.
+ * Each step logs its time (tag InstallKey40): key creation with attestation can take seconds on a slow phone's TEE.
  */
 @RunWith(AndroidJUnit4::class)
-@FixMethodOrder(MethodSorters.NAME_ASCENDING)
 class InstallKeyDeviceTest {
     private val ctx = InstrumentationRegistry.getInstrumentation().targetContext
-    private val root = File(ctx.noBackupFilesDir, "install-key-device-test")
-    private val models = File(root, "models")
-    private val buildDir = File(File(models, "v4.0"), BUILD)
+    private val dir = File(ctx.noBackupFilesDir, "install-key-device-test-40")
+    private val id = KeystoreIdentity(ctx, File(dir, "keys"))
 
-    private fun log(s: String) {
-        Log.i(TAG, s)
+    @After
+    fun cleanUp() {
+        id.reset()
+        dir.deleteRecursively()
     }
 
+    private fun log(s: String) = Log.i("InstallKey40", s)
     private fun ms(t0: Long) = (System.nanoTime() - t0) / 1e6
 
-    private fun store() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    private val challenge = "c1.4102444800.j2m5kXPeKJN6QDT5_rt0bA.v2tgPDs9l3CDNh_rhyIML3"
 
     @Test
-    fun aTheKeyAndTheRecords() {
-        val ks = store()
-        ks.deleteEntry(ALIAS)
-        ks.deleteEntry(OTHER)
-        root.deleteRecursively()
-        log("device ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.SUPPORTED_ABIS.joinToString()}")
-
-        // no key yet: "no key", not a failure
-        val keys = KeystoreInstallKey(ALIAS)
-        val records = InstallRecords(keys)
-        assertNull("a MAC without a key", keys.mac("x".toByteArray()))
-        assertFalse("the store says there is a key before one was made", records.probe())
-
-        // the key is made (as at the first download)
+    fun theAgreementKeyIsNewAndAttestedForTheChallenge() {
         var t0 = System.nanoTime()
-        records.write(buildDir, BUILD, InstallRecords.State.DOWNLOADING)
-        val created = ms(t0)
-        val key = store().getKey(ALIAS, null) as SecretKey
-        val info = SecretKeyFactory.getInstance(key.algorithm, "AndroidKeyStore").getKeySpec(key, KeyInfo::class.java) as KeyInfo
-        @Suppress("DEPRECATION")
-        val hardware = info.isInsideSecureHardware
-        val level = if (Build.VERSION.SDK_INT >= 31) info.securityLevel.toString() else "n/a below API 31"
-        log("key ${key.algorithm} made and the downloading record written in %.1f ms; inside secure hardware: $hardware; security level: $level".format(created))
-        assertEquals(InstallRecords.State.DOWNLOADING, records.state(buildDir, BUILD))
-
-        // installed, read back
-        records.write(buildDir, BUILD, InstallRecords.State.INSTALLED)
+        val k = id.prepare(challenge)
+        log("agreement key (${if (k.rsa) "RSA-2048" else "EC P-256"}, strongbox ${k.strongBox}, hardware ${k.hardware}): ${ms(t0)} ms, chain ${k.chain.size}")
+        assertEquals("RSA below API 31, EC from it", Build.VERSION.SDK_INT < 31, k.rsa)
+        if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)) log("the phone has StrongBox; used: ${k.strongBox}")
+        assertTrue("a Key Attestation chain", k.chain.isNotEmpty())
+        val cf = CertificateFactory.getInstance("X.509")
+        val leaf = cf.generateCertificate(k.chain[0].inputStream())
+        assertArrayEquals("the leaf is the install key", k.spki, leaf.publicKey.encoded)
+        // the attestation extension carries the challenge's UTF-8 bytes (setAttestationChallenge)
+        val ext = (leaf as java.security.cert.X509Certificate).getExtensionValue("1.3.6.1.4.1.11129.2.1.17")
+        assertNotNull("the leaf has a key description", ext)
+        assertTrue("the key description holds the challenge", indexOf(ext!!, challenge.toByteArray(Charsets.UTF_8)) >= 0)
+        // each link is signed by the next
+        for (i in 0 until k.chain.size - 1) {
+            cf.generateCertificate(k.chain[i].inputStream()).verify(cf.generateCertificate(k.chain[i + 1].inputStream()).publicKey)
+        }
+        // a second key for another challenge is another key
         t0 = System.nanoTime()
-        assertEquals(InstallRecords.State.INSTALLED, records.state(buildDir, BUILD))
-        log("one record check (installed, valid) in %.1f ms".format(ms(t0)))
-
-        // new instances of the classes, as a new process makes them
-        t0 = System.nanoTime()
-        assertEquals("a new instance does not read the record as valid", InstallRecords.State.INSTALLED,
-            InstallRecords(KeystoreInstallKey(ALIAS)).state(buildDir, BUILD))
-        log("new instances: one record check in %.1f ms".format(ms(t0)))
-
-        // a record made with another Keystore key (another device's) is not valid here
-        val elsewhere = File(File(File(root, "elsewhere"), "v4.0"), BUILD)
-        InstallRecords(KeystoreInstallKey(OTHER)).write(elsewhere, BUILD, InstallRecords.State.INSTALLED)
-        assertEquals(InstallRecords.State.INSTALLED, InstallRecords(KeystoreInstallKey(OTHER)).state(elsewhere, BUILD))
-        val copied = File(File(File(root, "copied"), "v4.0"), BUILD).apply { mkdirs() }
-        File(elsewhere.parentFile, BUILD + InstallRecords.SUFFIX).copyTo(File(copied.parentFile, BUILD + InstallRecords.SUFFIX))
-        assertNull("a record made with another key reads as valid", InstallRecords(KeystoreInstallKey(ALIAS)).state(copied, BUILD))
-        store().deleteEntry(OTHER)
-        File(root, "elsewhere").deleteRecursively()
-        File(root, "copied").deleteRecursively()
-        log("a record made with another Keystore key: not valid")
-        // the key and the installed record stay for bAfterARelaunch
+        val k2 = id.prepare("c1.4102444800.AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBB")
+        log("a second agreement key: ${ms(t0)} ms")
+        assertTrue(!k2.spki.contentEquals(k.spki))
+        id.commit(k)
+        id.discard(k2)
+        assertArrayEquals("the committed key is the install's", k.spki, id.current()!!.spki)
     }
 
     @Test
-    fun bAfterARelaunch() {
-        Assume.assumeTrue("no record from aTheKeyAndTheRecords", File(buildDir.parentFile, BUILD + InstallRecords.SUFFIX).isFile)
-        log("process ${android.os.Process.myPid()}")
-        // the first check in this process: the Keystore loads, the Keystore computes the MAC
-        var t0 = System.nanoTime()
-        val records = InstallRecords(KeystoreInstallKey(ALIAS))
-        assertEquals("the record of the earlier run is not valid", InstallRecords.State.INSTALLED, records.state(buildDir, BUILD))
-        log("first record check in this process (installed, valid) in %.1f ms".format(ms(t0)))
-        t0 = System.nanoTime()
-        assertEquals(InstallRecords.State.INSTALLED, records.state(buildDir, BUILD))
-        log("second record check in %.1f ms".format(ms(t0)))
-
-        // the key deleted (a cleared Keystore): "no key", never "the key store failed"
-        store().deleteEntry(ALIAS)
-        val keys = KeystoreInstallKey(ALIAS)
-        assertNull("a MAC without a key", keys.mac("x".toByteArray()))
-        val after = InstallRecords(keys)
-        assertFalse(after.probe())
-        assertNull("a record reads as valid without its key", after.state(buildDir, BUILD))
-        File(buildDir, "stand-in.bin").apply { parentFile!!.mkdirs(); writeBytes(ByteArray(1024)) }
-        after.sweep(models)
-        assertFalse("the folder whose record cannot be valid was kept", buildDir.exists())
-        log("the key deleted: no key (no exception), no record valid, the folder swept")
-        root.deleteRecursively()
-        assertTrue(!root.exists())
+    fun whatTheCoreAsksOfTheKeyWorks() {
+        val k = id.prepare(challenge)
+        id.commit(k)
+        val t0 = System.nanoTime()
+        if (!k.rsa) {
+            val eph = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
+            val z = id.agree(k, ProtectedKit.point(eph.public))
+            val other = KeyAgreement.getInstance("ECDH").run {
+                init(eph.private)
+                doPhase(KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(k.spki)), true)
+                generateSecret()
+            }
+            assertArrayEquals("ECDH in the Keystore", other, z)
+            log("ECDH in the Keystore: ${ms(t0)} ms")
+        } else {
+            val kek = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val c = Cipher.getInstance("RSA/ECB/OAEPWithSHA-1AndMGF1Padding").run {
+                init(Cipher.ENCRYPT_MODE, KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(k.spki)), ai.quranlab.tajweedformer.core.P256.OAEP_SHA1)
+                doFinal(kek)
+            }
+            assertArrayEquals("RSA-OAEP SHA-1 in the Keystore", kek, id.decryptRsa(k, c))
+            log("RSA-OAEP in the Keystore: ${ms(t0)} ms")
+        }
+        val msg = "quranlab-lease-ask 1\n$challenge\n${"0".repeat(40)}\n".toByteArray()
+        val sig = id.sign(msg)
+        val ok = Signature.getInstance("SHA256withECDSA").run {
+            initVerify(KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(id.signingSpki())))
+            update(msg)
+            verify(sig)
+        }
+        assertTrue("the signing key's signature verifies", ok)
     }
 
-    private companion object {
-        const val TAG = "InstallKeyDevice"
-        /** Aliases of this test only (the SDK's own is quranlab.model.install.1). */
-        const val ALIAS = "quranlab.model.install.devicetest"
-        const val OTHER = "quranlab.model.install.devicetest.other"
-        const val BUILD = "0123456789abcdef0123456789abcdef01234567"
+    @Test
+    fun theStateVault() {
+        val v = KeystoreStateVault(File(dir, "vault"))
+        val secret = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val sealed = v.seal(secret)!!
+        assertArrayEquals(secret, v.open(sealed))
+        assertEquals(0L, v.counterGet())
+        assertTrue(v.counterRaise(5))
+        assertTrue(v.counterRaise(3))
+        assertEquals(5L, v.counterGet())
+        java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(KeystoreStateVault.ALIAS)
+    }
+
+    private fun indexOf(h: ByteArray, n: ByteArray): Int {
+        outer@ for (i in 0..h.size - n.size) {
+            for (j in n.indices) if (h[i + j] != n[j]) continue@outer
+            return i
+        }
+        return -1
     }
 }

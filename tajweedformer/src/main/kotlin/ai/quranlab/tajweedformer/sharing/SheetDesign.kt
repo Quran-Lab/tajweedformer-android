@@ -12,8 +12,8 @@ import kotlin.math.roundToInt
  *
  * The sheet, top to bottom: the header (the emblem and [NAME]), the title, the re-ask line on a re-ask, the body,
  * the disclosure card (`sheet.what`, `sheet.who`, `sheet.control`, each with its icon), the hadith card when the
- * deck's hadith is verified, `sheet.mistakes` (not in the guardian variant, as in 3.1.0), the guardian's confirmation
- * card; then the bar that does not scroll, with "Share" over "Not now", the same size.
+ * deck's hadith is verified, `sheet.mistakes`; then the bar that does not scroll, with "Share" over "Not now", the
+ * same size. SDK 4.0 has this one sheet for every app.
  */
 internal object SheetDesign {
     /**
@@ -65,9 +65,6 @@ internal object SheetDesign {
     const val MIN_CONTRAST = 4.5
     const val MARK_CONTRAST = 3.0
 
-    /** The share button of the guardian variant until the switch is on. */
-    const val DISABLED_ALPHA = 0.45f
-
     /** The dim over the app behind the sheet (the window's dim amount). */
     const val SCRIM_ALPHA = 0.4f
 
@@ -86,7 +83,7 @@ internal object SheetDesign {
     const val GLYPH = 22f
     const val NAME_GAP = 10f
 
-    /** The cards: the disclosure card and the guardian's (card colour) and the hadith card (soft tint). */
+    /** The cards: the disclosure card (card colour) and the hadith card (soft tint). */
     const val CARD_RADIUS = 18f
     const val CARD_PAD_H = 16f
     /** The drawing's 2 above and below the rows of a card (`padding: 2px 16px`). */
@@ -138,7 +135,7 @@ internal object SheetDesign {
     /** A phone sheet opens tall: its top is this far below the top of the window (below the status bar). */
     const val SHEET_TOP_GAP = 10f
 
-    /** The switch of the guardian's card and of the settings rows. */
+    /** The switch of the settings rows. */
     const val SWITCH_W = 52f
     const val SWITCH_H = 32f
     const val THUMB_INSET = 3f
@@ -186,7 +183,7 @@ internal object SheetDesign {
     /** The body and the re-ask line: 15.5 / 24 regular; Arabic and Urdu 27. */
     fun body(s: Script) = Type(15.5f, if (s == Script.ARABIC) 27f else 24f, REGULAR)
 
-    /** A disclosure row and the guardian's confirmation: 14.5 / 22 regular; Arabic and Urdu 25. */
+    /** A disclosure row: 14.5 / 22 regular; Arabic and Urdu 25. */
     fun row(s: Script) = Type(14.5f, if (s == Script.ARABIC) 25f else 22f, REGULAR)
 
     /** The hadith: 15 / 24 regular; Arabic and Urdu 28. */

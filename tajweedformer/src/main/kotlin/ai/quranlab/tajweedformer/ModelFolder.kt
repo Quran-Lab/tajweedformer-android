@@ -28,7 +28,13 @@ internal class ModelFolder private constructor(
     val vocabulary: Vocabulary,
     /** The contexts whose files are on disk and verified, in the manifest's order. */
     val availableContexts: List<String>,
+    /** SDK 4.0: the encrypted build this folder is (the Core opens it); null for a plain folder (tests of the decoded layer). */
+    val protected: ai.quranlab.tajweedformer.core.ProtectedBuild? = null,
 ) {
+    /** The same folder with the vocabulary the open model gives (the Core's, R4: the build's own tokens.txt). */
+    fun withVocabulary(v: Vocabulary): ModelFolder =
+        if (v.names == vocabulary.names) this else ModelFolder(dir, manifest, calibration, v, availableContexts, protected)
+
     /** The model's id ("v4.0"). */
     val modelId: String get() = manifest.modelId
 
@@ -70,6 +76,28 @@ internal class ModelFolder private constructor(
 
         internal fun chunkMsOf(context: String): Int =
             Regex("^c(\\d+)_l\\d+$").find(context)?.groupValues?.get(1)?.toInt()?.times(20) ?: 0
+
+        /**
+         * An encrypted build (SDK 4.0): the manifest verified, the calibration read from its plain file (verified by its
+         * SHA-256), a first vocabulary (the one the SDK carries for the build's signed `tokens_sha256`, else ids alone),
+         * which the open model's own replaces (R4: the Core reads the build's tokens.txt container,
+         * [ModelFolder.withVocabulary]), and the contexts whose files the Core has installed.
+         */
+        internal fun protected(build: ai.quranlab.tajweedformer.core.ProtectedBuild, verifier: ManifestVerifier): ModelFolder {
+            val m = build.manifest
+            verifier.verify(m)
+            val stamps = VerifiedStamps(File(build.dir, VerifiedStamps.FILE_NAME))
+            val calEntry = m.files.firstOrNull { it.role == "calibration" && it.encoding != ModelManifest.Encoding.QLE1 }
+            val calFile = calEntry?.let { File(build.dir, it.localPath) }
+            val calibration = if (calEntry != null && calFile!!.isFile && stamps.verified(calFile, calEntry.localSize, calEntry.localSha256)) {
+                TajweedCalibration(calFile.readBytes(), calEntry.localSha256)
+            } else null
+            val vocabulary = Vocabulary.known(m.tokensSha256) ?: Vocabulary(Array(VOCAB_SIZE) { "<$it>" }, BLANK)
+            if (vocabulary.size != VOCAB_SIZE) throw RecognizerException.ModelLoadFailed("the vocabulary has ${vocabulary.size} tokens, V4 has $VOCAB_SIZE")
+            val available = m.contexts.filter { build.contextInstalled(it) }
+            if (available.isEmpty()) throw RecognizerException.ModelMissing("no context is installed in ${build.dir.path}")
+            return ModelFolder(build.dir, m, calibration, vocabulary, available, build)
+        }
 
         /** Opens and verifies the V4 folder [dir]; [require] are contexts that must be present. */
         @JvmStatic

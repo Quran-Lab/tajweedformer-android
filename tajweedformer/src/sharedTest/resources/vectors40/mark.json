@@ -1,0 +1,29 @@
+{
+ "section": "PROTECTED_MODEL.md 18.7.4",
+ "note": "Test keys only, made by protected40.py from fixed labels (stream(label, n): SHA-256 of the label and a 32-bit little-endian counter, concatenated). No SDK trusts them.",
+ "k_mark_hex": "55b9dc3505990f010d9610cc9b762e534f3259a14b58ea45bcd3cdee0d68c8c1",
+ "rule": "mark = SHA-256(API key id)[0:8] || install hash[0:8] || HMAC-SHA256(K_mark, those 16 bytes)[0:8]",
+ "cases": [
+  {
+   "api_key_id": "apps-one",
+   "install_hash_hex": "bd70fa07915575f0475829cb136c0636cce1e2c7b198ea270bb41537cd45afd8",
+   "mark_hex": "61c787be9d52382ebd70fa07915575f0523f586df39a2044",
+   "parts": {
+    "key_hash8_hex": "61c787be9d52382e",
+    "install8_hex": "bd70fa07915575f0",
+    "mac8_hex": "523f586df39a2044"
+   }
+  },
+  {
+   "api_key_id": "web-one",
+   "install_hash_hex": "5d11a97241721477528fc219ca099c3c7e0fc84bbe9113401598b0cd751576d3",
+   "mark_hex": "0951fe702420bdb05d11a972417214771ca5a1f908671875",
+   "parts": {
+    "key_hash8_hex": "0951fe702420bdb0",
+    "install8_hex": "5d11a97241721477",
+    "mac8_hex": "1ca5a1f908671875"
+   }
+  }
+ ],
+ "device_form": "The device-form bytes a mark produces need the scrambled layout's gap census (18.7.1); they are added by P3 with layout.json."
+}

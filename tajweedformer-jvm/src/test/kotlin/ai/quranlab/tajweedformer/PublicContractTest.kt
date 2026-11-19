@@ -38,7 +38,9 @@ class PublicContractTest : OpenChecked() {
             "TajweedChunk", "TajweedDecoded", "TajweedToken", "TajweedWord", "TajweedFrame", "TajweedHead", "TajweedEvent",
             "TajweedTokens", "TajweedCalibration", "TajweedReference", "TajweedClip",
             "TajweedSharing", "TajweedAnalytics", "TajweedDiagnosis",
-            "TajweedError", "Microphone")
+            "TajweedError", "Microphone",
+            // SDK 4.0 (SPEC 17.9): the app's judgement of a recited range
+            "RecitedOutcome")
         // the sharing UI components: the Views' theme and settings rows, the Compose style
         val ui = listOf("SharingTheme", "SharingSettingsView", "SharingStyle")
         assertEquals((naming + ui).sorted(), found)
@@ -85,9 +87,9 @@ class PublicContractTest : OpenChecked() {
     fun theErrorCatalogueIsTheContracts() {
         val bytes = javaClass.getResourceAsStream("/ai/quranlab/tajweedformer/errors.json")!!.use { it.readBytes() }
         val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-        // recorded from the contract's errors.json; the
-        // copy in the SDK is never typed by hand
-        assertEquals("04b264b9d820f865a0bfd4d695e17a07b2ae6b1be318324c91f3177d322cd510", sha)
+        // recorded from the contract's errors.json; the copy in
+        // the SDK is never typed by hand
+        assertEquals("923da8f3d66e765a34574c4e12cbce5ae963688f407a07106f46dcd865fad3bd", sha)
         // where the contract folder is at hand (not on CI), byte for byte
         val contract = (System.getProperty("TJ_ERRORS_JSON") ?: "").let(::File)
         if (contract.isFile) assertArrayEquals("the embedded catalogue differs from ${contract.path}", contract.readBytes(), bytes)
@@ -169,6 +171,12 @@ class PublicContractTest : OpenChecked() {
         for (edge in listOf("min", "max")) TajweedSessionOptions(endOnSilenceMs = (silence[edge] as Double).toInt()).validate()
         assertEquals(listOf(500, 60_000), listOf("min", "max").map { (silence[it] as Double).toInt() })
         assertEquals((speech["default_window_ms"] as Double).toInt(), TajweedSession.DEFAULT_SILENCE_MS)
+        // the Client's options: the two of names.json are 3.x only, skipped by a 4.0 replay, and 4.0's options have neither; nothing else of client_options is left to replay
+        val clientOptions = names["client_options"] as Map<String, Any?>
+        val threeXOnly = setOf("analytics", "audience")
+        assertEquals("client_options left to replay", emptySet<String>(), clientOptions.keys - threeXOnly)
+        val optionFields = TajweedClientOptions::class.java.declaredFields.map { it.name }.toSet()
+        for (k in clientOptions.keys) assertTrue("TajweedClientOptions still has $k", k !in optionFields)
         // the fields of the output types are public properties of those names
         fun props(c: Class<*>) = c.methods.map { it.name }.filter { it.startsWith("get") || it.startsWith("is") }
             .map { n -> if (n.startsWith("is")) n else n.removePrefix("get").replaceFirstChar { it.lowercase() } }.toSet()

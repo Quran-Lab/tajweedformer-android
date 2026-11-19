@@ -11,17 +11,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal data class CloudOptions @JvmOverloads constructor(
     /** The app's developer key, `qlk_v1_...`, from sdk.quranlab.ai. Null: offline only, nothing is sent. */
     val key: String?,
-    /** Telemetry v2, on by default (anonymous daily sums). [Analytics.OFF] is the developer's one opt-out. */
-    val analytics: Analytics = Analytics.ON,
     /** Issue reports (no free text). */
     val issueReports: Boolean = true,
     /**
-     * Ignored since 2.0.1: whether the SDK offers recitation sharing (its own sheet, then whole sessions
-     * uploaded for a learner who said "Share") is Quran Lab's decision per app, in the signed config.
+     * Ignored since 2.0.1: every learner is asked (the SDK's own sheet, then whole sessions uploaded for a learner
+     * who said "Share"); the signed config's `flags.contributions` is Quran Lab's incident switch for every app.
      */
     val contributions: Boolean = false,
-    /** Children: the sheet addresses the parent or guardian. */
-    val audience: Audience = Audience.GENERAL,
     /**
      * Sharing uploads only on unmetered networks (default: any network; about 86 MB per hour at the top
      * bitrate, less where uploads struggle: the bitrate steps down to 32 kbit/s, about 16 MB an hour).
@@ -30,10 +26,7 @@ internal data class CloudOptions @JvmOverloads constructor(
     val apiUrl: String = QuranLabApi.DEFAULT_API,
     /** The Ed25519 keys the signed config may be signed with (raw 32 bytes). */
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
-) {
-    enum class Analytics { ON, OFF }
-    enum class Audience { GENERAL, CHILDREN }
-}
+)
 
 /** What the cloud side needs from the platform (Android: `QuranLabAndroid` builds it). */
 internal class CloudEnvironment(
@@ -113,7 +106,23 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     }
     val telemetry = Telemetry(File(env.storage, "telemetry"), env.clock)
     val issues = IssueQueue(cloudDir, env.clock)
+
+    /** Error reports: every failure that reaches the app, and the silent ones of 24.1's list. */
+    val errors = ErrorReporter(cloudDir)
     val sharing = Sharing(this)
+
+    /** The model a report names (24.2 `revision` and `build`): the version and build in use or being fetched. */
+    @Volatile var reportModel: Pair<String?, String?>? = null
+
+    /** The app is in the foreground (24.6: the 30 s send point runs only then). The desktop JVM's launch says so. */
+    @Volatile var inForeground = false
+
+    /** The wait between an occurrence that made a new report and its send point (24.6: 30 s). Tests shorten it. */
+    @Volatile var errorSendDelayMs = ERROR_SEND_DELAY_MS
+    private val errorTimerSet = AtomicBoolean(false)
+    private val errorTimer by lazy {
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "tajweedformer-errors").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
+    }
 
     /** A refusal stopped network calls until the next launch (revoked key, blocked app, SDK too old). */
     private val stopped = AtomicBoolean(false)
@@ -123,8 +132,17 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     private var telemetryFailures = 0
     @Volatile private var lastSealAt = 0L
 
+    /** SDK 4.0: the recited count of each finished take (SPEC 17.1, 17.6); the Client gives it the Core. */
+    @Volatile var recited: RecitedCount? = null
+
     init {
-        telemetry.enabled = options.analytics == CloudOptions.Analytics.ON && config.current?.flags?.analytics != false
+        // SDK 4.0 (owner, 11-16): anonymous analytics are always on; the signed config's flags.analytics is the only switch
+        telemetry.enabled = config.current?.flags?.analytics != false
+        telemetry.metric = { g -> currentConfig?.flags?.metric(g) != false }
+        // 24.5: the signed config's flags.issues false turns error reports off (4.0 has no app option for them)
+        if (!options.issueReports || config.current?.flags?.issues == false) errors.off()
+        // 24.1: a telemetry report kept 7 days without being accepted is dropped, and that is reported
+        telemetry.expired = { silent(ErrorCause("events", "expired")) }
         // incidents made before the app configured Quran Lab join the queue (sent with the key once online)
         val spool = IncidentSpool(cloudDir, env.clock)
         try {
@@ -247,7 +265,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
      */
     @JvmOverloads
     fun launch(modelRevision: String? = null, foreground: Boolean = true) {
+        // a new app session for the share ask (SHARE_ASK_40 20.2); the first launch with 4.0 stores its time
+        try { sharing.launched() } catch (_: Exception) {}
         if (foreground) {
+            inForeground = true
             telemetry.launch()
             register(modelRevision)
         }
@@ -262,6 +283,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
      */
     @JvmOverloads
     fun foreground(modelRevision: String? = null) {
+        inForeground = true
         sharing.foreground()
         telemetry.launch()
         telemetryFailures = 0
@@ -280,7 +302,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
      * (2.0.3; a take that is running keeps its recording until it ends).
      */
     fun background() {
+        inForeground = false
         sharing.background()
+        // the takes waiting for the app's report are counted (17.6)
+        try { recited?.flush() } catch (_: Exception) {}
         sendPoint()
     }
 
@@ -319,13 +344,24 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             true
         } catch (e: CloudException) {
             if (!e.retryable) pendingNew.delete()
+            // 24.1: the launch went on without its registration (the app's token, attest, when that was what failed)
+            silentCall(e, "register")
             false
         }
     }
 
-    /** Fetches and verifies the config (conditional on its ETag); the last good one stays on failure. */
+    /** The cause of the last config request that failed (24.3), or null after one that was answered and verified. */
+    @Volatile var lastConfigCause: ErrorCause? = null
+        private set
+
+    /**
+     * Fetches and verifies the config (conditional on its ETag); the last good one stays on failure. A failure is a silent
+     * error report (24.1) unless [silentReport] is false: a call of the app that needs the config reports it, once, when
+     * it fails because of it.
+     */
+    @JvmOverloads
     @Synchronized
-    fun refreshConfig(): RemoteConfig? {
+    fun refreshConfig(silentReport: Boolean = true): RemoteConfig? {
         if (key == null || stopped.get()) return config.current
         return try {
             val pin = modelVersion
@@ -337,6 +373,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             refusals.apiAccepted(freshConfig = true)
             rememberPin(pin)
             lastConfigError = null
+            lastConfigCause = null
             lastConfigAt = env.clock()
             applyFlags(c)
             noteSdkLatest(c)
@@ -344,10 +381,14 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             c
         } catch (e: ConfigRejected) {
             lastConfigError = "signature_invalid"
+            lastConfigCause = ErrorCause("config", e.reason)
             report("signature_invalid", "config:" + (e.message ?: "rejected").replace(' ', '_'))
+            if (silentReport) silent(lastConfigCause!!)
             config.current.also { noteSdkLatest(it) }
         } catch (e: CloudException) {
             lastConfigError = e.api?.refusal ?: if (e.notPermitted) NOT_PERMITTED else "offline"
+            lastConfigCause = ErrorCause.ofCloud(e, ErrorRules.stageOfPath(e.path) ?: "config")
+            if (silentReport) silentCall(e, "config")
             config.current.also { noteSdkLatest(it) }
         }
     }
@@ -386,8 +427,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
 
     private fun applyFlags(c: RemoteConfig?) {
         val f = c?.flags ?: return
-        telemetry.enabled = options.analytics == CloudOptions.Analytics.ON && f.analytics
+        telemetry.enabled = f.analytics
+        if (!telemetry.enabled) try { recited?.clear() } catch (_: Exception) {}
         if (!f.issues) issues.clear()
+        if (!f.issues || !options.issueReports) errors.off() else errors.enabled = true
         if (f.contributions == false) sharing.configTurnedOff()
     }
 
@@ -426,8 +469,14 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         val flags = currentConfig?.flags
         if (telemetry.enabled && flags?.analytics != false && env.clock() >= telemetryRetryAt) reports = sendTelemetry()
         if (options.issueReports && flags?.issues != false) sent = sendIssues()
+        // 24.6: after the telemetry reports, each queued error report
+        if (options.issueReports && flags?.issues != false) errorsSent += sendErrors()
         return reports to sent
     }
+
+    /** Error reports accepted by the server in this process (tests). */
+    @Volatile var errorsSent = 0
+        private set
 
     /**
      * Each sealed report, its exact bytes (a retry sends the same `report_id`, which the server counts once):
@@ -442,8 +491,15 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
                 val r = authed("events") { api.events(it, body).also { r -> if (r.status == 401) throw CloudException(r.error, "events") } }
                 when {
                     r.status == 202 || r.ok -> { telemetry.dropReport(f); n++; telemetryFailures = 0 }
-                    r.status == 400 -> { telemetry.dropReport(f); report("other", "bad_request:events") }
-                    r.status == 413 -> telemetry.dropReport(f)
+                    r.status == 400 -> {
+                        telemetry.dropReport(f)
+                        report("other", "bad_request:events")
+                        silent(ErrorCause("events", "http", 400, errorCode = ErrorRules.serverCode(r.error)))
+                    }
+                    r.status == 413 -> {
+                        telemetry.dropReport(f)
+                        silent(ErrorCause("events", "http", 413, errorCode = ErrorRules.serverCode(r.error)))
+                    }
                     r.status == 403 -> { refused(CloudException(r.error, "events"), "events"); return n }
                     else -> { backoffTelemetry(); return n }
                 }
@@ -479,36 +535,101 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         return n
     }
 
+    // ---- error reports ----
+
+    /** 24.1 item 1: a failure that reached the app, with the stage of its cause. */
+    fun errorReachedApp(e: ai.quranlab.tajweedformer.TajweedError) {
+        occur(ErrorCause.of(e), e.code)
+    }
+
+    /**
+     * 24.1 item 2: a failure the SDK went on from without telling the app: code `none` (a call of the app that fails
+     * on the same cause is its own report, with its code, 24.1). A plain network failure is not reported (24.1).
+     */
+    fun silent(cause: ErrorCause) {
+        occur(cause, "none")
+    }
+
+    /** A background call of the launch that failed (24.1): its stage is the request's (an attest under a register is
+     *  `attest`). */
+    private fun silentCall(e: CloudException, stage: String) {
+        silent(ErrorCause.ofCloud(e, ErrorRules.stageOfPath(e.path) ?: stage))
+    }
+
+    private fun occur(c: ErrorCause, code: String) {
+        try {
+            val firstLaunch = try { sharing.firstLaunch } catch (_: Exception) { false }
+            val made = errors.occur(Day.of(env.clock()), c.stage, c.reason, code, c.httpStatus, firstLaunch, snapshot(c))
+            if (made) armErrorTimer()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** The occurrence's fields (24.2): the error's class and code, the retries, the model, and the device's snapshot. */
+    private fun snapshot(c: ErrorCause): Map<String, Any?> {
+        val d = LinkedHashMap<String, Any?>()
+        c.errorName?.let { d["error_name"] = it }
+        c.errorCode?.let { d["error_code"] = it }
+        c.retries?.let { d["retries"] = it }
+        val (version, build) = reportModel ?: currentConfig?.let { it.recommendedVersion to it.recommendedRevision } ?: (null to null)
+        version?.let { d["revision"] = it }
+        build?.let { d["build"] = it }
+        env.device.modelCode?.let { d["device_model"] = it }
+        env.device.ramTier?.let { d["ram_tier"] = it }
+        env.device.abi?.let { d["abi"] = it }
+        try { if (env.storage.isDirectory) d["storage_free"] = ErrorRules.storageFree(env.storage.usableSpace) } catch (_: Exception) {}
+        return d
+    }
+
+    /** 24.6: one timer for the SDK, 30 s after an occurrence that made a new report, while the app is in the foreground. */
+    private fun armErrorTimer() {
+        if (!inForeground || key == null || !errorTimerSet.compareAndSet(false, true)) return
+        try {
+            errorTimer.schedule({
+                errorTimerSet.set(false)
+                if (inForeground) try { env.scheduler.scheduleDelivery(this) } catch (_: Exception) {}
+            }, errorSendDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            errorTimerSet.set(false)
+        }
+    }
+
+    /**
+     * 24.6: each queued report, oldest first, one request each. 202 sent; 400 or 413 dropped (never reported: that would
+     * loop); 401 `invalid_token` renewed once by [authed]; 429, 5xx, no answer kept, and this send point stops.
+     */
+    private fun sendErrors(): Int {
+        if (!errors.enabled) return 0
+        var n = 0
+        errors.send(Day.of(env.clock())) { r ->
+            val body = errors.body(r, env.app, env.device, ai.quranlab.tajweedformer.SdkInfo.VERSION)
+            try {
+                val a = authed("issues") { api.issue(it, body).also { x -> if (x.status == 401) throw CloudException(x.error, "issues") } }
+                if (a.ok) { n++; 202 } else a.status
+            } catch (_: Exception) {
+                null
+            }
+        }
+        return n
+    }
+
     /** Queues an issue report (no free text) and schedules delivery. */
     fun report(kind: String, code: String, error: Throwable? = null, backend: String? = null, revision: String? = null) {
         if (!options.issueReports || currentConfig?.flags?.issues == false) return
         if (issues.add(kind, code, IssueQueue.frames(error), env.app, env.device, backend, revision)) env.scheduler.scheduleDelivery(this)
     }
 
-    /** Queues an accelerator incident (section 7.1) and schedules delivery. */
-    fun reportIncident(i: ai.quranlab.tajweedformer.AcceleratorIncident) {
-        if (!options.issueReports || currentConfig?.flags?.issues == false) return
-        if (issues.addIncident(i, IssueQueue.frames(i.error), env.app, env.device)) env.scheduler.scheduleDelivery(this)
-    }
 
     // ---- TajweedObserver ----
 
-    override fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {
-        telemetry.promotion(e)
-        if (!e.promoted) e.incident?.let { reportIncident(it) }
-    }
 
-    override fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) {
-        telemetry.failover(e)
-        reportIncident(e.incident)
-    }
 
-    override fun onBlankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = telemetry.blankConfirmed(e)
 
     override fun onModelLoad(e: TajweedObserver.ModelLoad) = telemetry.modelLoad(e)
     override fun onSelfTest(revision: String, context: String, backend: String, passed: Boolean, build: String) {
         telemetry.selfTest(revision, context, backend, passed, build)
-        if (!passed) report("self_test_failed", "self_test:$backend", backend = backend, revision = revision)
+        // the code stays `self_test:npu` (one issue group per backend kind, as before); the report's backend names the SoC
+        if (!passed) report("self_test_failed", "self_test:${backend.substringBefore(':')}", backend = backend, revision = revision)
     }
     override fun onFallback(revision: String, context: String, from: String, reason: TajweedObserver.FallbackReason, build: String) {
         telemetry.fallback(revision, context, from, reason, build)
@@ -539,6 +660,9 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
 
         /** [lastConfigError] when the system did not let the request out (no INTERNET permission). */
         const val NOT_PERMITTED = "network_not_permitted"
+
+        /** 24.6: an occurrence that made a new report is sent this long after it, while the app is in the foreground. */
+        const val ERROR_SEND_DELAY_MS = 30_000L
 
         @JvmStatic fun install(c: QuranLabCloud?) { shared = c }
     }

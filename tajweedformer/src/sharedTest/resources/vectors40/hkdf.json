@@ -1,0 +1,67 @@
+{
+ "section": "PROTECTED_MODEL.md 18.3.2",
+ "note": "Test keys only, made by protected40.py from fixed labels (stream(label, n): SHA-256 of the label and a 32-bit little-endian counter, concatenated). No SDK trusts them.",
+ "inputs": {
+  "model_root_hex": "eb9b1dae61c1160eacd69e9f113c79d691e451da7d8589a8f369b17daa6c7247",
+  "core_root_hex": "8c80e9bcfcabdbfbe3fce997f5defcd49e995e57d76f403bd446590157a30cf6",
+  "key_id_hex": "d14d9aeeeecb3a238cb86c41a5e8b0c2",
+  "model_id": "v4.0",
+  "version": "4.1.0",
+  "paths": [
+   "layers.zfw",
+   "frontend.zfw",
+   "c16_l64/model_engine2.onnx.zfg.bin",
+   "npu/tensor_g4/c16_l64/model.tflite",
+   "ruled/ب.bin"
+  ],
+  "local_key_id_hex": "9c5957275fe3a8b44016a11cb0422dab",
+  "releases": [
+   "4.0.0-c1",
+   "4.0.0-c2"
+  ]
+ },
+ "build_key_hex": "920882248e3222ee50275814897519d4b1096b7c84c9ff57f8a37945b545b3cc",
+ "other_builds": [
+  {
+   "model_id": "v4.0",
+   "version": "4.1.1",
+   "key_id_hex": "d14d9aeeeecb3a238cb86c41a5e8b0c2",
+   "build_key_hex": "0bc1a3844d89a601ed3e18913d66edaba57dcb4b6f745f5382869f30efc700da"
+  },
+  {
+   "model_id": "v4.1",
+   "version": "4.1.0",
+   "key_id_hex": "d14d9aeeeecb3a238cb86c41a5e8b0c2",
+   "build_key_hex": "b6e0d247f6f3c94375c09b3bfbc654fb7d400f5a81dc18c6b1d70305320156e0"
+  },
+  {
+   "model_id": "v4.0",
+   "version": "4.1.0",
+   "key_id_hex": "b8c581a54aa52818726a2ff4503eab6b",
+   "build_key_hex": "3bbed5dc2e67a3703e7df74a480d1274ad86fc8b7ccfa77f42af94dfe4b350fd"
+  }
+ ],
+ "file_keys_hex": {
+  "layers.zfw": "060762a57c5abdcbf1b33ddcc194af3d35673d8fa93fe95fd88e1f1785bd6f21",
+  "frontend.zfw": "daf6485bf04ef4e088bfac9ea17871bc282de0e7acbf21d2fcce0c3ebef089ca",
+  "c16_l64/model_engine2.onnx.zfg.bin": "ffb1cd964f558bfced830ef6eb58eb66306d4d8a46a25ab2551d86f5c2cffe36",
+  "npu/tensor_g4/c16_l64/model.tflite": "dbac242515e112874906197cf83c58906a9ed299da91f6a1008428780de253ee",
+  "ruled/ب.bin": "2776c42b22daa810ac71f933df6497aeeeaabfa3e52155350cc5bf8fab95e890"
+ },
+ "local_file_keys_hex": {
+  "layers.zfw": "853e68e7dc8b5c9d6e5956742f4d029aeff11bb5a335e9bac00f03d9d6430ceb",
+  "frontend.zfw": "3f22534f767f849041812ae0c5a505fae3ff0ad710f339245c7f314f530c3910",
+  "c16_l64/model_engine2.onnx.zfg.bin": "dc22345c3eb30ef022673aba81e36743f4359f2d01d3e9e8aea27dd34430eae3",
+  "npu/tensor_g4/c16_l64/model.tflite": "975176e3c311787600032e68053f3d4f58ec68bdc18aba5ec18b54d5be020a51",
+  "ruled/ب.bin": "372b7e3ca3b53604abdf7d6eefa079828e765d8d89d3dcc1f3eef3846229fd32"
+ },
+ "k_core_hex": {
+  "4.0.0-c1": "e0d0ef6020e920598dd2e82397f0bca61f2483b619f07276a4a919ee42629913",
+  "4.0.0-c2": "ab347a1c8b9a6efaa5f35d0e476be17883a6256bddca9b1fb6b3dc355355be4a"
+ },
+ "k_chal_hex": {
+  "4.0.0-c1": "dc899abed4e0da295b41688dbee293ceeae8041f31831a0e67e05839afd0b949",
+  "4.0.0-c2": "daaff52c85b24c1ee4a2ce5ea5bf7d62f442ee7a1d2fef78a7fe40dc3bcb51d4"
+ },
+ "k_mark_hex": "55b9dc3505990f010d9610cc9b762e534f3259a14b58ea45bcd3cdee0d68c8c1"
+}

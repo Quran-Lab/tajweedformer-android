@@ -115,7 +115,7 @@ class ShareRecorderTest : OpenChecked() {
 
         /** Time passes until nothing waits; every recording must have ended. */
         fun settle() {
-            at(now + 60_000)
+            at(now + TakeJoin.MAX_WINDOW_MS + 1)
             recorder.checkWindow()
             assertNull("no recording left open", recorder.current)
             assertTrue("every recording ended once", opened.all { it.completed != null })
@@ -124,14 +124,35 @@ class ShareRecorderTest : OpenChecked() {
 
     private fun takes(vararg t: Pair<Long, Int>) = t.map { Take(it.first, it.second) }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun resourceJson(resource: String) =
+        Json.parse(javaClass.getResourceAsStream(resource)!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>
+
     /** The shared vector: every case, once with the window's timer running and once without it (the clock decides). */
     @Suppress("UNCHECKED_CAST")
     @Test fun takesJoinVector() {
-        val v = Json.parse(javaClass.getResourceAsStream("/sharing_vectors/takes_join.json")!!.use { it.readBytes().toString(Charsets.UTF_8) }) as Map<String, Any?>
+        val v = resourceJson("/sharing_vectors/takes_join.json")
+        assertEquals(10, (v["cases"] as List<Map<String, Any?>>).size)
+        replayTakesJoin(v)
+    }
+
+    /** SDK 4.0: every case of the shared vector with the same expectation, then windows up to 60000. */
+    @Suppress("UNCHECKED_CAST")
+    @Test fun takesJoinVector40() {
+        val v = resourceJson("/vectors40/takes_join_40.json")
+        assertEquals((v["max_window_ms"] as Double).toInt(), TakeJoin.MAX_WINDOW_MS)
+        val cases = v["cases"] as List<Map<String, Any?>>
+        assertEquals(18, cases.size)
+        val shared = resourceJson("/sharing_vectors/takes_join.json")["cases"] as List<Map<String, Any?>>
+        assertEquals("the 3.x cases, the same expectations", shared, cases.take(shared.size))
+        replayTakesJoin(v)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun replayTakesJoin(v: Map<String, Any?>) {
         assertEquals((v["default_window_ms"] as Double).toInt(), TakeJoin.DEFAULT_WINDOW_MS)
         assertEquals((v["cap_ms"] as Double).toLong(), TakeJoin.CAP_MS)
         val cases = v["cases"] as List<Map<String, Any?>>
-        assertEquals(10, cases.size)
         var recordings = 0
         for (c in cases) for (timers in listOf(true, false)) {
             val name = "${c["name"]} (${if (timers) "timer" else "no timer"})"
@@ -166,13 +187,14 @@ class ShareRecorderTest : OpenChecked() {
         println("takes join vector: ${cases.size} cases, $recordings recordings, with and without the window's timer")
     }
 
-    /** `flags.share_join_ms`: a whole number 0 to 10000, anything else the default. */
-    @Test fun theWindowIsAWholeNumberFrom0To10000() {
+    /** `flags.share_join_ms`: a whole number 0 to 60000 (SDK 4.0; 3.x: 10000), anything else the default. */
+    @Test fun theWindowIsAWholeNumberFrom0To60000() {
         fun w(v: Any?) = RemoteConfig.Flags.parse(mapOf("share_join_ms" to v)).shareJoinMs
         assertEquals("absent", 3000, RemoteConfig.Flags.parse(emptyMap<String, Any?>()).shareJoinMs)
         assertEquals("no flags", 3000, RemoteConfig.Flags.parse(null).shareJoinMs)
         assertEquals(3000, RemoteConfig.Flags().shareJoinMs)
-        for ((v, want) in listOf<Pair<Any?, Int>>(0.0 to 0, 1.0 to 1, 3000.0 to 3000, 8000.0 to 8000, 10_000.0 to 10_000, 10_001.0 to 3000,
+        for ((v, want) in listOf<Pair<Any?, Int>>(0.0 to 0, 1.0 to 1, 3000.0 to 3000, 8000.0 to 8000, 10_000.0 to 10_000, 10_001.0 to 10_001,
+            15_000.0 to 15_000, 60_000.0 to 60_000, 60_001.0 to 3000,
             -1.0 to 3000, 2.5 to 3000, 1e300 to 3000, Double.NaN to 3000, Double.POSITIVE_INFINITY to 3000, "5" to 3000, "" to 3000, true to 3000,
             false to 3000, null to 3000, listOf(5.0) to 3000, mapOf("ms" to 5.0) to 3000)) {
             assertEquals("share_join_ms $v", want, w(v))
@@ -182,6 +204,8 @@ class ShareRecorderTest : OpenChecked() {
         fun json(text: String) = RemoteConfig.Flags.parse((Json.parse(text) as Map<String, Any?>)["flags"]).shareJoinMs
         assertEquals(0, json("{\"flags\":{\"share_join_ms\":0}}"))
         assertEquals(8000, json("{\"flags\":{\"share_join_ms\":8000}}"))
+        assertEquals(15_000, json("{\"flags\":{\"share_join_ms\":15000}}"))
+        assertEquals(3000, json("{\"flags\":{\"share_join_ms\":60001}}"))
         assertEquals(3000, json("{\"flags\":{\"share_join_ms\":\"8000\"}}"))
         assertEquals(3000, json("{\"flags\":{\"share_join_ms\":true}}"))
         assertEquals(3000, json("{\"flags\":{\"share_join_ms\":0.5}}"))
@@ -189,10 +213,11 @@ class ShareRecorderTest : OpenChecked() {
         assertEquals(3000, json("{\"flags\":{\"contributions\":true}}"))
     }
 
-    /** The gap is rounded to the nearest 100 ms, half up, within 0 to 10000; `start_ms` is floored. */
+    /** The gap is rounded to the nearest 100 ms, half up, within 0 to 60000; `start_ms` is floored. */
     @Test fun gapsRoundToHundredsAndStartsFloor() {
         for ((gap, want) in listOf(0L to 0, 49L to 0, 50L to 100, 149L to 100, 150L to 200, 1200L to 1200, 2999L to 3000, 9949L to 9900, 9950L to 10_000,
-            10_000L to 10_000, 99_999L to 10_000, -1L to 0, -5_000L to 0)) {
+            10_000L to 10_000, 12_000L to 12_000, 14_950L to 15_000, 59_949L to 59_900, 59_950L to 60_000, 60_000L to 60_000,
+            99_999L to 60_000, -1L to 0, -5_000L to 0)) {
             assertEquals("gap $gap", want, TakeJoin.gapMs(gap))
         }
         assertEquals(771, TakeJoin.ms(12_345, 16_000))

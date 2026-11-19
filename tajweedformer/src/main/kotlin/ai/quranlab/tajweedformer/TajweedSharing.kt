@@ -6,10 +6,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Recitation sharing, reached through `client.sharing`. Quran Lab decides per app whether learners are asked
- * ([isAvailable]); the developer switches nothing on. Where it is offered, the SDK asks the learner with its own
- * sheet at a quiet moment (at most three times; a yes is never asked again), and while the learner said yes
- * ([isOn]) every take is shared whole, in the background. Developers never receive recordings.
+ * Recitation sharing, reached through `client.sharing`. Every learner is asked, under the same ask rules in every
+ * app, and the choice is theirs: they can say "Not now", stop, or delete what they shared at any time. No app turns
+ * the ask off or is exempted from it. The SDK asks with its own sheet at a quiet moment (at most three times; a yes is
+ * never asked again), and while the learner said yes ([isOn]) every take is shared whole, in the background.
+ * Developers never receive recordings.
  *
  * What an app does with it: nothing (the default), or a settings row ([isOn], [setOn]), its own moment to ask
  * ([ask]), its own wording ([setWording]), the learner's deletion ([delete], [recoveryCode]), and, when it captures
@@ -18,7 +19,10 @@ import kotlinx.coroutines.withContext
 public class TajweedSharing internal constructor(private val client: TajweedClient) {
     private val inner: Sharing get() = client.cloud.sharing
 
-    /** Quran Lab's signed config offers sharing to this app on this device. Offered is not consent. */
+    /**
+     * The SDK may ask here now: a signed config is in force, Quran Lab's incident switch (`flags.contributions`, for
+     * every app at once) is not off, and this device may upload. Being asked is not consent.
+     */
     public val isAvailable: Boolean get() = inner.available
 
     /** The learner said yes and has not turned it off. */
@@ -29,7 +33,7 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
      * then never asks again. From the moment the call returns the SDK hands nothing more to the system; what the
      * system had already taken into its send buffer may still go out, which can be the whole segment that was being
      * sent. Nothing after it is sent. The call returns within three seconds, also when a request hangs.
-     * On, while sharing is not available for this app, is the error `sharing_unavailable`.
+     * On, while sharing is not available ([isAvailable] false), is the error `sharing_unavailable`.
      */
     public fun setOn(on: Boolean) {
         if (on && !inner.available) throw RecognizerException.SharingUnavailable()
@@ -37,16 +41,17 @@ public class TajweedSharing internal constructor(private val client: TajweedClie
     }
 
     /**
-     * Asks now, with the SDK's sheet, if an ask is still allowed (at most three per install, never after a yes or
-     * after the switch was turned off). Returns whether the sheet is being shown. While sharing is not available for
-     * this app the error is `sharing_unavailable`.
+     * Asks now, at the app's moment, when an ask is due by the SDK's own rules (SDK 4.0, SHARE_ASK_40): after a
+     * finished take of this app session, with no take running, not twice in a day, at most three per install, never
+     * after a yes or after the switch was turned off; the minute of recitation the SDK's own ask waits for does not
+     * apply. Returns whether an ask is being shown (the sheet, or for a re-ask the card). While sharing is not
+     * available ([isAvailable] false) it shows nothing and returns false (SHARE_ASK_40 20.5, decision `not_offered`):
+     * no error, as on Apple.
      */
     public fun ask(): Boolean {
-        if (!inner.available) throw RecognizerException.SharingUnavailable()
-        val show = inner.prompts ?: return false
-        val variant = inner.askNow() ?: return false
-        show(Sharing.SheetRequest.Consent(variant, inner.guardian))
-        return true
+        // SDK 4.0 (SHARE_ASK_40 20.5): only when an ask is due by the same rules, never at launch or during a take;
+        // counted once it is on screen. Not offered: the decision is not_offered, and nothing is shown
+        return inner.askNow()
     }
 
     /**

@@ -6,12 +6,14 @@ platform's own README gives them.
 
 ## Recitation sharing
 
-### Who decides that the sheet is offered
+### Every learner is asked, and the choice is theirs
 
-Quran Lab decides, per app, in the signed config the SDK downloads (`flags.contributions`, and per platform who
-may upload). The app's own sharing option is ignored since 2.0.1. Without a signed config in force nothing is
-offered. Offered is never consent: nothing is recorded for sharing and nothing is sent before the learner
-answers "Share", and a learner who never answers never shares.
+Every learner is asked, under the same ask rules in every app (below), and the choice is the learner's: they can
+say "Not now", stop, or delete what they shared at any time. No app can turn the ask off or be exempted from it;
+the app's own sharing option is ignored since 2.0.1. The signed config the SDK downloads carries
+`flags.contributions`, Quran Lab's incident switch for every app at once (not a per-app decision), and per platform
+who may upload; without a signed config in force nothing is asked. Being asked is never consent: nothing is recorded
+for sharing and nothing is sent before the learner answers "Share", and a learner who never answers never shares.
 
 ### Consent
 
@@ -20,7 +22,7 @@ answers "Share", and a learner who never answers never shares.
   a learner who turned sharing off after a yes is not asked again. After that, only the app's own settings
   entry point (the SDK's settings switch) turns sharing on or off. The count carries over from 2.0.0.
 - The learner agrees to one wording, identified by a consent version, recorded when they agree. The SDK's
-  own copy deck has version `share-2026-11-09` (deck `2026-11-13.1`, eight languages). Every shared session
+  own copy deck has version `share-2026-11-09` (deck `2026-11-19.1`, eight languages). Every shared session
   carries the version the learner actually agreed to (`consent_version`), for example `share-2026-11-07b`
   for a learner who agreed in a 2.0.0 app.
 - A grant persists: a new copy deck, a new SDK version or new app wording neither pauses sharing nor asks
@@ -31,13 +33,16 @@ answers "Share", and a learner who never answers never shares.
 
 ### The default sheet, a themed sheet, or your own
 
-1. **Default.** The SDK shows its own sheet at a good moment (after a finished session with feedback, never
-   at first launch), in the learner's language, right to left for Arabic and Urdu, with a guardian variant
-   for children's apps.
+1. **Default.** The SDK shows its own sheet at a good moment (SDK 4.0: never in the install's first 24 hours
+   or before its third finished take; after a finished take once the app session holds a minute of recitation,
+   3 seconds after it with no new take; a re-ask is a small card that opens the sheet, 14 days and 7 takes, then
+   30 days and 10 takes, after the ask before), in the learner's language, right to left for Arabic and Urdu.
+   Every app shows the same sheet (SDK 4.0 has no audience option).
 2. **Themed.** Colours, corner radius and fonts of the SDK's sheets can be set; the words stay the SDK's.
    This does not change the consent version.
 3. **Your own moment.** An app that knows a better moment than the SDK's calls `client.sharing.ask()`: the
-   SDK shows its own sheet then, if an ask is still allowed, and that counts as one of the three. Drawing
+   SDK shows its own ask then, if one is due by the same rules (the minute of recitation aside; never at
+   launch or during a take), and that counts as one of the three; it returns whether it showed one. Drawing
    the ask itself is not available in this version: the sheet is always the SDK's, and no call hands the
    app the request to ask or takes the learner's answer from a screen of the app's. What an app changes is
    the look (item 2) and the words (item 4).
@@ -109,7 +114,8 @@ on real recitation the 80-band log-mel features the model reads differ from the 
 ## Telemetry
 
 On by default, anonymous by construction: sums and histograms, no audio, text, identifiers or times finer than
-the UTC day. Off with the signed config's `flags.analytics: false` or the developer's one opt-out in code.
+the UTC day. Off only with the signed config's `flags.analytics: false`: SDK 4.0 has no app option that turns it
+off (Quran Lab's decision of 11-16).
 
 ### Deltas during the day (2.0.1)
 
@@ -141,18 +147,21 @@ Each `promotions` entry (at most 8; zero counts left out):
  "failed_at": {"download": 0, "compile": 0, "warmup": 0, "golden": 0},
  "reasons": {"network": 0, "storage": 0, "verify": 0, "compile_error": 0, "compile_timeout": 0, "load_error": 0,
              "crash": 0, "hang": 0, "non_finite": 0, "golden_mismatch": 0, "cpu_mismatch": 0, "failover": 0,
-             "denylist": 0, "other": 0},
+             "denylist": 0, "other": 0, "slower_than_cpu": 0, "firmware": 0, "dispatch": 0},
  "compile_ms": {"le_1000": 0, "le_5000": 0, "le_15000": 0, "le_30000": 0, "le_60000": 0, "le_120000": 0, "gt_120000": 0},
  "speedup": {"lt_0_5": 0, "lt_1": 0, "le_1_5": 0, "le_2": 0, "le_3": 0, "le_5": 0, "gt_5": 0},
  "failovers": 0,
  "failover_causes": {"exception": 0, "non_finite": 0, "out_of_range": 0, "blank": 0, "deadline": 0},
  "failover_stall_ms": {"le_50": 0, "le_100": 0, "le_200": 0, "le_300": 0, "le_500": 0, "le_1000": 0, "gt_1000": 0},
- "demoted": 0, "blank_confirmed_ok": 0}
+ "demoted": 0, "blank_confirmed_ok": 0,
+ "slower_than_cpu": [{"accelerator_ms": 61.0, "cpu_ms": 6.1}]}
 ```
 
 `backend` is `ane`, `gpu` or `npu:<soc>`. An attempt is counted once, when it ends. `speedup` is the CPU's
 median chunk time over the accelerator's on the self-test clips (`lt_0_5` and `lt_1`: the accelerator was
-slower, and was promoted anyway). `failover_stall_ms` runs from the failed chunk being detected to its CPU
+slower). SDK 4.0: a build that passed the golden test but is slower than the CPU engine on the device is not
+promoted; the attempt counts under `reasons.slower_than_cpu`, and `slower_than_cpu` lists each such attempt's two
+medians in milliseconds (at most 8 a day), as the Apple SDK sends them. `failover_stall_ms` runs from the failed chunk being detected to its CPU
 result. `demoted` counts promoted builds taken back to the CPU after a failure in a session.
 `blank_confirmed_ok` counts silent stretches the CPU confirmed (no switch).
 
@@ -179,7 +188,13 @@ whatever the model's id; none when the device holds no model).
    mistake included, through the accelerator and through the CPU engine and compare the tokens, the flagged
    sites and the per-word verdicts in both directions. A build passes when it finds the planted mistake and
    differs from the CPU by no more than its tolerance, which the signed manifest gives per build (none means
-   identical). A build that passes is promoted, whatever its speed; the speed is measured and reported only.
+   identical). SDK 4.0: a build that passes is promoted only when its median chunk time (the golden test's warm
+   chunks) is not slower than the CPU engine's on the same device (the signed config's `flags.accel_min_speedup`
+   may ask for more, never less than 1.0); otherwise the CPU engine stays (`slower_than_cpu`, the program released),
+   tried again at once by another SDK version or OS build, else after 30 days. A program the runtime refuses on the OS
+   build, or a prepare that does not answer in 20 s (`compile_timeout`), is held the same way. Android: firmware the
+   Core knows cannot set a program up (the Pixel 10's launch firmware, reason `firmware`) is remembered until the OS
+   updates; a vendor service that did not answer (reason `dispatch`) is asked again at the next start.
 3. **The swap** happens only between sessions, to an accelerator that is already loaded and warm, so the next
    session starts without a pause and the app sees only faster chunks. A promoted device keeps its compiled
    program and verdict, loads it again at the next launch in the background, and usually starts its first

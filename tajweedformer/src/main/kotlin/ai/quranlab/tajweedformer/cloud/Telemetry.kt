@@ -1,6 +1,7 @@
 package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.RecitedReport
 import ai.quranlab.tajweedformer.SdkInfo
 import java.io.File
 
@@ -24,12 +25,31 @@ internal class Telemetry(
     private val dir: File,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    /** Off: nothing is recorded and the stored days are dropped (developer opt-out or `flags.analytics` false). */
+    /** The learner's own days (17.8), kept beside the counts (`<storage>/core/learner.json`); never sent. */
+    private val learnerFile: File = File(dir.parentFile ?: dir, "core/learner.json")
+
+    /**
+     * The remote switches of 17.8 and 17.9 (`flags.metrics`, a map of group to boolean, absent = on): `juz`, `hours`,
+     * `lengths`, `learner`, `repeats`, `health`, `judged`. A group that is off is not counted, and what it counted before
+     * is not sent. 17.1's `app_ayahs` and `app_surah_ayahs` have no switch: the app's reports are always sent.
+     */
+    @Volatile var metric: (String) -> Boolean = { true }
+
+    /** The device's time zone for the local hour and day (17.8): never sent, only the bucket. */
+    @Volatile var zone: java.time.ZoneId = java.time.ZoneId.systemDefault()
+
+    private val learnerDays by lazy { LearnerDays(learnerFile) }
+
+    /** Off: nothing is recorded and the stored days are dropped (the signed config's `flags.analytics` false, the only
+     *  switch: SDK 4.0 has no app option). */
     @Volatile var enabled = true
         set(v) {
             field = v
             if (!v) dropAll()
         }
+
+    /** A sealed report was dropped unsent after 7 days. */
+    @Volatile var expired: () -> Unit = {}
 
     private val lock = Any()
     private var day: String? = null
@@ -68,7 +88,12 @@ internal class Telemetry(
         val k = DownloadKey(e.revision, DeviceProfile.token(e.profile) ?: "other", e.build)
         val d = a.downloads.getOrPut(k) { DownloadCounts() }
         d.bytes += e.bytes
-        if (e.success) d.success++ else d.failed++
+        if (e.success) d.success++ else {
+            d.failed++
+            // 24.8: under the reason's telemetry name
+            val r = e.failureReason?.takeIf { it in DownloadCounts.FAILURE_REASONS } ?: "other"
+            d.reasons[r] = (d.reasons[r] ?: 0) + 1
+        }
         if (e.resumed) d.resumed++
         persist(force = true)
     }
@@ -126,14 +151,133 @@ internal class Telemetry(
     }
 
     /**
-     * App-reported (SPEC 6.3): the learner recited ayahs [ayahFrom]..[ayahTo] of [surah] in a take that counts. The
-     * caller has validated the range and decided that this report is the take's one.
+     * App-reported (SPEC 6.3): the learner recited ayahs [ayahFrom]..[ayahTo] of [surah] in a take the SDK did not
+     * place (SDK 4.0: the app's fallback count, `app_ayahs` and `app_surah_ayahs`, always listed in `reported`). The
+     * caller has validated the range. A take of the Client goes through [recordTake], which decides the source.
      */
     fun recited(surah: Int, ayahFrom: Int, ayahTo: Int) = rec { a ->
         if (surah !in 1..114 || ayahFrom < 1 || ayahTo < ayahFrom) return@rec
         val n = ayahTo - ayahFrom + 1
-        a.ayahs += n
-        a.coverage[surah] += n
+        a.m40.appAyahs += n
+        a.m40.appSurah[surah] += n
+        persist(force = true)
+    }
+
+
+    /**
+     * One step of the accelerator's promotion (R2, SPEC 6.1 `promotions`): an attempt that promoted it or stopped at
+     * the Core's prepare (`compile`), the golden test or (SDK 4.0) the measure stage, with the reason, the prepare's
+     * time and the speedup (CPU median chunk time / the accelerator's); or a take that went back to the CPU
+     * (`failovers`, and `demoted` with reason `failover`: later takes run on the CPU). An attempt that stayed on the CPU
+     * engine because the accelerator was slower counts under `reasons.slower_than_cpu`, and its two medians are listed
+     * (`slower_than_cpu`, at most [Promo.MAX_SLOWER] an entry and day), as the Apple SDK sends them.
+     */
+    fun promotion(p: ai.quranlab.tajweedformer.core.PromotionInfo) = rec { a ->
+        val c = a.promotion(PromoKey("npu", p.version, p.context, p.build))
+        if (p.failover) {
+            c.failovers++
+            inc(c.causes, "exception")
+            c.demoted++
+            inc(c.reasons, "failover")
+        } else {
+            c.attempts++
+            if (p.promoted) c.promoted++ else {
+                p.failedAt?.takeIf { it in Promo.FAILED_AT }?.let { inc(c.failedAt, it) }
+                inc(c.reasons, p.reason?.takeIf { it in Promo.REASONS } ?: "other")
+            }
+            p.compileMs?.let { Hist.compile(c.compileMs, it) }
+            val acc = p.acceleratorMs
+            val cpu = p.cpuMs
+            if (acc != null && cpu != null && acc > 0 && cpu > 0) {
+                Hist.speedup(c.speedup, cpu / acc)
+                if (p.reason == Promo.SLOWER_THAN_CPU && c.slower.size < Promo.MAX_SLOWER) c.slower.add(acc to cpu)
+            }
+        }
+        persist(force = true)
+    }
+
+    /** A lease refresh ended (17.8 `lease`): null ok, else its failure's kind. */
+    fun lease(failed: String?) = rec { a ->
+        if (!metric("health")) return@rec
+        a.m40.lease(failed)
+        persist(force = true)
+    }
+
+    /** The session's ayahs counted so far (17.8 repeats, 17.9 first and repeat): kept for the Client's life only. */
+    private val sessionAyahs = HashSet<Int>()
+
+    /**
+     * One finished take, counted once by its source (SPEC 17.1's precedence, 17.6): the detector's range when it found
+     * one (`ayahs`, `surah_ayahs`, `juz_ayahs`, `repeat_ayahs`), else the app's report (`app_ayahs`,
+     * `app_surah_ayahs`), else nothing; and the app's judgement (17.9) paired with the measured ayahs where there are,
+     * else with the app's. The count joins the take's own UTC day, and a take id counted before counts nothing.
+     * Returns false when nothing could be written (the take stays to be counted).
+     */
+    fun recordTake(t: TakeRecord): Boolean {
+        var ok = false
+        recDay(Day.of(t.day * 86_400_000L)) { a ->
+            if (t.id in a.m40.recitedIds) { ok = true; return@recDay }
+            val r = t.report
+            val measured = t.found == true
+            if (measured) {
+                val n = t.last - t.first + 1
+                a.ayahs += n
+                a.coverage[t.surah] += n
+                // a take counted through a refrain tie (R5 `ties`): its copies elsewhere are not known here, so it counts
+                // toward no juz (17.8: only when every copy lies in that juz) and no repeat (17.8: not through a tie)
+                for (ay in t.first..t.last) {
+                    if (t.ties == 0 && metric("juz")) a.m40.juz[Juz.of(t.surah, ay)]++
+                    if (!sessionAyahs.add(t.surah * 1000 + ay) && t.ties == 0 && metric("repeats")) a.m40.repeatAyahs++
+                }
+                if (metric("health")) {
+                    a.m40.recitedTake("measured")
+                    if (t.context) a.m40.recitedTake("context")
+                }
+            } else if (r != null) {
+                a.m40.appAyahs += r.ayahs
+                a.m40.appSurah[r.surah] += r.ayahs
+                if (metric("health")) a.m40.recitedTake("app")
+            } else if (metric("health")) {
+                a.m40.recitedTake("none")
+            }
+            if (t.recovered && metric("health")) a.m40.recitedTake("recovered")
+            if (r != null && (r.outcome != null || r.perAyah.isNotEmpty()) && metric("judged")) judge(a, t, r, measured)
+            a.m40.recitedIds.add(t.id)
+            persistDay(a)
+            ok = true
+        }
+        return ok
+    }
+
+    /** 17.9: each judged ayah once, the rules into `rule_checks` and `rule_flags`. */
+    private fun judge(a: DayAggregate, t: TakeRecord, r: RecitedReport, measured: Boolean) {
+        val (surah, ayahs) = if (measured) t.surah to (t.first..t.last) else r.surah to (r.ayahFrom..r.ayahTo)
+        val tenure = learnerDays.tenureDays(t.day)?.let { Measured40.tenureBucket(it) }
+        var judged = 0
+        var correct = 0
+        for (ay in ayahs) {
+            val o = (if (!measured || surah == r.surah) r.perAyah[ay] else null) ?: r.outcome ?: continue
+            val first = sessionAyahs.add(-(surah * 1000 + ay))
+            a.m40.judge(surah, o, first, measured, tenure)
+            judged++
+            if (o.correct) correct++
+            if (!o.correct) for (rule in o.rules) {
+                if (rule !in a.dayRules && a.dayRules.size >= MAX_RULES) continue
+                a.dayRules.add(rule)
+                a.ruleChecks[rule] = (a.ruleChecks[rule] ?: 0) + 1
+                a.ruleFlags[rule] = (a.ruleFlags[rule] ?: 0) + 1
+            }
+        }
+        // perAyah entries the measured range does not hold
+        if (measured) a.m40.unpaired(r.perAyah.keys.count { it !in ayahs || surah != r.surah })
+        learnerDays.judged(t.day, judged, correct)
+        if (a.m40.trend == null) learnerDays.trendDue(t.day)?.let { a.m40.trend = it }
+        learnerDays.save()
+    }
+
+    /** Journal entries dropped (17.6 `recited_takes.dropped`): a corrupt or too old journal. */
+    fun recitedDropped(n: Int) = rec { a ->
+        if (n > 0 && metric("health")) repeat(n) { a.m40.recitedTake("dropped") }
         persist(force = true)
     }
 
@@ -158,41 +302,8 @@ internal class Telemetry(
         return kept
     }
 
-    /** A promotion attempt ended (or a crash at a session's first accelerator call was found at launch). A stop of the
-     *  process in the background that counted nothing is not counted here either (SDK 3.1.5). */
-    fun promotion(e: ai.quranlab.tajweedformer.PromotionEvent) = if (e.background) Unit else rec { a ->
-        val p = a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
-        if (e.countsAttempt) {
-            p.attempts++
-            if (e.promoted) p.promoted++ else if (e.stage in Promo.FAILED_AT) inc(p.failedAt, e.stage)
-        }
-        if (!e.promoted) inc(p.reasons, e.reason?.takeIf { it in Promo.REASONS } ?: "other")
-        // a crash at a promoted build's first session call (found at launch) took it back to the CPU
-        if (!e.promoted && e.stage == "session") p.demoted++
-        e.compileMs?.let { Hist.compile(p.compileMs, it.toDouble()) }
-        e.speedup?.let { Hist.speedup(p.speedup, it) }
-        persist(force = true)
-    }
 
-    /** A session switched from the accelerator to the CPU: `failovers` and its cause and stall always (a single missed
-     *  limit too: it is still a switch for that session); `demoted` and `reasons.failover` only when it demoted the key. */
-    fun failover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = rec { a ->
-        val p = a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision)))
-        p.failovers++
-        inc(p.causes, e.failover.cause.takeIf { it in Promo.CAUSES } ?: "exception")
-        Hist.stall(p.stall, e.failover.stallMs)
-        if (e.failover.demoted) {
-            p.demoted++
-            inc(p.reasons, "failover")
-        }
-        persist(force = true)
-    }
 
-    /** A blank stretch the CPU confirmed (no switch): `blank_confirmed_ok`. */
-    fun blankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) = rec { a ->
-        a.promotion(PromoKey(e.backend, ai.quranlab.tajweedformer.ModelIds.version(e.revision), e.context, ai.quranlab.tajweedformer.ModelIds.build(e.revision))).blankConfirmedOk++
-        persist(force = true)
-    }
 
     private fun inc(h: MutableMap<String, Int>, k: String) { h[k] = (h[k] ?: 0) + 1 }
 
@@ -222,6 +333,20 @@ internal class Telemetry(
         c.sessions++
         c.minutes += e.audioSeconds / 60
         if (!e.completed) c.aborted++
+        // SDK 4.0 (17.8): a closed session by its seconds of audio (`session_s`; a Session of this SDK is one take,
+        // finished or not), and the day's learner facts at its first take with audio (an active day)
+        val now = clock()
+        if (metric("lengths")) a.m40.sessionLength(e.audioSeconds)
+        if (metric("learner") && !a.m40.learnerDone) {
+            val (l, gap, streak) = learnerDays.activate(now / 86_400_000L, LearnerDays.localDay(now, zone))
+            a.m40.learner = l
+            a.m40.learnerGap = gap
+            a.m40.streak = streak
+            a.m40.learnerDone = true
+            // the day's facts are in the aggregate first; then the learner's days
+            persistNow()
+            learnerDays.save()
+        }
         if (sessionThrottled) c.throttledSessions++
         // SPEC 6.2: what the SDK measured of the take, from the model's own outputs. Only a take that ended with its
         // Heads counts: a cancelled or failed one adds nothing here, so takes = sessions - aborted.
@@ -232,6 +357,9 @@ internal class Telemetry(
             c.silenceMs += 40L * e.silenceFrames
             c.computeUs += e.computeUs
             for ((h, n) in e.tokens) if (n > 0) c.tokens[h] = (c.tokens[h] ?: 0) + n
+            // SDK 4.0 (17.8): the finished take's length and its speech by the learner's local hour
+            if (metric("lengths")) a.m40.takeLength(e.audioMs / 1000.0)
+            if (metric("hours")) a.m40.hourSpeechMs[LearnerDays.localHour(now, zone)] += 40L * e.speechFrames
         }
         session = null
         persist(force = true)
@@ -264,6 +392,51 @@ internal class Telemetry(
         }
     }
 
+    /** [body] on [d]'s sums (today's, or another day's file), under the lock; the caller persists ([persistDay]). */
+    private fun recDay(d: String, body: (DayAggregate) -> Unit) {
+        if (!enabled) return
+        try {
+            synchronized(lock) {
+                val today = Day.of(clock())
+                if (day != today) {
+                    persistNow()
+                    day = today
+                    agg = load(today) ?: DayAggregate()
+                }
+                if (d == day) {
+                    body(agg!!)
+                    dirty = true
+                } else {
+                    // a take of another day (a take over midnight, or one finalised after a restart): that day's file
+                    if (age(d) > 7 || age(d) < -1) return
+                    val other = load(d) ?: DayAggregate()
+                    otherDay = d to other
+                    try { body(other) } finally { otherDay = null }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private var otherDay: Pair<String, DayAggregate>? = null
+
+    /** Writes [a] now: today's aggregate, or the other day's [recDay] is running on. */
+    private fun persistDay(a: DayAggregate) {
+        val o = otherDay
+        if (o != null && o.second === a) write(o.first, a) else { dirty = true; persistNow() }
+    }
+
+    private fun write(d: String, a: DayAggregate) {
+        dir.mkdirs()
+        val tmp = File(dir, "$d.json.tmp")
+        java.io.FileOutputStream(tmp).use { out ->
+            out.write(Json.write(a.toStore()).toByteArray(Charsets.UTF_8))
+            out.fd.sync()
+        }
+        val f = File(dir, "$d.json")
+        if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
+    }
+
     private fun persist(force: Boolean) {
         val now = clock()
         if (force || now - lastWrite > 30_000) persistNow()
@@ -274,11 +447,7 @@ internal class Telemetry(
         val a = agg ?: return
         if (!dirty) return
         try {
-            dir.mkdirs()
-            val tmp = File(dir, "$d.json.tmp")
-            tmp.writeText(Json.write(a.toStore()))
-            val f = File(dir, "$d.json")
-            if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
+            write(d, a)
             lastWrite = clock()
             dirty = false
         } catch (_: Exception) {
@@ -291,9 +460,10 @@ internal class Telemetry(
     /** Today's counts as the body a send point would make of them, without sealing anything (the vector tests read it). */
     @Suppress("UNCHECKED_CAST")
     fun peek(ctx: TelemetryContext): Map<String, Any?>? = synchronized(lock) {
-        val d = day ?: return null
-        val a = agg ?: return null
-        TelemetryPayload.build(d, a, ctx, "0".repeat(32))?.let { Json.parse(String(it, Charsets.UTF_8)) as Map<String, Any?> }
+        // today's counts: in memory, or on disk when this process has counted nothing yet (a new process)
+        val d = day ?: Day.of(clock())
+        val a = (if (d == day) agg else load(d)) ?: return null
+        TelemetryPayload.build(d, a, ctx, "0".repeat(32), metric)?.let { Json.parse(String(it, Charsets.UTF_8)) as Map<String, Any?> }
     }
 
     private fun load(d: String): DayAggregate? = try {
@@ -306,8 +476,16 @@ internal class Telemetry(
 
     private fun age(d: String): Long = try { Day.between(d, Day.of(clock())) } catch (_: Exception) { 99L }
 
-    /** Days with counts not sealed yet, oldest first (today's included); days older than 7 are deleted. */
+    /**
+     * Days with counts not sealed yet, oldest first (today's included). A day kept only for what must not be counted
+     * again on it (its counted takes, its learner facts, its rule names) has nothing to send and is not open.
+     */
     fun openDays(): List<String> = synchronized(lock) {
+        dayFiles().filter { d -> (if (d == day) agg else load(d))?.isEmpty() == false }
+    }
+
+    /** Every day on disk, oldest first; days older than 7 are deleted. */
+    private fun dayFiles(): List<String> = synchronized(lock) {
         persistNow()
         val out = ArrayList<String>()
         for (f in dir.listFiles() ?: emptyArray()) {
@@ -328,11 +506,11 @@ internal class Telemetry(
         return try {
             synchronized(lock) {
                 var n = 0
-                for (d in openDays()) {
+                for (d in dayFiles()) {
                     val f = File(dir, "$d.json")
                     val a = if (d == day) agg else load(d)
                     val id = newReportId()
-                    val body = a?.let { TelemetryPayload.build(d, it, ctx, id) }
+                    val body = a?.let { TelemetryPayload.build(d, it, ctx, id, metric) }
                     if (body != null) {
                         sealedDir.mkdirs()
                         lastSeq = maxOf(clock(), lastSeq + 1)
@@ -343,16 +521,18 @@ internal class Telemetry(
                         if (!tmp.renameTo(out)) { out.delete(); if (!tmp.renameTo(out)) throw java.io.IOException("cannot write $name") }
                         n++
                     }
-                    f.delete()
+                    // what must not be counted again on this day (the takes it counted, its learner facts) stays with it
+                    val carried = a?.let { old -> DayAggregate().also { n -> old.m40.carryInto(n.m40); n.dayRules.addAll(old.dayRules) } }
+                    if (carried != null && (carried.m40.recitedIds.isNotEmpty() || carried.m40.learnerDone || carried.dayRules.isNotEmpty())) {
+                        write(d, carried)
+                    } else {
+                        f.delete()
+                    }
                     if (d == day) {
                         // the open session goes on counting into a fresh aggregate (its cold start still pending); the
                         // day's rules stay with the day, across its deltas
                         val pending = session?.let { agg?.cohorts?.get(it)?.coldStartPending } == true
-                        val rules = agg?.dayRules
-                        agg = DayAggregate()
-                        if (rules != null) agg!!.dayRules.addAll(rules)
-                        // the fresh aggregate must reach the disk with the day's rules, or a restart forgets them
-                        if (rules != null && rules.isNotEmpty()) { dirty = true; persistNow() }
+                        agg = carried ?: DayAggregate()
                         if (pending) session?.let { agg!!.cohort(it).coldStartPending = true }
                         dirty = false
                     }
@@ -369,7 +549,9 @@ internal class Telemetry(
         val out = ArrayList<File>()
         for (f in sealedDir.listFiles() ?: emptyArray()) {
             val m = REPORT_FILE.matchEntire(f.name) ?: continue
-            if (age(m.groupValues[1]) > 7) f.delete() else out.add(f)
+            if (age(m.groupValues[1]) > 7) {
+                if (f.delete()) try { expired() } catch (_: Exception) {}
+            } else out.add(f)
         }
         out.sortedBy { it.name }
     }
@@ -431,6 +613,8 @@ internal class PromoCounts {
     var blankConfirmedOk = 0
     val causes = LinkedHashMap<String, Int>()
     val stall = LinkedHashMap<String, Int>()
+    /** SDK 4.0: the attempts that stayed on the CPU engine, the accelerator slower: (accelerator, CPU) median chunk ms. */
+    val slower = ArrayList<Pair<Double, Double>>()
 }
 
 /** The `promotions` entry's closed key sets. */
@@ -438,7 +622,16 @@ internal object Promo {
     const val MAX = 8
     val FAILED_AT = listOf("download", "compile", "warmup", "golden")
     val REASONS = listOf("network", "storage", "verify", "compile_error", "compile_timeout", "load_error", "crash", "hang", "non_finite",
-        "golden_mismatch", "cpu_mismatch", "failover", "denylist", "other")
+        "golden_mismatch", "cpu_mismatch", "failover", "denylist", "other", "slower_than_cpu", "firmware", "dispatch")
+
+    /** SDK 4.0: the accelerator passed the golden test and was slower than the CPU engine (the Apple SDK's name). */
+    const val SLOWER_THAN_CPU = "slower_than_cpu"
+
+    /** The `slower_than_cpu` list's length at most, an entry and day. */
+    const val MAX_SLOWER = 8
+
+    /** A median as the list carries it: ms to 0.1, 0 to 600,000. */
+    private fun ms(x: Double): Double = Math.round(x.coerceIn(0.0, 600_000.0) * 10) / 10.0
     val CAUSES = listOf("exception", "non_finite", "out_of_range", "blank", "deadline")
 
     /** The entry as the payload has it (and as the day file keeps it): zero counts and empty objects left out. */
@@ -462,6 +655,9 @@ internal object Promo {
         hist(c.stall, Hist.STALL)?.let { o["failover_stall_ms"] = it }
         if (c.demoted > 0 || store) o["demoted"] = cap(c.demoted)
         if (c.blankConfirmedOk > 0 || store) o["blank_confirmed_ok"] = cap(c.blankConfirmedOk)
+        if (c.slower.isNotEmpty()) o["slower_than_cpu"] = c.slower.take(MAX_SLOWER).map { (a, p) ->
+            linkedMapOf("accelerator_ms" to ms(a), "cpu_ms" to ms(p))
+        }
         return o
     }
 
@@ -474,11 +670,32 @@ internal object Promo {
         c.blankConfirmedOk = n(o["blank_confirmed_ok"])
         h("failed_at", c.failedAt); h("reasons", c.reasons); h("compile_ms", c.compileMs); h("speedup", c.speedup)
         h("failover_causes", c.causes); h("failover_stall_ms", c.stall)
+        (o["slower_than_cpu"] as? List<*>)?.forEach { x ->
+            val m = x as? Map<*, *> ?: return@forEach
+            val a = (m["accelerator_ms"] as? Double) ?: return@forEach
+            val p = (m["cpu_ms"] as? Double) ?: return@forEach
+            if (c.slower.size < MAX_SLOWER) c.slower.add(a to p)
+        }
         return PromoKey(o["backend"] as String, o["revision"] as String, o["context"] as String, o["build"] as? String ?: "") to c
     }
 }
 
-internal class DownloadCounts(var bytes: Long = 0, var success: Int = 0, var failed: Int = 0, var resumed: Int = 0)
+internal class DownloadCounts(var bytes: Long = 0, var success: Int = 0, var failed: Int = 0, var resumed: Int = 0,
+                              /** Contract 24.8: the failed downloads by their telemetry reason (`network`, `http`, `hash_mismatch`,
+                               *  `signature`, `storage`, `other`). */
+                              val reasons: MutableMap<String, Int> = LinkedHashMap()) {
+    fun copy(): DownloadCounts = DownloadCounts(bytes, success, failed, resumed, LinkedHashMap(reasons))
+
+    fun add(o: DownloadCounts) {
+        bytes += o.bytes; success += o.success; failed += o.failed; resumed += o.resumed
+        for ((k, v) in o.reasons) reasons[k] = (reasons[k] ?: 0) + v
+    }
+
+    companion object {
+        /** The names of 24.8, in the server's order. */
+        val FAILURE_REASONS = listOf("network", "http", "hash_mismatch", "signature", "storage", "other")
+    }
+}
 
 internal class Cohort {
     var sessions = 0
@@ -549,6 +766,8 @@ internal class DayAggregate {
     val promotions = LinkedHashMap<PromoKey, PromoCounts>()
     /** The distinct rules the app reported today (at most [Telemetry.MAX_RULES]), kept across the day's deltas. */
     val dayRules = LinkedHashSet<String>()
+    /** SDK 4.0: [ayahs] and [coverage] are the MEASURED ayahs (17.1); the app's fallback and 17.8, 17.9 are here. */
+    val m40 = Measured40()
 
     fun cohort(k: CohortKey): Cohort = cohorts.getOrPut(k) { Cohort() }
 
@@ -556,18 +775,19 @@ internal class DayAggregate {
 
     /** Nothing to send (the day's rule names alone are not something to send). */
     fun isEmpty(): Boolean = cohorts.isEmpty() && downloads.isEmpty() && coverage.all { it == 0 } && launches == 0 && ayahs == 0 &&
-        words == 0 && ruleChecks.isEmpty() && shareAsked == 0 && shareYes == 0 && shareNo == 0 && promotions.isEmpty()
+        words == 0 && ruleChecks.isEmpty() && shareAsked == 0 && shareYes == 0 && shareNo == 0 && promotions.isEmpty() && m40.isEmpty()
 
     /** The on-disk form (the payload's fields plus the cohort keys). */
     fun toStore(): Map<String, Any?> = linkedMapOf(
         "cohorts" to cohorts.map { (k, c) -> TelemetryPayload.cohortJson(k, c, store = true) },
         "coverage" to coverage.withIndex().filter { it.value > 0 }.associate { it.index.toString() to it.value },
         "downloads" to downloads.map { (k, d) -> linkedMapOf("revision" to k.revision, "build" to k.build, "profile" to k.profile, "bytes" to d.bytes,
-            "success" to d.success, "failed" to d.failed, "resumed" to d.resumed) },
+            "success" to d.success, "failed" to d.failed, "resumed" to d.resumed, "failure_reasons" to d.reasons) },
         "launches" to launches, "ayahs" to ayahs, "words" to words, "rule_checks" to ruleChecks, "rule_flags" to ruleFlags,
         "share" to linkedMapOf("asked" to shareAsked, "yes" to shareYes, "no" to shareNo),
         "promotions" to promotions.map { (k, c) -> Promo.json(k, c, store = true) },
         "day_rules" to dayRules.toList(),
+        "m40" to m40.toStore(),
     )
 
     companion object {
@@ -602,7 +822,9 @@ internal class DayAggregate {
                 val o = x as Map<String, Any?>
                 a.downloads[DownloadKey(o["revision"] as String, o["profile"] as String, o["build"] as? String ?: "")] = DownloadCounts(
                     (o["bytes"] as? Double)?.toLong() ?: 0, (o["success"] as? Double)?.toInt() ?: 0,
-                    (o["failed"] as? Double)?.toInt() ?: 0, (o["resumed"] as? Double)?.toInt() ?: 0)
+                    (o["failed"] as? Double)?.toInt() ?: 0, (o["resumed"] as? Double)?.toInt() ?: 0,
+                    (o["failure_reasons"] as? Map<String, Any?>)?.entries?.mapNotNull { (k, v) -> (v as? Double)?.toInt()?.let { k to it } }
+                        ?.toMap(LinkedHashMap()) ?: LinkedHashMap())
             }
             fun n(v: Any?) = (v as? Double)?.toInt() ?: 0
             a.launches = n(m["launches"]); a.ayahs = n(m["ayahs"]); a.words = n(m["words"])
@@ -611,6 +833,7 @@ internal class DayAggregate {
             (m["share"] as? Map<String, Any?>)?.let { sh -> a.shareAsked = n(sh["asked"]); a.shareYes = n(sh["yes"]); a.shareNo = n(sh["no"]) }
             (m["promotions"] as? List<Any?>)?.forEach { x -> val (k, c) = Promo.fromJson(x as Map<String, Any?>); a.promotions[k] = c }
             (m["day_rules"] as? List<Any?>)?.forEach { r -> (r as? String)?.let { a.dayRules.add(it) } }
+            (m["m40"] as? Map<String, Any?>)?.let { a.m40.fromStore(it) }
             return a
         }
     }
@@ -712,15 +935,15 @@ internal object TelemetryPayload {
     }
 
     /** The v2 body of one delta; [reportId] (32 lower-case hex) is always sent. Null when nothing was counted. */
-    fun build(day: String, a: DayAggregate, ctx: TelemetryContext, reportId: String): ByteArray? {
+    fun build(day: String, a: DayAggregate, ctx: TelemetryContext, reportId: String, metric: (String) -> Boolean = { true }): ByteArray? {
         if (a.isEmpty()) return null
         // the 16 largest cohorts by sessions; the rest merged into the 16th
         val sorted = a.cohorts.entries.sortedByDescending { it.value.sessions }
         val kept = sorted.take(MAX_COHORTS).map { it.key to Cohort().apply { merge(it.value) } }.toMutableList()
         for (e in sorted.drop(MAX_COHORTS)) kept.last().second.merge(e.value)
         val dl = a.downloads.entries.toList()
-        val dlKept = dl.take(MAX_DOWNLOADS).map { it.key to DownloadCounts(it.value.bytes, it.value.success, it.value.failed, it.value.resumed) }
-        for (e in dl.drop(MAX_DOWNLOADS)) dlKept.last().second.let { d -> d.bytes += e.value.bytes; d.success += e.value.success; d.failed += e.value.failed; d.resumed += e.value.resumed }
+        val dlKept = dl.take(MAX_DOWNLOADS).map { it.key to it.value.copy() }
+        for (e in dl.drop(MAX_DOWNLOADS)) dlKept.last().second.add(e.value)
         val dev = LinkedHashMap<String, Any?>()
         dev["class"] = ctx.device.deviceClass
         ctx.device.soc?.let { dev["soc"] = it }
@@ -735,8 +958,8 @@ internal object TelemetryPayload {
         b["app_version"] = ctx.app.version
         b["device"] = dev
         b["cohorts"] = kept.map { cohortJson(it.first, it.second) }
+        // SDK 4.0 (17.1): `coverage` is not sent; `surah_ayahs` carries the measured ayahs per surah
         val cov = a.coverage.withIndex().filter { it.index in 1..114 && it.value > 0 }.associate { it.index.toString() to minOf(it.value, 1_000_000) }
-        if (cov.isNotEmpty()) b["coverage"] = cov
         if (dlKept.isNotEmpty()) b["downloads"] = dlKept.map { (k, d) ->
             val o = LinkedHashMap<String, Any?>()
             o["revision"] = k.revision
@@ -746,6 +969,9 @@ internal object TelemetryPayload {
             o["success"] = cap(d.success)
             o["failed"] = cap(d.failed)
             o["resumed"] = cap(d.resumed)
+            // 24.8: the failed ones by reason, zero reasons left out
+            val reasons = DownloadCounts.FAILURE_REASONS.mapNotNull { r -> d.reasons[r]?.takeIf { it > 0 }?.let { r to cap(it) } }
+            if (reasons.isNotEmpty()) o["failure_reasons"] = reasons.toMap(LinkedHashMap())
             o
         }
         // 2.0.1: the delta's id and counters, each left out when zero
@@ -762,8 +988,11 @@ internal object TelemetryPayload {
         if (a.shareAsked > 0) b["share_asked"] = cap(a.shareAsked)
         if (a.shareYes > 0) b["share_yes"] = cap(a.shareYes)
         if (a.shareNo > 0) b["share_no"] = cap(a.shareNo)
-        // SPEC 6.3: those of the app-reported fields that this payload carries, in this order
-        val reported = listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags").filter { b.containsKey(it) }
+        // SPEC 6.3 and 17.1: the app-reported fields this payload carries; the measured `ayahs` and `surah_ayahs` never
+        val reported = ArrayList<String>()
+        a.m40.putApp(b, reported)
+        listOf("words", "rule_checks", "rule_flags").filterTo(reported) { b.containsKey(it) }
+        a.m40.putInto(b, reported, metric)
         if (reported.isNotEmpty()) b["reported"] = reported
         // the accelerator's promotions and failovers: at most 8 entries, the busiest kept
         val promos = a.promotions.entries.sortedByDescending { it.value.attempts + it.value.failovers + it.value.blankConfirmedOk }.take(Promo.MAX)

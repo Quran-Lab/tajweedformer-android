@@ -111,7 +111,7 @@ class SharingDeletionStateTest : OpenChecked() {
                 during = onDisk()
                 onInProcess = c.sharing.isOn
                 // any other write of the state during the ask keeps saying no
-                c.sharing.state.sessionCompleted(feedback = false, enabled = false)
+                c.sharing.state.anyWrite()
                 afterAWrite = onDisk()
                 true
             } else false
@@ -194,7 +194,7 @@ class SharingDeletionStateTest : OpenChecked() {
         assertEquals(0, uploadsOf(waiting, requests))
         // the next write of the state that succeeds stores the off
         assertTrue(inTheWay.delete())
-        c.sharing.state.sessionCompleted(feedback = false, enabled = false)
+        c.sharing.state.anyWrite()
         assertEquals("final", onDisk()["consent"])
         assertEquals(n + 1, count(onDisk()))
         assertEquals(false, onDisk()["deletionUnfinished"])
@@ -248,7 +248,7 @@ class SharingDeletionStateTest : OpenChecked() {
 
         // the device can store again: the next change of the state stores the state in force
         assertTrue(inTheWay.delete())
-        c.sharing.state.sessionCompleted(feedback = false, enabled = false)
+        c.sharing.state.anyWrite()
         assertFalse(c.sharing.state.unsaved)
         assertEquals("granted", onDisk()["consent"])
         assertEquals(n + 2, count(onDisk()))
@@ -316,7 +316,7 @@ class SharingDeletionStateTest : OpenChecked() {
         repeat(3) { next.sharing.outbox.drain(ignoringBackoff = true) }
         assertEquals("never an upload", 0, uploadsOf(waiting, requests))
         // the learner is not asked again, and turns sharing on again with the switch
-        assertEquals("the learner is not asked again", null, next.sharing.askNow())
+        assertFalse("the learner is not asked again", next.sharing.askNow())
         next.sharing.setOn(true)
         assertTrue(next.sharing.isOn)
         val fresh = recording(next)
@@ -347,7 +347,7 @@ class SharingDeletionStateTest : OpenChecked() {
         assertEquals("the device has the earlier state", before, onDisk())
         // writing works again: what is written next is not an off (nothing of the failed write is left in memory)
         assertTrue(inTheWay.delete())
-        c.sharing.state.sessionCompleted(feedback = false, enabled = false)
+        c.sharing.state.anyWrite()
         assertEquals("granted", onDisk()["consent"])
         assertEquals(n, count(onDisk()))
         // a new process reads the earlier state, and the queue goes on
@@ -356,4 +356,8 @@ class SharingDeletionStateTest : OpenChecked() {
         repeat(3) { next.sharing.outbox.drain(ignoringBackoff = true) }
         assertEquals(Contribution.Status.UPLOADED, next.sharing.outbox.item(waiting)!!.status)
     }
+
+    /** A change of the stored state (a completed session): the whole state is written. */
+    private fun ConsentState.anyWrite() =
+        decide(ShareAsk.Event("take_end", end = "normal", speechMs = 40, offered = false), null, ShareAsk.Now(System.currentTimeMillis(), 0))
 }

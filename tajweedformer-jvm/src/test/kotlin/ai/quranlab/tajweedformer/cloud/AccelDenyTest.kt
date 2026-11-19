@@ -45,6 +45,24 @@ class AccelDenyTest : OpenChecked() {
         return c.accelDenied(accelerator, "v4.0-2026-11-09", osBuild, model, chip, delegate)
     }
 
+    /**
+     * Quran Lab's decision of 11-18 (Stage B): the Tensor NPU off for SDK 4.0 until a program faster than the CPU
+     * exists. The rule as the server signs it (qlab-api src/accelDeny.js: patterns `*`, `prefix*` or exact), matched as
+     * this SDK matches it: the SoC id is the chip.
+     */
+    @Test fun theTensorRuleForSdk40() {
+        val rule = mapOf("platform" to "android", "os_version" to "*", "device_class" to "*", "model_revision" to "*",
+            "sdk_version" to "4.0*", "accelerator" to "npu", "chip" to "tensor_g*",
+            "reason" to "Tensor NPU slower than the CPU engine (Stage B, 11-18)")
+        for (soc in listOf("tensor_g3", "tensor_g4", "tensor_g5")) {
+            assertEquals(soc, "Tensor NPU slower than the CPU engine (Stage B, 11-18)", denied(rule, accelerator = "npu:$soc", chip = soc))
+        }
+        assertNull("Exynos 2600", denied(rule, accelerator = "npu:exynos2600", chip = "exynos2600"))
+        assertNull("Exynos 2500", denied(rule, accelerator = "npu:exynos2500", chip = "exynos2500"))
+        assertNull("another SDK version", denied(rule + ("sdk_version" to "3.1*")))
+        assertNull("the Neural Engine of an Apple SDK is another kind", denied(rule, accelerator = "ane", chip = "tensor_g5"))
+    }
+
     @Test fun everyRequiredFieldMatchesOrNot() {
         assertEquals("Tensor G5 dispatch bug", denied(base))
         for ((k, other) in listOf("platform" to "apple", "os_version" to "15", "device_class" to "Pixel9", "accelerator" to "ane",

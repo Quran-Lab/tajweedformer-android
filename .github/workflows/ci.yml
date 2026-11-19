@@ -1,5 +1,10 @@
 name: CI
 
+# SDK 4.0: the Kotlin SDK over the Quran Lab Core. Nothing here builds the Core. The JVM job needs no Core: the tests
+# that need the Core's test release or the contract's vectors (Quran Lab's own) skip. The AAR job takes the Core's
+# Android binaries of this version from the release's folder on cdn.quranlab.ai, checked against
+# native/core/CORE_RELEASE (scripts/ci-core.sh), and builds the AAR and the example app around them.
+
 on:
   push:
   pull_request:
@@ -10,8 +15,10 @@ permissions:
 
 jobs:
   jvm:
-    name: JVM tests (no engine)
-    runs-on: ubuntu-latest
+    name: JVM tests (no Core)
+    # ubuntu-24.04, not ubuntu-latest: ubuntu-latest became 26.04 in November 2026, which has no CMake 3.31.6 (the
+    # version the AAR's native build pins)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -20,48 +27,37 @@ jobs:
           distribution: temurin
           java-version: "17"
       - name: libopus for the sharing tests (built first, so no sharing test ever skips)
-        run: bash scripts/opus/build_opus_host.sh
+        run: echo "TAJWEEDFORMER_OPUS_LIBRARY=$(bash scripts/opus/build_opus_host.sh)" >> "$GITHUB_ENV"
       - name: Test (libopus required)
         run: TJ_REQUIRE_OPUS=1 ./gradlew --no-daemon :tajweedformer-jvm:test -PnoNative
-      - name: Compile the Android library's Kotlin and the Compose module
-        run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin :tajweedformer-compose:compileReleaseKotlin
-      - name: The sharing sheet's layout and screenshot tests, both drawings (Views and Compose) with Android's own renderer on the JVM
-        run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
+      - name: Compile the Android library's Kotlin (without the Core's binaries, which only the AAR needs)
+        run: ./gradlew --no-daemon :tajweedformer:compileReleaseKotlin -PnoNative -x :tajweedformer:prepareCore
       - name: The bundle dry run's steps are the publish workflow's (what the dry run shows is what the publish workflow would upload)
         run: python3 scripts/check_bundle_steps.py
-      - name: Compile the README's quick start and the example app (examples/quickstart; QuickStartDocTest above keeps the README equal to it)
-        run: ./gradlew --no-daemon :examples:quickstart:compileDebugKotlin
 
-  engine:
-    name: Engine through JNI, and the AAR
-    runs-on: ubuntu-latest
+  aar:
+    name: The AAR around the published Core, and the example app
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      VERSION: "4.0.0"
     steps:
       - uses: actions/checkout@v4
-      - name: Engine submodule
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/ci-engine.sh engine
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Tools (ninja makes the host build faster, without it scripts/build_host.sh uses make)
-        run: |
-          command -v ninja || timeout 120 sudo apt-get install -y ninja-build || echo "ninja-build was not installed (the package mirror did not answer), the host build uses make"
-      - name: JVM tests with the engine (the host JNI library is built; the model-dependent ones skip without the model)
-        run: |
-          ./gradlew --no-daemon :tajweedformer-jvm:test -Pnative \
-            --tests 'ai.quranlab.tajweedformer.V4ConformanceTest' --tests 'ai.quranlab.tajweedformer.TajweedApiTest' \
-            --tests 'ai.quranlab.tajweedformer.TajweedModelTest' --tests 'ai.quranlab.tajweedformer.ManifestTest' \
-            --tests 'ai.quranlab.tajweedformer.LayersTest' --tests 'ai.quranlab.tajweedformer.TakeLimitsTest'
-      - name: AAR (arm64-v8a, armeabi-v7a, x86_64)
+      - name: The Quran Lab Core's Android binaries for this version, checked against native/core/CORE_RELEASE
+        run: bash scripts/ci-core.sh "$VERSION" "$RUNNER_TEMP/qlcore"
+      - name: The sharing sheet's layout and screenshot tests, both drawings (Views and Compose) with Android's own renderer on the JVM
+        run: ./gradlew --no-daemon :tajweedformer-compose:testDebugUnitTest
+      - name: AAR (the Core, its bridge and the Opus encoder for arm64-v8a, armeabi-v7a and x86_64)
         run: ./gradlew --no-daemon :tajweedformer:assembleRelease
       - name: Android's verifier rule on monitors, on every class of the AAR (first the proof that the check still rejects the class 2.0.2 shipped)
         run: |
           python3 scripts/check_monitor_handlers.py --expect-rejected scripts/testdata/Telemetry-2.0.2.class
           python3 scripts/check_monitor_handlers.py tajweedformer/build/outputs/aar/*.aar
-      - name: The example app (examples/quickstart)
+      - name: The example app (examples/quickstart; QuickStartDocTest keeps the README's quick start equal to it)
         run: ./gradlew --no-daemon :examples:quickstart:assembleDebug
       - name: The example app as a release build shrunk with R8 and no rule of its own (the AAR's consumer rules must be enough)
         run: ./gradlew --no-daemon :examples:quickstart:assembleRelease

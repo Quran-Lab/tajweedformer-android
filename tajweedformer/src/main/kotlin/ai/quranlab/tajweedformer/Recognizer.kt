@@ -1,8 +1,5 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.accel.AcceleratorController
-import ai.quranlab.tajweedformer.accel.FailoverEngine
-import ai.quranlab.tajweedformer.accel.FailoverEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
@@ -15,7 +12,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-/** The engine under a [Recognizer]: the exact C engine through JNI, the NPU backend, or a test's own. */
+/** The engine under a [Recognizer]: the Core's exact engine (SDK 4.0), or a test's own. */
 internal interface TajweedEngine : AutoCloseable {
     /** Audio per chunk in ms (320 at c16, 480 at c24). */
     val chunkMs: Int
@@ -23,12 +20,14 @@ internal interface TajweedEngine : AutoCloseable {
     /** The backend that computes the heads now. */
     val backend: Backend get() = Backend.CPU
 
-    /** A stream for one take at a time; the exact engine allows one live stream per process. */
+    /** A stream for one take at a time; the Core allows one live stream per process. */
     fun createStream(): TajweedEngineStream
 
-    /** A stream that computes at least [heads] (the exact engine computes only those and the base set;
-     *  other engines may compute more). */
+    /** A stream that computes at least [heads] (the Core computes only those and the base set). */
     fun createStream(heads: Set<HeadId>): TajweedEngineStream = createStream()
+
+    /** The same, on the accelerator when [accelerator] and the engine has one promoted (else the CPU). */
+    fun createStream(heads: Set<HeadId>, accelerator: Boolean): TajweedEngineStream = createStream(heads)
 }
 
 internal interface TajweedEngineStream : AutoCloseable {
@@ -44,11 +43,11 @@ internal interface TajweedEngineStream : AutoCloseable {
     /** A new take: every cache back to the start. */
     fun reset()
 
-    /** Every chunk of the take when the stream replaced earlier chunks (a fallback replay), else null. */
+    /** Every chunk of the take when the stream replaced earlier chunks, else null. */
     fun takeHeads(): List<HeadValues>? = null
 
     /** After a [pushAudio] or [finish]: the take's chunk index its chunks start at when they REDO chunks already
-     *  delivered (a confirmed accelerator disagreement: the CPU's chunks from the first suspicious one), else -1. */
+     *  delivered, else -1. */
     fun takeRedo(): Int = -1
 }
 
@@ -58,17 +57,19 @@ internal fun interface TajweedEngineFactory {
 
     companion object {
         /**
-         * The exact engine through JNI (native/tj_jni.c over the engine's zf_tajweed.h).
-         * Throws [RecognizerException.RuntimeUnsupported] when the native library does not load on this device (an
-         * ABI it is not built for), and [RecognizerException.EngineNotAvailable] when it lacks the engine.
+         * The Core's exact engine (SDK 4.0): the build's device forms decrypted into the Core's memory under the lease.
+         * Throws `runtime_unsupported` when the Core does not load on this device (an ABI it is not built for).
          */
         @JvmField
-        val EXACT: TajweedEngineFactory = TajweedEngineFactory { model, context, options ->
-            val jni = ai.quranlab.tajweedformer.engine.TajweedJni
-            if (!jni.available) throw jni.unavailable("libtajweedformer_jni was built without the engine's zf_tajweed")
-            model.contextFiles(context) // a context that is not downloaded fails here, clearly
-            ai.quranlab.tajweedformer.engine.ExactTajweedEngine(model, context, options)
+        val CORE: TajweedEngineFactory = TajweedEngineFactory { model, context, options ->
+            val build = model.protected ?: throw RecognizerException.ModelIncompatible("not an encrypted build: SDK 4.0 opens a model only through the Core")
+            if (context !in model.availableContexts) throw RecognizerException.ModelMissing("context $context is not installed")
+            ai.quranlab.tajweedformer.core.CoreTajweedEngine(build, context, options)
         }
+
+        /** The 3.x name of the default factory. */
+        @JvmField
+        val EXACT: TajweedEngineFactory = CORE
     }
 }
 
@@ -77,64 +78,45 @@ internal fun interface TajweedEngineFactory {
  * chunk every requested head; the decoded layer ([decode]: top-1 and runner-up per frame, transcript with
  * confidences, words, times). Nothing here judges a recitation.
  *
- * Backends: the exact CPU engine serves from the first session. With an [Options.accelerator] the NPU
- * is promoted in the background (download, compile, warm-up, the golden test against the CPU engine) and a
- * NEW session runs on it once it is ready (never a session in progress). While it serves, the CPU engine's
- * weights are released ([CpuSlot]); a chunk the NPU fails (an exception, NaN or inf, values out of range, a
- * missed limit) switches the take to the CPU within that call ([FailoverEngine]: the recent audio replayed, the
- * failed chunk redone). Blank output over audio is checked on the CPU off the audio path and switches the take
- * only when the CPU writes tokens there (the chunks from that point are delivered again, [EngineChunk.replaces]).
- * What a failure does to later sessions depends on its cause ([ai.quranlab.tajweedformer.accel.AcceleratorController]).
- * [backendChoice] says which backend the last session got and why; every choice and switch goes to
- * [SdkObserver.onBackendSelected].
- *
- * One session at a time (the exact engine runs one live stream per process). Every engine call runs
- * on the recognizer's own thread, in order; the calls are safe from any thread.
+ * SDK 4.0: the exact engine inside the Quran Lab Core, on the CPU, and the accelerator program the Core runs from its
+ * own memory (R2) once it is prepared and passed its golden test ([Options.accelerator]). One session at a time. Every
+ * engine call runs on the recognizer's own thread, in order (an accelerator take is fed from it, never from the
+ * real-time audio callback); the calls are safe from any thread.
  */
 internal class Recognizer private constructor(
     val model: ModelFolder,
     /** The context the engine runs ("c16_l64"). */
     val context: String,
     val options: Options,
-    /** The exact CPU engine at open, the accelerator's standby (its weights released while the accelerator serves). */
-    firstEngine: CpuSlot,
+    first: TajweedEngine,
     choice: BackendChoice,
-    /** The CPU self-test, when it ran ([Options.selfTest]). */
-    val cpuSelfTest: SelfTestResult?,
 ) : AutoCloseable {
     data class Options(
         /** The app's context; null: [configContext], else the model's default. */
         val context: String? = null,
-        /** The signed config's `inference.context` (the portal's Response time); used when the app chose none and
-         *  the model build ships it, ignored otherwise. */
+        /** The signed config's `inference.context`; used when the app chose none and the build ships it. */
         val configContext: String? = null,
         /** The rate audio is pushed at: 16000, or 8000 .. 48000 through the engine's resampler. */
         val sampleRate: Int = 16_000,
-        /** Engine threads; 0 = the default: on Android the big + mid cores capped at 4 ([CoreTopology]),
-         *  elsewhere the engine's own choice. */
+        /** Engine threads; 0 = the default: on Android the big + mid cores capped at 4 ([CoreTopology]). */
         val threads: Int = 0,
         /** Engine chunks run together, for stored audio; 1 for live audio. */
         val batch: Int = 1,
-        /** Leave the engine's threads unpinned (true) or pin them (false); null: the engine's platform
-         *  default (pinned on Android, unpinned on desktops). Timing only, never a bit. */
+        /** Leave the engine's threads unpinned (true) or pin them (false); null: the engine's platform default. */
         val noPin: Boolean? = null,
-        /** The decoded layer's depth per head ([Decoder]): how many ranked entries per frame (2 for log_probs
-         *  by default; up to 38 for the token heads = the full ranked list; the class heads up to their
-         *  class count). boundary and conf have no ranking (they are single logits). */
+        /** The decoded layer's depth per head ([Decoder]). */
         val topK: Map<HeadId, Int> = Decoder.DEFAULT_TOP_K,
-        /** The heads each chunk carries (the raw layer is opt-in per head). */
+        /** The heads each chunk carries. */
         val heads: Set<HeadId> = DEFAULT_HEADS,
         /** Every head, whatever [heads] says. */
         val allHeads: Boolean = false,
-        /** AUTO uses the [accelerator] when it is ready; CPU never does. */
+        /** The app's backend choice: AUTO runs takes on the accelerator once it is promoted, CPU never. */
         val backend: BackendPreference = BackendPreference.AUTO,
-        /** The NPU, prepared in the background (ModelClient makes it); null: CPU only. */
-        val accelerator: AcceleratorController? = null,
+        /** The accelerator to promote once the CPU engine is open (R2); null: the CPU only. */
+        val accelerator: ai.quranlab.tajweedformer.core.AcceleratorPlan? = null,
         /** The device's SoC id, for the observer. */
         val soc: String? = null,
-        /** Run the CPU self-test at open (ModelClient always does). */
-        val selfTest: Boolean = false,
-        val engine: TajweedEngineFactory = TajweedEngineFactory.EXACT,
+        val engine: TajweedEngineFactory = TajweedEngineFactory.CORE,
     )
 
     private val executor = Executors.newSingleThreadExecutor { r ->
@@ -149,84 +131,35 @@ internal class Recognizer private constructor(
     }
 
     /** The CPU engine in use: one at a time, opened for [rate] (a take at another rate opens it again for that rate). */
-    @Volatile private var engine: CpuSlot = firstEngine
+    @Volatile private var engine: TajweedEngine = first
 
     /** The input rate the CPU engine is open for. */
     @Volatile private var rate: Int = options.sampleRate
     private var closed = false
 
-    /** The backend the last session got and why (at open: the CPU and the accelerator's state). */
+    /** The backend the last session got and why. */
     @Volatile
     var backendChoice: BackendChoice = choice
         private set
 
-    /** The backend of the last session (the CPU until a session runs on the accelerator). */
+    /** The backend the next session asked for on the accelerator runs on. */
     val backend: Backend get() = backendChoice.backend
-
-    private fun choose(c: BackendChoice) {
-        val prev = backendChoice
-        backendChoice = c
-        if (prev.backend != c.backend || prev.reason != c.reason) SdkEvents.emit { it.onBackendSelected(c) }
-    }
-
-    /** The accelerator's session engine, kept while the same accelerator stays promoted. */
-    @Volatile private var accEngine: FailoverEngine? = null
-
-    /** The accelerator's session engine of the last accelerator session (measurements). */
-    internal val acceleratorEngine: FailoverEngine? get() = accEngine
-
-    /** The CPU standby (tests look at its weights being loaded or released). */
-    internal val cpuStandby: CpuSlot get() = engine
-
-    /** Release the CPU weights while the accelerator serves (tests keep them to measure the warm switch). */
-    @Volatile internal var releaseCpuForAccelerator = true
-
-    /** The accelerator controller in use (null: CPU only, or the app asked for the CPU). */
-    internal fun accelerator(): AcceleratorController? = options.accelerator.takeIf { options.backend != BackendPreference.CPU }
-
-    /** The engine for a new session of [sampleRate]: the accelerator's when it is ready and nothing prefers the CPU. */
-    private fun engineForSession(sampleRate: Int, cpuOnly: Boolean): TajweedEngine {
-        val cpu = cpuFor(sampleRate)
-        val acc = accelerator() ?: return cpu
-        if (cpuOnly) {
-            choose(BackendChoice(Backend.CPU, "cpu_requested", "", acc.key.soc, context, model.manifest.build))
-            return cpu
-        }
-        val e = acc.engineForNextSession(cpu, sampleRate, accEngine) { ev -> switched(ev) }
-        if (e != null) {
-            accEngine = e
-            // the warm-up at take start: one prediction of silence on the accelerator's thread while the first
-            // chunk's audio arrives (a powered-down accelerator wakes up before the first real chunk)
-            e.warmUp()
-            choose(BackendChoice(Backend.NPU, "npu", "", acc.key.soc, context, model.manifest.build))
-            // no second resident copy of the weights while the accelerator serves: a failover loads them again
-            if (releaseCpuForAccelerator) executor.execute { try { cpu.release() } catch (_: Exception) {} }
-            return e
-        }
-        choose(BackendChoice(Backend.CPU, acc.lastCpuReason ?: "cpu", "", acc.key.soc, context, model.manifest.build))
-        return cpu
-    }
 
     /**
      * The CPU engine for a take pushed at [sampleRate]. The engine resamples at its input, and its rate is fixed when it
-     * is opened, so a take at another rate than the last one closes the engine and opens it again for that rate (one
-     * model load; a `listen` take runs at the microphone's rate, so this happens once, not per take). Never two loaded
-     * engines: the weights would be resident twice.
+     * is opened, so a take at another rate closes the engine and opens it again for that rate (one model load: the
+     * Core decrypts the device forms again). Never two loaded engines (the Core opens one model at a time).
      */
-    private fun cpuFor(sampleRate: Int): CpuSlot {
+    private fun cpuFor(sampleRate: Int): TajweedEngine {
         if (sampleRate == rate) return engine
         val old = engine
         try { executor.submit { old.close() }.get() } catch (_: Exception) {}
-        val o = options.copy(sampleRate = sampleRate)
-        val next = CpuSlot(options.engine.open(model, context, o)) { options.engine.open(model, context, o) }
+        val next = options.engine.open(model, context, options.copy(sampleRate = sampleRate))
         engine = next
         rate = sampleRate
+        backendChoice = BackendChoice(Backend.CPU, "no_accelerator", "", options.soc, context, model.manifest.build)
+        promoteLater(next)
         return next
-    }
-
-    /** A take on the accelerator switched to the CPU: the app sees only the backend change. */
-    private fun switched(e: FailoverEvent) {
-        choose(BackendChoice(Backend.CPU, "failover_${e.cause}", e.error?.javaClass?.simpleName ?: "", options.soc, context, model.manifest.build))
     }
 
     val chunkMs: Int get() = engine.chunkMs
@@ -237,14 +170,10 @@ internal class Recognizer private constructor(
     /** The decoded layer of [heads] (a chunk's, or a whole take's). */
     fun decode(heads: HeadValues, frameOffset: Int = 0): Decoded = Decoder.decode(heads, model.vocabulary, frameOffset, options.topK)
 
-    /** Starts a take at the recognizer's own rate and head selection. Throws [RecognizerException.SessionActive]
-     *  while another is running. */
+    /** Starts a take at the recognizer's own rate and head selection. */
     fun startSession(): RecognizerSession = startSession(options.sampleRate, heads)
 
-    /**
-     * Starts a take pushed at [sampleRate] (8000 to 48000) carrying [select] per chunk; with [cpuOnly] on the CPU
-     * engine whatever the accelerator's state. A rate other than the last take's opens the CPU engine again for it.
-     */
+    /** Starts a take pushed at [sampleRate] (8000 to 48000) carrying [select] per chunk. */
     fun startSession(sampleRate: Int, select: Set<HeadId> = heads, cpuOnly: Boolean = false): RecognizerSession {
         if (sampleRate !in 8_000..48_000) {
             throw RecognizerException.UnsupportedAudioFormat("$sampleRate Hz (the resampler takes 8000 to 48000)")
@@ -252,32 +181,22 @@ internal class Recognizer private constructor(
         synchronized(lock) {
             if (closed) throw RecognizerException.SessionClosed()
             if (session != null) throw RecognizerException.SessionActive()
-            val sessionEngine = engineForSession(sampleRate, cpuOnly)
-            val info = sessionInfo(sampleRate)
-            val s = RecognizerSession(this, info, sessionEngine, select)
+            val sessionEngine = cpuFor(sampleRate)
+            val info = sessionInfo(sampleRate, if (cpuOnly) Backend.CPU else sessionEngine.backend)
+            val s = RecognizerSession(this, info, sessionEngine, select, cpuOnly)
             session = s
-            // the pipeline's golden and warm-up stages yield to sessions (and a first install starts it after one)
-            accelerator()?.sessionStarted()
             SdkEvents.emit { it.onSessionStart(info) }
             return s
         }
     }
 
-    private fun sessionInfo(sampleRate: Int): SessionInfo =
+    private fun sessionInfo(sampleRate: Int, backend: Backend): SessionInfo =
         SessionInfo(sessionIds.incrementAndGet(), model.modelId, context, backend, sampleRate, System.currentTimeMillis(),
             revision = model.manifest.build, soc = options.soc,
-            weightsSha256 = model.manifest.file("layers.zfw")?.localSha256)
+            weightsSha256 = model.manifest.file("layers.zfw")?.plainSha256)
 
     internal fun release(s: RecognizerSession) {
-        val ended = synchronized(lock) {
-            if (session === s) {
-                session = null
-                true
-            } else {
-                false
-            }
-        }
-        if (ended) accelerator()?.sessionEnded()
+        synchronized(lock) { if (session === s) session = null }
     }
 
     /** Whether a take is open. */
@@ -294,6 +213,197 @@ internal class Recognizer private constructor(
     internal val firstChunkNeed = java.util.concurrent.ConcurrentHashMap<TajweedEngine, Long>()
 
     internal suspend fun <T> onEngine(body: (TajweedEngine) -> T): T = withContext(dispatcher) { body(engine) }
+
+    /** [body] on the engine's thread, waited for (never call it from that thread). */
+    internal fun <T> onEngineBlocking(body: (TajweedEngine) -> T): T = try {
+        executor.submit(java.util.concurrent.Callable { body(engine) }).get()
+    } catch (e: java.util.concurrent.ExecutionException) {
+        throw e.cause ?: e
+    }
+
+    // ---------------------------------------------------------------- the accelerator's promotion (R2)
+
+    /**
+     * The accelerator for [e], in the background (quranlab-core hardening.md section 10): the Core prepares the program
+     * on a thread of its own (seconds: the decryption, then the runtime's compile) while CPU takes go on; then, on the
+     * engine thread with no take open, the golden test (once per build on this device: the verdict is kept); then the
+     * takes asked for on the accelerator run on it. A failure leaves the CPU engine; a build whose program the Core or
+     * the runtime refused, or that failed its golden test, is not tried again on this device.
+     */
+    private fun promoteLater(e: TajweedEngine) {
+        val plan = options.accelerator ?: return
+        val ce = e as? ai.quranlab.tajweedformer.core.AcceleratorHost ?: return
+        if (options.backend == BackendPreference.CPU) return
+        val key = "${model.manifest.build}:${plan.kind}:$context"
+        // off for good, or held by a transient verdict (slower than the CPU engine, the runtime refused it on this OS)
+        if (plan.records.blocked(key) || plan.held(key)) return
+        ce.onFailover = { why ->
+            val c = BackendChoice(Backend.CPU, "failover", why, options.soc, context, model.manifest.build)
+            backendChoice = c
+            SdkEvents.emit { it.onBackendSelected(c) }
+            plan.report(ai.quranlab.tajweedformer.core.PromotionInfo(plan.soc, model.manifest.build, context, promoted = false,
+                reason = "failover", detail = why, failover = true, version = model.manifest.version ?: ""))
+        }
+        Thread({ promote(ce, plan, key) }, "tajweedformer-accel").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }.start()
+    }
+
+    private fun promote(e: ai.quranlab.tajweedformer.core.AcceleratorHost, plan: ai.quranlab.tajweedformer.core.AcceleratorPlan, key: String) {
+        val build = model.manifest.build
+        val records = plan.records
+        fun report(at: String?, reason: String?, detail: String?, ms: Double?, accMs: Double? = null, cpuMs: Double? = null) = try {
+            plan.report(ai.quranlab.tajweedformer.core.PromotionInfo(plan.soc, build, context, at == null, at, reason, detail, ms,
+                version = model.manifest.version ?: "", acceleratorMs = accMs, cpuMs = cpuMs))
+        } catch (_: Exception) {
+        }
+        // every transient verdict names the dispatch library it was found with: another one is tried again at once
+        fun hold(state: String, why: String, extra: Map<String, Any?> = emptyMap()) =
+            records.hold(key, state, why, plan.sdk, plan.os, plan.clock(), extra + ("dispatch" to plan.dispatchId))
+        val passedBefore = records.passedWith(key, plan.dispatchId) || records.passedBefore(key)
+        val clips = if (passedBefore) emptyList() else try { plan.clips() } catch (_: Exception) { emptyList() }
+        if (!passedBefore && clips.isEmpty()) return
+        if (!records.begin(key, plan.dispatchId)) {
+            // the process ended twice during the preparation (the system, or the vendor's runtime, ended it): the CPU
+            // engine, held until an SDK, OS or dispatch library update or 30 days, never off for good
+            hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.UNSUPPORTED, "crash: the process ended during the preparation twice")
+            report("compile", "crash", "the process ended during the preparation twice", null)
+            return
+        }
+        val t0 = System.nanoTime()
+        // the Core's prepare on a thread of its own, waited for at most plan.prepareDeadlineMs: a vendor dispatch that
+        // does not answer (the Pixel 10's launch firmware waits on its service) never keeps the promotion waiting; the
+        // takes run on the CPU engine meanwhile, and a late answer is released, never promoted
+        val abandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+        val released = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun releaseLate() {
+            if (released.compareAndSet(false, true)) onEngineLater { try { e.releaseAccelerator() } catch (_: Exception) {} }
+        }
+        val prepare = java.util.concurrent.FutureTask {
+            val n = e.prepareAccelerator(plan.kind, plan.dispatchDir)
+            if (abandoned.get()) releaseLate()
+            n
+        }
+        Thread(prepare, "tajweedformer-accel-prepare").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }.start()
+        val name = try {
+            prepare.get(plan.prepareDeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: java.util.concurrent.TimeoutException) {
+            abandoned.set(true)
+            if (prepare.isDone) try { prepare.get(); releaseLate() } catch (_: Exception) {}
+            hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.UNSUPPORTED, "compile: no answer in ${plan.prepareDeadlineMs} ms")
+            report("compile", "compile_timeout", "no answer in ${plan.prepareDeadlineMs} ms", null)
+            return
+        } catch (w: java.util.concurrent.ExecutionException) {
+            val x = w.cause as? ai.quranlab.tajweedformer.core.CoreException
+            if (x == null) {
+                records.end(key, "waiting")
+                return
+            }
+            val qc = ai.quranlab.tajweedformer.core.Core
+            val reason = when (x.detail) {
+                qc.D_ACCEL_PROGRAM -> "compile_error"
+                qc.D_ACCEL_RUNTIME, qc.D_ACCEL_CONTRACT -> "load_error"
+                qc.D_ACCEL_FIRMWARE -> "firmware"
+                qc.D_ACCEL_DISPATCH -> "dispatch"
+                else -> "other"
+            }
+            when {
+                x.status != qc.E_ENGINE -> records.end(key, "waiting", x.message)
+                // Core 69276aa: firmware known not to set a program up (the Pixel 10's launch firmware), refused in
+                // milliseconds: the SDK stops asking (no download, no prepare) until the OS build changes
+                x.detail == qc.D_ACCEL_FIRMWARE ->
+                    hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.FIRMWARE, x.message ?: reason)
+                // the vendor's service did not answer: the CPU engine; the Core refuses every later prepare of this
+                // process at once, and the next start asks again
+                x.detail == qc.D_ACCEL_DISPATCH -> records.end(key, "waiting", x.message)
+                // the runtime or the vendor's dispatch refused the program on this OS build (the Pixel 10's launch
+                // firmware: its dispatch times out): tried again after an SDK or OS update or 30 days, not for good
+                x.detail == qc.D_ACCEL_PROGRAM || x.detail == qc.D_ACCEL_RUNTIME ->
+                    hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.UNSUPPORTED, x.message ?: reason)
+                // the device's side too (Stage B): LiteRT's entry points split over images (another LiteRT build, or a
+                // hook: risk signal 8 is the Core's), or an OS below the program's floor: tried again after an update
+                x.detail == qc.D_ACCEL_HOOKED || x.detail == qc.D_ACCEL_PLATFORM ->
+                    hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.UNSUPPORTED, x.message ?: reason)
+                // the build's own fault (a program that breaks the host contract, no complete program): off for good
+                else -> records.end(key, ai.quranlab.tajweedformer.core.AcceleratorRecords.FAILED, x.message)
+            }
+            report("compile", reason, qc.detailName(x.status, x.detail) ?: qc.statusName(x.status), null)
+            return
+        } catch (_: Exception) {
+            records.end(key, "waiting")
+            return
+        }
+        val ms = (System.nanoTime() - t0) / 1e6
+        var accMs: Double? = null
+        var cpuMs: Double? = null
+        if (!passedBefore) {
+            // the golden test on the engine thread, when no take is open (one CPU stream at a time in the Core)
+            var runs: ai.quranlab.tajweedformer.core.GoldenRuns? = null
+            val until = System.currentTimeMillis() + GOLDEN_WAIT_MS
+            while (runs == null) {
+                if (closed || engine !== e) return records.end(key, "waiting")
+                runs = try {
+                    executor.submit(java.util.concurrent.Callable { if (engine === e) e.goldenRuns(clips) else null }).get()
+                } catch (_: java.util.concurrent.RejectedExecutionException) {
+                    return records.end(key, "waiting")
+                } catch (x: Exception) {
+                    // the golden runs did not complete: the accelerator's stream failed while running (the runtime or
+                    // the vendor's dispatch: a program prepared without its dispatch library fails at its first push,
+                    // "qlc_stream_push: engine", a device lab's Pixel 10, 11-18), or the CPU's side failed. That says
+                    // nothing about the build: the CPU engine now, held until an SDK, OS or dispatch library update or
+                    // 30 days, never off for good. Only a mismatch below is a verdict on the build.
+                    val cause = (x as? java.util.concurrent.ExecutionException)?.cause ?: x
+                    val qc = ai.quranlab.tajweedformer.core.Core
+                    val core = cause as? ai.quranlab.tajweedformer.core.CoreException
+                    val what = core?.let { qc.detailName(it.status, it.detail) ?: qc.statusName(it.status) } ?: cause.javaClass.simpleName
+                    hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.UNSUPPORTED, "golden run: ${cause.message ?: what}")
+                    try { executor.submit { e.releaseAccelerator() }.get() } catch (_: Exception) {}
+                    report("golden", "load_error", "golden run: $what", ms)
+                    return
+                }
+                if (runs == null) {
+                    if (System.currentTimeMillis() > until) return records.end(key, "waiting")
+                    try { Thread.sleep(GOLDEN_RETRY_MS) } catch (_: InterruptedException) { return records.end(key, "waiting") }
+                }
+            }
+            val v = ai.quranlab.tajweedformer.core.Golden.judge(runs.runs, plan.tolerance)
+            if (!v.passed) {
+                records.end(key, ai.quranlab.tajweedformer.core.AcceleratorRecords.FAILED, "golden: ${v.detail}")
+                try { executor.submit { e.releaseAccelerator() }.get() } catch (_: Exception) {}
+                report("golden", "golden_mismatch", v.detail.take(120), ms)
+                return
+            }
+            // the measure stage (SDK 4.0): not promoted when slower than the CPU engine on this device, by the
+            // golden test's warm chunks
+            val speed = ai.quranlab.tajweedformer.core.AcceleratorSpeed
+            val a = speed.median(runs.acceleratorMs)
+            val c = speed.median(runs.cpuMs)
+            accMs = a.takeIf { it > 0 }
+            cpuMs = c.takeIf { it > 0 }
+            val need = speed.minSpeedup(try { plan.minSpeedup() } catch (_: Exception) { null })
+            if (speed.slower(a, c, need)) {
+                val why = String.format(java.util.Locale.ROOT,
+                    "measure: the accelerator's median chunk takes %.1f ms, the CPU engine's %.1f ms (speedup %.2f, at least %.2f)", a, c, c / a, need)
+                hold(ai.quranlab.tajweedformer.core.AcceleratorRecords.SLOWER, why, mapOf("accelerator_ms" to a, "cpu_ms" to c))
+                // the program let go: its memory goes back (about 200 MB on a Pixel 10)
+                try { executor.submit { e.releaseAccelerator() }.get() } catch (_: Exception) {}
+                backendChoice = BackendChoice(Backend.CPU, "slower_than_cpu", why, options.soc, context, build)
+                report("measure", "slower_than_cpu", why, ms, a, c)
+                return
+            }
+        }
+        records.end(key, ai.quranlab.tajweedformer.core.AcceleratorRecords.PASSED, extra = mapOf("dispatch" to plan.dispatchId))
+        if (closed || engine !== e) return
+        e.promote()
+        val c = BackendChoice(Backend.NPU, "promoted", name, options.soc, context, build)
+        backendChoice = c
+        SdkEvents.emit { it.onBackendSelected(c) }
+        report(null, null, name, ms, accMs, cpuMs)
+    }
 
     /**
      * [body] on the engine's thread, after what is queued there, not awaited. A plain task of the thread, never a
@@ -314,9 +424,10 @@ internal class Recognizer private constructor(
             closed = true
             s = session
         }
-        // the open take's engine stream is closed on the engine's thread first, then the engine itself
+        // the open take's engine stream is closed on the engine's thread first, then the engine itself; the Core's
+        // model is closed before close() returns, so another one can be opened right after
         s?.cancel()
-        executor.execute { engine.close() }
+        try { executor.submit { engine.close() }.get() } catch (_: Exception) {}
         executor.shutdown()
         OpenObjects.closed(this)
     }
@@ -325,6 +436,10 @@ internal class Recognizer private constructor(
         private val counter = AtomicInteger()
         private val sessionIds = AtomicLong()
         private val loads = AtomicInteger()
+
+        /** How long the golden test waits for a moment with no take open, and how often it looks. */
+        const val GOLDEN_WAIT_MS = 10 * 60_000L
+        const val GOLDEN_RETRY_MS = 5_000L
 
         /** The heads delivered by default: the base set plus conf for the decoded layer's confidences. */
         @JvmField
@@ -344,7 +459,7 @@ internal class Recognizer private constructor(
             return config?.takeIf { it in model.contexts } ?: model.defaultContext
         }
 
-        /** Opens the engine (and the NPU when set up) for [model] on [Dispatchers.IO]. */
+        /** Opens the engine for [model] on [Dispatchers.IO]. */
         suspend fun create(model: ModelFolder, options: Options = Options()): Recognizer =
             withContext(Dispatchers.IO) { open(model, options) }
 
@@ -358,39 +473,19 @@ internal class Recognizer private constructor(
             }
             val t0 = System.nanoTime()
             val cpu = options.engine.open(model, context, options)
-            val rec = try {
-                choose(model, context, options, cpu)
-            } catch (e: Throwable) {
-                cpu.close()
-                throw e
-            }
+            // the vocabulary the open model gives (R4: its build's tokens.txt, from the Core), where the folder's differs
+            val folder = (cpu as? ai.quranlab.tajweedformer.core.CoreTajweedEngine)?.coreModel?.let { m ->
+                try { model.withVocabulary(Vocabulary(m.tokenNames().toTypedArray(), ModelFolder.BLANK)) } catch (_: Exception) { null }
+            } ?: model
+            val reason = if (options.backend == BackendPreference.CPU) "cpu_requested" else "no_accelerator"
+            val c = BackendChoice(Backend.CPU, reason, "", options.soc, context, folder.manifest.build)
+            SdkEvents.emit { it.onBackendSelected(c) }
+            val rec = Recognizer(folder, context, options, cpu, c)
             val load = ModelLoadInfo(model.manifest.build, context, rec.backend, (System.nanoTime() - t0) / 1e6,
                 loads.getAndIncrement() == 0, options.soc)
             SdkEvents.emit { it.onModelLoad(load) }
+            rec.promoteLater(cpu)
             return rec
-        }
-
-        private fun choose(model: ModelFolder, context: String, options: Options, cpu: TajweedEngine): Recognizer {
-            // the CPU self-test runs the built-in 16 kHz clip: at another app rate, on a 16 kHz engine of its own
-            val cpuTest = if (options.selfTest) {
-                val testCpu = if (options.sampleRate == 16_000) cpu else options.engine.open(model, context, options.copy(sampleRate = 16_000))
-                try {
-                    SelfTest.cpu(testCpu, model, context)
-                } finally {
-                    if (testCpu !== cpu) testCpu.close()
-                }
-            } else null
-            val acc = options.accelerator
-            val reason = when {
-                options.backend == BackendPreference.CPU -> "cpu_requested"
-                acc == null -> "no_accelerator"
-                else -> acc.state.value.let { s -> (s as? ai.quranlab.tajweedformer.accel.AcceleratorState.Disabled)?.reason
-                    ?: (s as? ai.quranlab.tajweedformer.accel.AcceleratorState.Cpu)?.reason ?: s.key }
-            }
-            val c = BackendChoice(Backend.CPU, reason, "", options.soc, context, model.manifest.build)
-            SdkEvents.emit { it.onBackendSelected(c) }
-            val slot = CpuSlot(cpu) { options.engine.open(model, context, options) }
-            return Recognizer(model, context, options, slot, c, cpuTest?.result)
         }
     }
 }
@@ -405,6 +500,8 @@ internal class RecognizerSession internal constructor(
     private val engine: TajweedEngine,
     /** The heads each chunk carries. */
     private val select: Set<HeadId> = recognizer.heads,
+    /** The app asked for the CPU (`Backend.CPU`): never the accelerator. */
+    private val cpuOnly: Boolean = false,
 ) {
     // Both hold at most the chunks of one take, and a take holds at most maxSamples of audio (TakeLimits): the
     // channel has no capacity of its own because the engine thread must never wait for, or drop, a chunk the
@@ -434,6 +531,9 @@ internal class RecognizerSession internal constructor(
     private val pending = FloatArray(maxOf(16_000, (engine.chunkMs.toLong() * info.sampleRate / 1000).toInt() + info.sampleRate / 10))
     private var pendingN = 0
     @Volatile private var taken = 0L
+
+    /** The take was given audio (a take without any is not a session, SPEC 6.1). */
+    val hadAudio: Boolean get() = taken > 0
 
     /** The take holds all the audio it may ([TakeLimits.MAX_TAKE_MS]): the Session ends it with `Ended(LIMIT)`. */
     val atLimit: Boolean get() = taken >= maxSamples
@@ -519,7 +619,7 @@ internal class RecognizerSession internal constructor(
             val b0 = if (prof) System.nanoTime() else 0L
             // the two heads speech is read from are always computed, whatever the app selected; they are handed to
             // the app, and counted, only when selected
-            val s = stream ?: engine.createStream(select + SpeechFrames.HEADS).also { stream = it }
+            val s = stream ?: engine.createStream(select + SpeechFrames.HEADS, accelerator = !cpuOnly).also { stream = it }
             if (prof) StageClock.lap(StageClock.STREAM_OPEN_CLOSE, b0)
             val t0 = System.nanoTime()
             // each call's chunks with where they start when they redo delivered ones (takeRedo)
@@ -577,6 +677,9 @@ internal class RecognizerSession internal constructor(
 
     /** The take's heads once it finished (the 6.2 counters are read from them). */
     @Volatile private var takeHeads: HeadValues? = null
+
+    /** The `Ended` reason of a take that ended by itself, set by its [TajweedSession] before [finish]; null for the app's finish. */
+    @Volatile internal var endedBy: String? = null
 
     /** Stops the take; [chunks] fails with Cancelled. */
     fun cancel() {
@@ -666,7 +769,7 @@ internal class RecognizerSession internal constructor(
         }
         val stats = SessionStats(samples.toDouble() / info.sampleRate, compute, index, outcome, lastBackend,
             speechFrames = counts.speechFrames, silenceFrames = counts.silenceFrames, tokens = counts.tokens,
-            audioMs = samples * 1000 / info.sampleRate, computeUs = computeUs)
+            audioMs = samples * 1000 / info.sampleRate, computeUs = computeUs, endedBy = endedBy)
         SdkEvents.emit { it.onSessionEnd(info, stats) }
     }
 }

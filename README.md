@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Android, JVM" src="https://img.shields.io/badge/platform-Android%20%7C%20JVM-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 3.1.5" src="https://img.shields.io/badge/version-3.1.5-2a3b8f?style=flat-square">
+  <img alt="version: 4.0.0" src="https://img.shields.io/badge/version-4.0.0-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -23,7 +23,7 @@
 <tr>
 <td width="33%" valign="top">
 
-**Hears the recitation**<br>Streaming recognition of Quranic recitation: audio in, and what the model heard comes out as often as every 160 ms on the CPU engine (320 ms by default, including on the NPU; 480 ms for longer context).
+**Hears the recitation**<br>Streaming recognition of Quranic recitation: audio in, and what the model heard comes out as often as every 160 ms (320 ms by default, 480 ms for longer context).
 
 </td>
 <td width="33%" valign="top">
@@ -33,7 +33,7 @@
 </td>
 <td width="33%" valign="top">
 
-**Native on Android**<br>Kotlin for Android 8.0+ and the desktop JVM. It runs on the CPU on every phone, and on the NPU where this phone's build passes its self-test.
+**Native on Android**<br>Kotlin for Android 8.0+ and the desktop JVM, over the Quran Lab Core. It runs the exact CPU engine on every phone.
 
 </td>
 </tr>
@@ -50,7 +50,7 @@
 </td>
 <td valign="top">
 
-**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, so your app can judge a recitation its own way. The expected units of each ayah do not: with this release and the model build served now, `model.reference` is null.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, and the expected units of each ayah where the served build carries them, so your app can judge a recitation its own way.
 
 </td>
 </tr>
@@ -61,11 +61,11 @@
 - **Made for the Quran.** Trained on Quranic recitation, with its own sound units and heads for what tajweed is about.
 - **Feedback in the moment.** Output streams while the learner recites, so your app can respond on the word itself, not after the take.
 - **One engine on every platform.** The same engine runs the [Android](https://github.com/Quran-Lab/tajweedformer-android), [iOS and macOS](https://github.com/Quran-Lab/tajweedformer-apple), [web](https://github.com/Quran-Lab/tajweedformer-web) and [Windows and Linux](https://github.com/Quran-Lab/tajweedformer-c) SDKs, all set from one portal.
-- **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, asks three things: no paywall on model features, no results presented as rulings, and show the notice.
+- **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, and Quran Lab's access terms ask two things: no paywall on model features, and no output presented as an authoritative religious ruling. A line telling learners that automatic feedback can be wrong is encouraged, not required.
 
 ## Built for AI developers
 
-Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste it into your coding assistant. That one prompt sets everything up: the package, your key, and the first calls. [AGENTS.md](AGENTS.md), beside this README, gives the assistant the complete API, so the code it writes uses names that exist. Prefer to do it by hand? Get a key in the portal and start below.
+Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajweedformer-android) and paste it into your coding assistant. That one prompt sets everything up: the package, your key, and the first calls. [AGENTS.md](AGENTS.md), beside this README, gives the assistant the complete API, so the code it writes uses names that exist. Prefer to do it by hand? Get a key in the portal and start below.
 
 ## Install
 
@@ -74,19 +74,27 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:3.1.5") }
+dependencies { implementation("ai.quranlab:tajweedformer:4.0.0") }
 ```
+
+
+
+The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
+every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
+[sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajweedformer-android) ("Before you start").
 
 ## Before you start
 
 | | |
 | - | - |
-| **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai), for your app's package name. |
-| **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. On another ABI the SDK fails with `runtime_unsupported`. An app that does not ship to Chromebooks keeps `x86_64` out of its release build with one `abiFilters` line. |
+| **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajweedformer-android), for your app's package name. |
+| **Signing certificates** | On your Android key's page, under "Signing certificates (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App integrity, App signing). Until you do, your installs get 24-hour leases. |
+| **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. It needs a development key: Quran Lab leases the `x86_64` Core to development keys only. On another ABI the SDK fails with `runtime_unsupported`. |
 | **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
-| **Download** | The first `client.model()` or `client.prefetch()` downloads the model: 55.5 MB, once (68.1 MB on disk), on any network. `client.prefetch()` does it before the learner taps, and `prefetch(unmeteredOnly = true)` waits for Wi-Fi. A phone with a supported NPU fetches its build later, on an unmetered network only. |
-| **Model** | A model comes only from Quran Lab's server, through the Client: the SDK opens only a model it downloaded itself on this device. An app that updates from an SDK before 3.1.0 downloads the model once more. |
-| **Play Integrity** | Since 3.1.0 the SDK depends on Google's Play Integrity library (`com.google.android.play:integrity`; with the ten libraries it brings it adds 33,594 bytes to the example app's release APK shrunk with R8, and 34,420 bytes to its debug APK). Quran Lab can ask for proof that a model download or a shared recording comes from your app as Google Play delivered it, on a real device; the SDK asks Play only when Quran Lab's signed config says so, and continues without it where Play services are missing. You add and set nothing. |
+| **Download** | The first `client.model()` or `client.prefetch()` downloads the model, encrypted: 55.5 MB, once (68.4 MB on disk), on any network, and needs a connection. At 4.0's launch every phone runs the Core's CPU engine: Quran Lab serves no NPU build until one is faster than the CPU engine. |
+| **Offline** | The model opens under a lease Quran Lab signs for this install: 7 days when the phone's hardware attests the install for your app (Play Integrity where a phone has no usable attestation), 24 hours otherwise. The SDK renews it in the background whenever the phone is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A Model that is open keeps running. |
+| **Model** | The model runs only inside the Quran Lab Core, in the AAR: its files are encrypted from Quran Lab's server to the device, and no plain model file is ever written. When Quran Lab refuses the key or the app, the model's files are removed. |
+| **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
 | **Takes** | A Model runs one take (one Session) at a time; a take holds at most 20 minutes of audio. |
 
@@ -126,7 +134,7 @@ with a key made for that identifier ([its README](examples/quickstart/README.md)
 
 ## More
 
-The full reference (every layer of the API, backends, what a device downloads, platform settings, recording sharing, building and testing) is in [AGENTS.md](AGENTS.md), written for coding assistants and just as readable for you. Guides: [sdk.quranlab.ai/docs](https://sdk.quranlab.ai/docs).
+Moving an app from 3.x: [docs/migrating-to-4.md](docs/migrating-to-4.md). SDK 3.x stops receiving the V4 model on 15 January 2027, 00:00 UTC. The full reference (every layer of the API, backends, what a device downloads, platform settings, recording sharing, building and testing) is in [AGENTS.md](AGENTS.md), written for coding assistants and just as readable for you. Guides: [sdk.quranlab.ai/docs](https://sdk.quranlab.ai/go/gh-tajweedformer-android?to=/docs).
 
 ## Problems and wishes
 
@@ -146,6 +154,6 @@ Quran-Lab No-Profit License 1.2 ([NPL-1.2](LICENSE)): use, copy, modify and buil
 but never charge for them, for access to them, or for any feature they power. The weights are not
 stored in this repository; Quran Lab hosts them itself and serves them to apps by
 `cdn.quranlab.ai/models` under the same licence. Get access at
-[sdk.quranlab.ai](https://sdk.quranlab.ai).
+[sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajweedformer-android).
 
 Third-party components keep their own licences, listed in their folders under `third_party/`.

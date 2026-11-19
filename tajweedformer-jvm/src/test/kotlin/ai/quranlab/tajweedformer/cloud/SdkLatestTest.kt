@@ -48,17 +48,17 @@ class SdkLatestTest : OpenChecked() {
         mapOf("sdk_latest" to mapOf("version" to version, "severity" to severity, "url" to url))
 
     @Test fun aNewerSdkLogsOneLinePerLaunchInADebuggableBuild() {
-        stub.extra = latest("3.1.9")
+        stub.extra = latest("4.0.9")
         val c = cloud()
         c.refreshConfig()
-        stub.extra = latest("3.2.0", "required")
+        stub.extra = latest("4.1.0", "required")
         c.refreshConfig()
-        assertEquals(listOf("Quran Lab SDK 3.1.9 is available (recommended), you have ${SdkInfo.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
+        assertEquals(listOf("Quran Lab SDK 4.0.9 is available (recommended), you have ${SdkInfo.VERSION}: https://quranlab.ai/sdk/android/2.0.2"),
             lines.toList())
         // the next launch (a new cloud for the process) logs again, once
         cloud().refreshConfig()
         assertEquals(2, lines.size)
-        assertTrue(lines[1].startsWith("Quran Lab SDK 3.2.0 is available (required), you have "))
+        assertTrue(lines[1].startsWith("Quran Lab SDK 4.1.0 is available (required), you have "))
     }
 
     @Test fun equalOlderReleaseOrMalformedLogNothing() {

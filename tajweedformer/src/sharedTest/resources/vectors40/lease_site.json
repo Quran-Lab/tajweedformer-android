@@ -1,0 +1,140 @@
+{
+ "section": "PROTECTED_MODEL.md 18.4.6 and 18.4.9 (spec fix 15; quranlab-core docs/spec-fixes/15)",
+ "note": "Test keys only, made by protected40.py from fixed labels (stream(label, n): SHA-256 of the label and a 32-bit little-endian counter, concatenated). No SDK trusts them.",
+ "rule": "version 2: a fourth u8-length string after the Core release, the site origin of a web lease (flags bit 1), '' for every other lease, inside D. The Core accepts a web lease only when its site equals, byte for byte, the site the frame verified (qlc_set_site, before qlc_lease_accept); another site, none set, or a web lease naming none (a version 1 web lease included) is refused as site (code 12). Leases signed as before ('quranlab-lease 1\\n'). The API writes version 2 for a web lease of SDK 4.0 with flags.web4 on, version 1 for every other lease, byte for byte as before.",
+ "order": "format, signature, install, release, build, key_id, model, site, expired (at max(now, iat)), outer_tag, inner_tag",
+ "signer": {
+  "seed_hex": "50fb0388ef36ffc3f7f695f2c11c468e72f16bbcb66e45a21d0738badf94b5e3",
+  "public_hex": "3a83ab14c7129ea01912f2ec4db55d61570cb4ebd5be3f911f66aeb56b157059",
+  "kid_hex": "bae32b00126ed013"
+ },
+ "release": "4.0.0-c1",
+ "k_core_hex": "e0d0ef6020e920598dd2e82397f0bca61f2483b619f07276a4a919ee42629913",
+ "build_key_hex": "920882248e3222ee50275814897519d4b1096b7c84c9ff57f8a37945b545b3cc",
+ "build": "5221e22fba69737fe00682a9447451b22cdca991",
+ "key_id_hex": "d14d9aeeeecb3a238cb86c41a5e8b0c2",
+ "model": "v4.0",
+ "version": "4.1.0",
+ "now": 1790000000,
+ "install": {
+  "of": "lease.json install_ecdh",
+  "spki_b64u": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEeL-OOIGJFEy1xYw6HJDuV5vXCMTDDaL15U27hYHE2yV9ilaQtMCwOFCzQHP1xSaBH_50ZSlkSSsLoVVEmxr12g",
+  "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c"
+ },
+ "cases": [
+  {
+   "name": "a web lease on the site it names",
+   "version": 2,
+   "site": "https://recite.example.org",
+   "set_site": "https://recite.example.org",
+   "flags": 2,
+   "fields": {
+    "lease_id_hex": "bf5a729d7a83f1387064c2b3956474cd",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDmuEHxITaz5EF47PoPaEUNsd43VtxgHLUydwjDJjNgOhRANCAATbLhRMkTCyEixUoaSMukGFgl0iXqQmBLkPPNXWeAM1x5_tyLaaFG5uaeTWWMxFc1vr6cx0upSIZzJchcMJ9oOD",
+   "lease_hex": "514c4c3102000200bf5a729d7a83f1387064c2b3956474cd702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d63311a68747470733a2f2f7265636974652e6578616d706c652e6f726701410004db2e144c9130b2122c54a1a48cba4185825d225ea42604b90f3cd5d6780335c79fedc8b69a146e6e69e4d658cc45735bebe9cc74ba948867325c85c309f683834000db18cd8d0810566493472c50be22a19cdb5a58854016a3b0dd38798bc46e113f6da1b5e94b874aeb690452e53bd716799c4205f461d6fd08f3d8dfecf83e7e6ebae32b00126ed013787c43c2300a3920dc39f9d432537e04c68006ddca206e0f07a414a522c7f581aa5e2e6e58637b9b6da36b9fa6559e77415783b3da73180dfda64f7dfd16290c",
+   "d_hex": "4f303217cac72c681f0cf97c659b031d6f5f1dc96bdbfe12c08eb0d5f9a5bde0",
+   "expect": "accept"
+  },
+  {
+   "name": "a web lease on another site",
+   "version": 2,
+   "site": "https://recite.example.org",
+   "set_site": "https://other.example.net",
+   "flags": 2,
+   "fields": {
+    "lease_id_hex": "6d64d9bc1244c65641236c4a6075780c",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgOwMNoRDdHCuzEg4VyLyo2jL8RdH6bRFHxlTVM9MEupOhRANCAARE6_JTxbZEZ5S1nrEhtLTDldocg5GVMZKWM13oJT42ZWLF4N2mZ1yU70SlVSWUXaFs_AhZWwT0icKKI4GJcHdM",
+   "lease_hex": "514c4c31020002006d64d9bc1244c65641236c4a6075780c702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d63311a68747470733a2f2f7265636974652e6578616d706c652e6f72670141000444ebf253c5b6446794b59eb121b4b4c395da1c839195319296335de8253e366562c5e0dda6675c94ef44a55525945da16cfc08595b04f489c28a23818970774c4000ce115f531d7ee774f05c143b11103693aa483782457023f6469fdbadf332117b4bf7d04b09ef4001633c61f541f138ecf7a0472528b34bb91c589b7c928941f5bae32b00126ed0138c9a2ec297c19c6febb53b9ccaf1682d2bb261e5d3ed921740eaa1c7468c8e8fa4020fdaf38047fbdd6314524dbea0778ee82dc83876b79edb2e4773e4441c08",
+   "d_hex": "b0f6855920724e2592d826ed25ffadb89273f9dbc98eac1a205b457ffac39fa1",
+   "expect": "site"
+  },
+  {
+   "name": "a web lease with no site set in the Core",
+   "version": 2,
+   "site": "https://recite.example.org",
+   "set_site": null,
+   "flags": 2,
+   "fields": {
+    "lease_id_hex": "ce68a6e72a321af5e11bcd164fb9fbf4",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTUXNX-qDrETvIssXhcr151Jop2B48zTpCMpOCdDwXeuhRANCAATGhKgvdGfyG9z4bBMRHfWY4NB-4Dwwvjv-2Iw2sXb5rhYqDcRSB4-E6EbF5qjojifQ5WN2yFliJSfQgnUBAFg_",
+   "lease_hex": "514c4c3102000200ce68a6e72a321af5e11bcd164fb9fbf4702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d63311a68747470733a2f2f7265636974652e6578616d706c652e6f726701410004c684a82f7467f21bdcf86c13111df598e0d07ee03c30be3bfed88c36b176f9ae162a0dc452078f84e846c5e6a8e88e27d0e56376c859622527d082750100583f4000ae5fad0cc514cef7823749b37f1cca64d88543fb8e5258187576728efd5ad0c40d70b9e9450373ddfe1d220d61b6a718e5ffbdc9b4e8f9ca3c265be6573afaa3bae32b00126ed0137ffa563f1cabc5c68f1c0ac6385df54dd3732fa9652a34094cce543b3e081e48b597d33ca653b6fb26945332fd50f52e97640ec9faec8681b482a5db6d843f0d",
+   "d_hex": "9a91e01a683b03d15ced222aba31334e84b24d5630a619350bc4ad832d960d25",
+   "expect": "site"
+  },
+  {
+   "name": "a web lease that names no site",
+   "version": 2,
+   "site": "",
+   "set_site": "https://recite.example.org",
+   "flags": 2,
+   "fields": {
+    "lease_id_hex": "22ebd0a5ee1181a376d18527abfa2932",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN1p4rzXeJHhNpwZ0A_fjqVWKuR-KGLFe8cfR-e9yKeihRANCAATi0AfnsRRXUta0b1NatTng_Y4-8eC1n6erhfMN3K2l7jmAkaCa_goRB20eMz5c36ESn56H6C9p4DnO4pGRnSiT",
+   "lease_hex": "514c4c310200020022ebd0a5ee1181a376d18527abfa2932702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d63310001410004e2d007e7b1145752d6b46f535ab539e0fd8e3ef1e0b59fa7ab85f30ddcada5ee398091a09afe0a11076d1e333e5cdfa1129f9e87e82f69e039cee291919d289340008852ccbd7a1e4a4b1eb26db882bdecedc26ca55d5b5274dcdf5807e80dcfcbed248360488796f2e19e4d3f02a7f1df8e141cb37118002febac4f7b29057b335abae32b00126ed0137556d6843ce138b7a0ac823b33feaec808e89fae6090a1bccab671b30f322546d73c5caa948aa92c7b54837f6f5df2f40ba2c70ca4b315cca1553074d09b5703",
+   "d_hex": "22a29f29e55cd651d1143f72aa755a2729d2dd717ee946dbc96940d092b8a61c",
+   "expect": "site"
+  },
+  {
+   "name": "a lease that is not a web lease, version 2, no site",
+   "version": 2,
+   "site": "",
+   "set_site": null,
+   "flags": 0,
+   "fields": {
+    "lease_id_hex": "d2200bcddc31664b6bd5ff150c370618",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdzOKcGkEp9WcLwAZfWElMgzF6B9ONv4fNiA4rUF33PehRANCAAQ_VZ1kuLslS74Sw-a6VIShIKmU8d0ewFbzS-w58xC56Zgm04ngs_RT4b3zKjFPg5HeS6vOYqolOD9OeoSntlKs",
+   "lease_hex": "514c4c3102000000d2200bcddc31664b6bd5ff150c370618702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d633100014100043f559d64b8bb254bbe12c3e6ba5484a120a994f1dd1ec056f34bec39f310b9e99826d389e0b3f453e1bdf32a314f8391de4babce62aa25383f4e7a84a7b652ac4000eba1a615ae0c0a205876fe3a5b2c2cb2d5a704863482654a7e51e9a9ae0c16167a8a28d897893c7a453f7db0fd90a189d93172893e338fbab6d7ce5ce24dd09ebae32b00126ed01372bb13a04b0d492d4ddc30e09cf430c0084cf4ce3206e35b40bbc355b73c1ad6e90bbd638682c53345e9ad7708c5bad9724897cd4e351865bbd499befa733f05",
+   "d_hex": "1801ce23dff9fc5a0383865eddea738c5bf60782125f3c83fa8abe1d3148ff61",
+   "expect": "accept"
+  },
+  {
+   "name": "a web lease of version 1 (no site field), on the site the frame verified",
+   "version": 1,
+   "site": null,
+   "set_site": "https://recite.example.org",
+   "flags": 2,
+   "fields": {
+    "lease_id_hex": "74a971346edfa23b40000ede64ad3b93",
+    "iat": 1789996400,
+    "exp": 1790082800,
+    "refresh_after": 1790039600,
+    "install_hash_hex": "c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c",
+    "mark_hex": "61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db"
+   },
+   "eph_pkcs8_b64u": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZXtyrbYi_7pzVOELWtDR_Nl3s9O_fu_fXkDCqj0iKJyhRANCAARuaKgshMxIKc61Vwf31ZAmU_LGCTkbpKyKVIGflJBaHALqER6YIcQurD8LTKuVqIRoyibDPtMe4XdZ1eA0ejoA",
+   "lease_hex": "514c4c310100020074a971346edfa23b40000ede64ad3b93702db16a00000000f07eb26a0000000030d6b16a00000000d14d9aeeeecb3a238cb86c41a5e8b0c25221e22fba69737fe00682a9447451b22cdca991c5dc283408f5e65db837f1c9b083454adf41cb8dfc3d9f60f5dc8aace820f71c61c787be9d52382ec5dc283408f5e65d741666e87fe8c0db0476342e3005342e312e3008342e302e302d6331014100046e68a82c84cc4829ceb55707f7d5902653f2c609391ba4ac8a54819f94905a1c02ea111e9821c42eac3f0b4cab95a88468ca26c33ed31ee17759d5e0347a3a004000c7f4b8fd334c4990dc397ef98677393bfe1ea957f26a5f3c1db14a59677f35867ad301ff3bb844238c20cb505670da610c9f1b3ceaf9238aa0624fd00102fc4bbae32b00126ed01345f2002cb1b6f03cb05de490532d1a8e633117e45dce9b6e687ae23df69b9967088e211505f3fcb48814ee30609d6c3d2dad104b83f4828805b32502bdef0e0a",
+   "d_hex": "ec5ca2af6128a89af510c3983ffb8b71570a9e8211a214af1ada9dab1c50e38e",
+   "expect": "site"
+  }
+ ]
+}

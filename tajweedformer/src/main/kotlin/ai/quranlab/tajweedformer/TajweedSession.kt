@@ -18,8 +18,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Runs [body]; whatever it throws leaves as a [TajweedError] (a coroutine's cancellation stays what it is). */
+/**
+ * Runs [body]; whatever it throws leaves as a [TajweedError] (a coroutine's cancellation stays what it is). This is
+ * where a failure reaches the app: it is counted as an error report.
+ */
 internal inline fun <T> guard(body: () -> T): T = try {
+    guardQuiet(body)
+} catch (e: TajweedError) {
+    reachedApp(e)
+    throw e
+}
+
+/** [guard] without the report, for a caller that reports the error itself once it knows it reaches the app. */
+internal inline fun <T> guardQuiet(body: () -> T): T = try {
     body()
 } catch (e: CancellationException) {
     throw e
@@ -71,14 +82,15 @@ public class TajweedSession internal constructor(
     private val speech = SpeechTracker(options.silenceEndMs ?: DEFAULT_SILENCE_MS)
     private val ending = AtomicBoolean(false)
     private val result = CompletableDeferred<TajweedHeads>()
+
+    /** Completed when the take has let go of the Model ([closed]): the next Session can start. */
+    private val released = CompletableDeferred<Unit>()
     @Volatile private var lastBackend: TajweedBackend? = null
     @Volatile private var sawLast = false
     @Volatile private var feeder: Job? = null
-    /** The recited range the app reported while the take ran (the last one wins); counted when the take ends. */
-    private var reported: Triple<Int, Int, Int>? = null
-
     init {
         OpenObjects.opened(this, if (listening) "Session (listen)" else "Session (push)")
+        try { model.host.takeStarted(this) } catch (_: Exception) {}
     }
 
     /** Each chunk as it is ready. Ends when the take ends; after `cancel()` it fails with the error `cancelled`. */
@@ -102,7 +114,7 @@ public class TajweedSession internal constructor(
         } catch (e: CancellationException) {
             chunkChannel.close(RecognizerException.Cancelled())
         } catch (e: Throwable) {
-            chunkChannel.close(TajweedError.of(e))
+            chunkChannel.close(TajweedError.of(e).also { reachedApp(it) })
         } finally {
             taken.value = Int.MAX_VALUE
         }
@@ -186,7 +198,12 @@ public class TajweedSession internal constructor(
      */
     public suspend fun finish(): TajweedHeads {
         end(null, null)
-        return guard { result.await() }
+        val heads = guard { result.await() }
+        // a take that ended by itself (the end of a clip, silence) is ended on its own coroutine, which completes the
+        // result and only then lets go of the Model: wait for that, so the next take started right after finish()
+        // never finds this one still open (Stage B, a device lab: session_open on back-to-back clip takes)
+        released.await()
+        return heads
     }
 
     /** Ends the take and keeps nothing: [chunks] fails with `cancelled`, the microphone stops. */
@@ -204,39 +221,35 @@ public class TajweedSession internal constructor(
     public val backend: TajweedBackend get() = lastBackend ?: model.backendFor(inner.backend)
 
     /**
-     * App-reported, for the app's own statistics at sdk.quranlab.ai: the learner recited ayahs [ayahFrom] to [ayahTo]
-     * of [surah] in this take. Counts only (ayahs per surah per day): never text, audio or times, and never part of a
-     * shared recording. One report per take: a second one replaces the first. May be called during the take or after
-     * it. A surah or ayah the Quran does not have is `invalid_argument`. Nothing is sent when analytics are off.
+     * Where the learner recited, for the app's own statistics at sdk.quranlab.ai: ayahs [ayahFrom] to [ayahTo] of
+     * [surah] in this take. SDK 4.0 counts the recited ayahs of each take by itself (SPEC 17.1); this report is the
+     * fallback, used only for a take the SDK could not place, so a take is never counted twice.
+     *
+     * When the app judged the recitation, [outcome] says how for the whole range and [perAyah] for single ayahs of it
+     * (it wins over [outcome] for those): the SDK counts them as the app's own judgement (SPEC 17.9); it never judges a
+     * recitation itself. Counts only (per surah per day): never text, audio, times or ayah numbers, and never part of a
+     * shared recording. One report per take: during the take a second one replaces the first; after the take ended,
+     * a report counts only when the take had none, and the first such one is kept. It may come until the take is
+     * counted: when the next take starts, the app goes to the background, or 30 seconds after the end, whichever is
+     * first. A cancelled take, or one ended by an error, counts no
+     * report. A surah or ayah the Quran does not have, or an ayah of [perAyah] outside the range, is
+     * `invalid_argument`. Nothing is sent while Quran Lab's signed config has analytics off (`flags.analytics`).
      */
-    public fun reportRecited(surah: Int, ayahFrom: Int, ayahTo: Int) {
+    @JvmOverloads
+    public fun reportRecited(surah: Int, ayahFrom: Int, ayahTo: Int, outcome: RecitedOutcome? = null, perAyah: Map<Int, RecitedOutcome>? = null) {
         Quran.check(surah, ayahFrom, ayahTo)
-        val now = Triple(surah, ayahFrom, ayahTo)
-        synchronized(reportLock) {
-            when (outcome) {
-                // the take is running: the report waits for its end, and a later one replaces it
-                Outcome.OPEN -> reported = now
-                // the take ended with its Heads: the first report counts at once, later ones count nothing
-                Outcome.COUNTS -> if (!counted) { counted = true; model.host.recited(now) }
-                // a cancelled or failed take counts no report
-                Outcome.DROPPED -> {}
-            }
-        }
+        val per = perAyah ?: emptyMap()
+        for (a in per.keys) if (a !in ayahFrom..ayahTo) throw RecognizerException.InvalidAppOption("perAyah", "$a is not in $ayahFrom..$ayahTo")
+        try { model.host.recited(this, RecitedReport(surah, ayahFrom, ayahTo, outcome, per)) } catch (_: Exception) {}
     }
 
-    private enum class Outcome { OPEN, COUNTS, DROPPED }
-
-    private val reportLock = Any()
-    private var outcome = Outcome.OPEN
-    private var counted = false
-
-    /** The take ended: with its Heads ([counts]) the report made during it is counted now. */
-    private fun settle(counts: Boolean) = synchronized(reportLock) {
-        if (outcome != Outcome.OPEN) return@synchronized
-        outcome = if (counts) Outcome.COUNTS else Outcome.DROPPED
-        val r = reported
-        if (counts && r != null) { counted = true; model.host.recited(r) }
+    /** The take ended: with its Heads ([counts]) it is a finished take (SPEC 17.1 finds what it recited). */
+    private fun settle(counts: Boolean) {
+        if (settled.getAndSet(true)) return
+        try { model.host.takeEnded(this, counts && inner.hadAudio) } catch (_: Exception) {}
     }
+
+    private val settled = AtomicBoolean(false)
 
     // ---- the SDK's own feeds (listen) ----
 
@@ -385,10 +398,12 @@ public class TajweedSession internal constructor(
         stop()
         try {
             feederDone()
+            inner.endedBy = reason?.name
             val heads = inner.finish(failed = reason == TajweedEvent.Ended.Reason.ERROR)
             pump.join()
             result.complete(TajweedHeads(heads.only(select), vocabulary, 0, options.topK, finalDecoded))
             settle(counts = reason != TajweedEvent.Ended.Reason.ERROR)
+            if (error != null) reachedApp(error)
             if (reason != null) eventChannel.trySend(TajweedEvent.Ended(reason, error))
         } catch (e: CancellationException) {
             inner.cancel()
@@ -397,6 +412,7 @@ public class TajweedSession internal constructor(
             throw e
         } catch (e: Throwable) {
             val failure = error ?: TajweedError.of(e)
+            reachedApp(failure)
             inner.cancel()
             settle(counts = false)
             result.completeExceptionally(failure)
@@ -409,6 +425,7 @@ public class TajweedSession internal constructor(
 
     private fun closed() {
         model.sessionEnded(this)
+        released.complete(Unit)
         OpenObjects.closed(this)
         // the pump and the feeder end by themselves; nothing else runs in this scope afterwards
         scope.launch { pump.join(); scope.cancel() }

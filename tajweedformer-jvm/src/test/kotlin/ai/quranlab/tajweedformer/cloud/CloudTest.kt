@@ -115,17 +115,14 @@ class CloudTest : OpenChecked() {
         assertNull(c2.inferenceContext)
     }
 
-    @Test fun theModelFolderUrlComesFromTheSignedBaseElseTheCdnModelsPath() {
-        val rec = mapOf("model" to "Quran-Lab/tajweedformer-v4", "model_id" to "v4.0", "folder" to "sdk/v4.0", "revision" to "abc")
-        fun url(base: Any?) = RemoteConfig(mapOf("recommended" to rec) + (if (base != null) mapOf("base" to base) else emptyMap()), ByteArray(0)).modelBaseUrl()
-        assertEquals("https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url(null))
-        assertEquals("https://mirror.example/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://mirror.example/"))
-        assertEquals("a bare cdn base keeps the old /hf/ path", "https://cdn.quranlab.ai/hf/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://cdn.quranlab.ai"))
-        assertEquals("not https: ignored", "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("http://evil.example"))
-        assertEquals("the models path is not the bare host: no /hf", "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/abc/sdk/v4.0/", url("https://cdn.quranlab.ai/models/"))
-        assertNull(RemoteConfig(emptyMap(), ByteArray(0)).modelBaseUrl())
-        assertEquals("https://eeur.cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/", ai.quranlab.tajweedformer.ModelStore.folderUrl("https://eeur.cdn.quranlab.ai/", "Quran-Lab/m", "r", "sdk/v4.0"))
-        assertTrue(ai.quranlab.tajweedformer.ModelStore.DEFAULT_BASE_URL.startsWith("https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/"))
+    @Test fun theFourZeroConfigNamesTheBuildsKeyIdAndNoFolder() {
+        // contract 18.4.5: the build and its key id; the folder comes from the lease answer, never from the config
+        val rec = mapOf("model" to "Quran-Lab/tajweedformer-v4", "model_id" to "v4.0", "folder" to "sdk/v4.0", "revision" to "a".repeat(40),
+            "version" to "4.0.0", "key_id" to "0123456789abcdef0123456789abcdef")
+        val c = RemoteConfig(mapOf("recommended" to rec, "base" to "https://mirror.example/"), ByteArray(0))
+        assertEquals("0123456789abcdef0123456789abcdef", c.recommendedKeyId)
+        assertNull("not 32 hex", RemoteConfig(mapOf("recommended" to rec + ("key_id" to "XYZ")), ByteArray(0)).recommendedKeyId)
+        assertNull(RemoteConfig(emptyMap(), ByteArray(0)).recommendedKeyId)
     }
 
     @Test fun aTamperedOrForeignConfigIsRejectedAndTheLastGoodOneKept() {
@@ -192,8 +189,8 @@ class CloudTest : OpenChecked() {
     @Test fun aDeltaIsSealedAtASendPointWithTheDaysSumsAndThe201Fields() {
         val c = cloud()
         c.refreshConfig()
-        // a sheet the learner leaves unanswered (an ask nobody can show is not counted)
-        c.sharing.prompts = {}
+        // a sheet that is shown and left unanswered (an ask nobody can show is not counted)
+        c.sharing.prompts = { (it as? ai.quranlab.tajweedformer.sharing.Sharing.SheetRequest.Consent)?.shown() }
         c.onModelLoad(TajweedObserver.ModelLoad("v4.0+abc", "c16_l64", "cpu", 800.0, cold = true))
         c.onDownload(TajweedObserver.Download("v4.0+abc", "android-cpu", 72_000_000, success = true, resumed = true))
         session(c)
@@ -241,17 +238,18 @@ class CloudTest : OpenChecked() {
         assertEquals(2.0, main["silence_s"])
         assertEquals(0.301, main["compute_s"])
         assertEquals(mapOf("log_probs" to 24.0), main["tokens"])
-        assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["coverage"])
+        // SDK 4.0 (17.1): `coverage` is not sent; the app's report is its fallback count
+        assertFalse(b.containsKey("coverage"))
         assertEquals(listOf(mapOf("revision" to "v4.0+abc", "profile" to "android-cpu", "bytes" to 7.2E7, "success" to 1.0, "failed" to 0.0, "resumed" to 1.0)), b["downloads"])
         // the delta's counters (zero ones left out); the app-reported ones are listed
-        assertEquals(4.0, b["ayahs"])
-        assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["surah_ayahs"])
-        assertEquals(listOf("ayahs", "surah_ayahs", "coverage"), b["reported"])
+        assertEquals(4.0, b["app_ayahs"])
+        assertEquals(mapOf("1" to 2.0, "112" to 2.0), b["app_surah_ayahs"])
+        assertFalse(b.containsKey("ayahs"))
+        assertEquals(listOf("app_ayahs", "app_surah_ayahs"), b["reported"])
         assertFalse(b.containsKey("words"))
-        // SDK 3.1.5: the sheet left without an answer is a "Not now", so the second take does not ask again (the next ask
-        // would come 7 sessions later); 3.1.4 asked at each of the two
-        assertEquals("the first finished session with feedback asks (the config offers sharing, a sheet is registered); the unanswered sheet is not asked again at the next", 1.0, b["share_asked"])
-        for (k in listOf("launches", "rule_checks", "rule_flags", "share_yes", "share_no")) assertFalse(k, b.containsKey(k))
+        // SDK 4.0 (SHARE_ASK_40 20.5): never in the install's first 24 hours, so these two takes ask nothing (3.x asked
+        // at the first finished session with feedback)
+        for (k in listOf("launches", "rule_checks", "rule_flags", "share_asked", "share_yes", "share_no")) assertFalse(k, b.containsKey(k))
         // nothing that could identify anyone: only the schema's fields (the stub refuses any other)
         val text = String(ev.body)
         assertFalse(text.contains("org.example.recite"))
@@ -386,6 +384,8 @@ class CloudTest : OpenChecked() {
     @Test fun theAppsOwnReportsGiveTheAppReportedFieldsAndTheReportedList() {
         // SPEC 6.3: nothing the SDK measures; counted only because the app said so, and listed in `reported`
         val c = cloud()
+        // the config says the server takes the 4.0 fields (flags.metrics)
+        c.refreshConfig()
         c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
         c.onSessionEnd(TajweedObserver.SessionEnd(12.0, completed = true))
         c.telemetry.recited(2, 255, 256)
@@ -398,16 +398,16 @@ class CloudTest : OpenChecked() {
         c.background()
         assertEquals(1, c.deliver().first)
         val b = stub.seen("/v1/events").single().json!!
-        assertEquals(2.0, b["ayahs"])
+        assertEquals(2.0, b["app_ayahs"])
         assertEquals(6.0, b["words"])
-        assertEquals(mapOf("2" to 2.0), b["surah_ayahs"])
-        assertEquals(mapOf("2" to 2.0), b["coverage"])
+        assertEquals(mapOf("2" to 2.0), b["app_surah_ayahs"])
+        assertFalse(b.containsKey("coverage"))
         val checks = b["rule_checks"] as Map<String, Double>
         val flags = b["rule_flags"] as Map<String, Double>
         assertEquals(mapOf("vowel_sub" to 6.0, "madd" to 4.0, "qalqalah" to 4.0, "word" to 6.0), checks)
         assertEquals(mapOf("vowel_sub" to 2.0, "madd" to 2.0, "qalqalah" to 2.0, "word" to 2.0), flags)
         for ((k, f) in flags) assertTrue("$k: flags <= checks", f <= checks.getValue(k))
-        assertEquals(listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags"), b["reported"])
+        assertEquals(listOf("app_ayahs", "app_surah_ayahs", "words", "rule_checks", "rule_flags"), b["reported"])
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -420,6 +420,7 @@ class CloudTest : OpenChecked() {
             dir.deleteRecursively()
             dir = Files.createTempDirectory("tj-cloud").toFile()
             val c = cloud()
+            c.refreshConfig()
             c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
             c.onSessionEnd(TajweedObserver.SessionEnd(3.0, completed = true))
             if (mask and 1 != 0) c.telemetry.recited(1, 1, 7)
@@ -429,17 +430,60 @@ class CloudTest : OpenChecked() {
             c.background()
             assertEquals("mask $mask: the server accepted the delta", 1, c.deliver().first)
             val b = stub.seen("/v1/events").single().json!!
-            val six = listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags")
+            val six = listOf("app_ayahs", "app_surah_ayahs", "words", "rule_checks", "rule_flags")
             val present = six.filter { b.containsKey(it) }
             if (present.isEmpty()) assertFalse("mask $mask: nothing reported, no field", b.containsKey("reported"))
             else assertEquals("mask $mask", present, b["reported"])
-            assertEquals("mask $mask ayahs", mask and 1 != 0, b.containsKey("ayahs"))
+            assertEquals("mask $mask ayahs", mask and 1 != 0, b.containsKey("app_ayahs"))
             assertEquals("mask $mask words", mask and 2 != 0, b.containsKey("words"))
             assertEquals("mask $mask rule_checks", mask and 14 != 0, b.containsKey("rule_checks"))
             assertEquals("mask $mask rule_flags", mask and 8 != 0, b.containsKey("rule_flags"))
         }
     }
-    @Test fun theKillSwitchAndTheDeveloperOptOutDropEverything() {
+    @Test fun aSwitchThatIsOffStopsOnlyItsFieldsAndTheAppsReportsAlwaysGo() {
+        // 17.8: flags.metrics, absent = on. No `metrics` at all: everything goes
+        stub.flags = stub.flags - "metrics"
+        fun body(): Map<String, Any?> {
+            val c = cloud()
+            c.refreshConfig()
+            c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
+            c.onSessionEnd(TajweedObserver.SessionEnd(12.0, completed = true, audioMs = 12_000, speechFrames = 100))
+            c.telemetry.recited(2, 255, 256)
+            c.background()
+            assertEquals(1, c.deliver().first)
+            return stub.seen("/v1/events").last().json!!
+        }
+        var b = body()
+        for (k in listOf("app_ayahs", "app_surah_ayahs", "hour_speech_s", "take_s", "session_s", "learner", "learner_gap", "streak"))
+            assertTrue(k, b.containsKey(k))
+        // `lengths` and `learner` off: their fields stay out, the rest (and the app's report) goes
+        stub.flags = stub.flags + ("metrics" to mapOf("lengths" to false, "learner" to false))
+        dir.deleteRecursively()
+        dir = Files.createTempDirectory("tj-cloud").toFile()
+        b = body()
+        for (k in listOf("take_s", "session_s", "learner", "learner_gap", "streak")) assertFalse(k, b.containsKey(k))
+        for (k in listOf("app_ayahs", "app_surah_ayahs", "hour_speech_s")) assertTrue(k, b.containsKey(k))
+        assertEquals(listOf("app_ayahs", "app_surah_ayahs"), b["reported"])
+    }
+
+    @Test fun aSessionIsCountedByItsAudioFinishedOrNotAndATakeOnlyWhenFinished() {
+        // 17.8: session_s counts closed sessions by their seconds of audio, take_s finished takes; a Session of this
+        // SDK is one take. A session without audio counts nothing
+        val c = cloud()
+        c.refreshConfig()
+        c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
+        c.onSessionEnd(TajweedObserver.SessionEnd(40.0, completed = true, audioMs = 40_000))
+        c.onSessionStart(TajweedObserver.SessionStart("4.0.0", "c16_l64", "cpu"))
+        c.onSessionEnd(TajweedObserver.SessionEnd(700.0, completed = false, audioMs = 0))
+        c.background()
+        assertEquals(1, c.deliver().first)
+        val b = stub.seen("/v1/events").single().json!!
+        assertEquals(mapOf("le_60" to 1.0), b["take_s"])
+        assertEquals(mapOf("le_60" to 1.0, "le_1200" to 1.0), b["session_s"])
+    }
+
+    /** SDK 4.0 (owner, 11-16): the signed config's flags.analytics is the only off switch; no app option exists. */
+    @Test fun theServersSwitchIsTheOnlyOffSwitchAndDropsEverything() {
         val c = cloud()
         session(c)
         c.background()
@@ -450,14 +494,14 @@ class CloudTest : OpenChecked() {
         assertTrue(stub.seen("/v1/events").isEmpty())
         assertTrue(c.telemetry.pendingReports().isEmpty())
         assertTrue(c.telemetry.openDays().isEmpty())
-
-        val off = QuranLabCloud(CloudOptions(stub.key, analytics = CloudOptions.Analytics.OFF, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
-            stub.environment(Files.createTempDirectory("tj-off").toFile(), clock = clock))
-        session(off)
-        off.background()
-        assertEquals(0, off.deliver().first)
-        assertTrue(off.telemetry.pendingReports().isEmpty())
-        assertTrue(off.telemetry.openDays().isEmpty())
+        // the server turns it on again: counted again
+        stub.flags = stub.flags + ("analytics" to true)
+        c.refreshConfig()
+        assertTrue(c.telemetry.enabled)
+        session(c)
+        assertTrue(c.telemetry.openDays().isNotEmpty())
+        // the app's side has no switch at all
+        assertFalse(CloudOptions::class.java.declaredFields.any { it.name.contains("analytics", ignoreCase = true) })
     }
 
     @Test fun daysAndReportsOlderThanAWeekAreDropped() {

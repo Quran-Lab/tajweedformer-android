@@ -89,10 +89,9 @@ class TajweedApiTest : OpenChecked() {
             assertEquals("runtime_unsupported", e.code)
             assertTrue(e.message!!, e.message!!.contains("tajweedformer_jni"))
             assertTrue(e.fix, e.fix.contains(SdkInfo.MINIMUM))
-        } catch (e: RecognizerException.ModelLoadFailed) {
-            // a library with the engine loaded: this test's folder holds placeholder bytes for the engine files,
-            // which the engine refuses
-            assertTrue(ai.quranlab.tajweedformer.engine.TajweedJni.available)
+        } catch (e: RecognizerException.ModelIncompatible) {
+            // SDK 4.0: the Core opens only an encrypted build the Client downloaded; a plain folder is refused first
+            assertEquals("model_incompatible", e.code)
         }
     }
 

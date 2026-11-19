@@ -1,5 +1,65 @@
 # Changelog
 
+## 4.0.0
+
+The model is protected. It is encrypted from Quran Lab's server to the phone and runs only inside the Quran Lab Core,
+a closed native library in the AAR, under a lease for each install. The calls of a take stay as they were. Moving from
+3.x: [docs/migrating-to-4.md](docs/migrating-to-4.md).
+
+- **Removed: the `analytics` option.** The anonymous analytics (daily counts and durations, never audio, text, names
+  or device identifiers) are always on. Code that sets `analytics` no longer compiles: delete the argument.
+- **Removed: the `audience` argument of `TajweedClientOptions` and the `Audience` type, and the guardian sheet;** code
+  that sets them no longer compiles. Every app shows the same sharing sheet. Complying with children's privacy law is
+  the app's and the app store's. A learner who said yes before keeps that yes and is never asked again.
+- **Add your app's signing certificates** on your Android key's page at sdk.quranlab.ai. Until you do, your installs
+  get 24-hour leases.
+- **The lease.** The model opens under a lease Quran Lab signs for the install: 7 days when the phone attests the
+  install, 24 hours otherwise, renewed in the background. Offline within it, the model opens. When it has ended and
+  Quran Lab cannot be reached, the model keeps opening for 24 hours more; a refusal ends that at once. A Model that is
+  open keeps running.
+- **The first start after the upgrade downloads the model once more**, encrypted, so it needs a connection once.
+- **The CPU engine on every phone.** At launch Quran Lab serves no NPU program; NPU support returns when a build
+  faster than the CPU engine ships.
+- **Error reports.** Every error your app gets (except misuse of the API) and every failure the SDK goes on from
+  reaches Quran Lab as a small anonymous report. You see them on your app's Problems page at sdk.quranlab.ai.
+- **More exact error codes.** `needs_connection` only when no request got an answer; an answer from a server that
+  failed is `download_failed`, with what answered in the message.
+- **Recited ayahs.** The SDK counts the ayahs of each take itself; `reportRecited` is the fallback, and its new
+  `outcome` and `perAyah` carry your app's own judgement.
+- **Sharing.** Asked later and less often (never in the first 24 hours, at most three times), and a recording stays
+  open up to 60 seconds between takes. There is still no developer switch.
+- **Every learner is asked** and the choice is theirs: Not now, stop, or delete at any time. No app is exempt.
+- **Model versions.** From V4.1 on, new model versions are published only encrypted, for SDK 4.0. SDK 3.x stops
+  receiving the V4 model on 15 January 2027, 00:00 UTC.
+
+## 3.1.6
+
+Every analytics report reaches Quran Lab again, and every failure a learner meets now reaches Quran Lab as a small
+error report, so a problem in your app can be found without the learner's help. A few error codes are more exact. No
+call changes.
+
+- **Error reports.** When a call of the SDK fails for your app (any `TajweedError` except your own misuse:
+  `invalid_argument`, `client_exists`, `session_open`, `session_closed`, `cancelled`), or when the SDK goes on from a
+  failure without telling you (Quran Lab's server refused or failed the launch's config, a statistics report was
+  refused, a shared recording will not be uploaded), the SDK sends one short report: where the failure started, why,
+  the HTTP status, the exception's class, how many times it happened that day, and the device's model code, memory
+  tier, free space and ABI. Never audio, text, a name, an identifier, a path, a URL or an error message. At most one
+  report a day for each failure, with its count. Quran Lab can turn them off in the signed config; `Analytics.OFF`
+  keeps covering the analytics only.
+- **More exact error codes.** `needs_connection` now always means that no request got an answer and the model is
+  not on the device. When Quran Lab's server answered instead (a 5xx, a 429 or a redirect to the config or to
+  the app token asked for before it, or a config that does not verify or has expired), the call fails with
+  `download_failed`, and its message says what answered ("the server answered 503"); 3.1.5 said
+  `needs_connection`. A download that timed out is `download_failed` too. A model file
+  whose bytes do not match after its download is `checksum_mismatch` (it was `download_failed`), and a file that
+  cannot be written on the device fails at once with `storage_full` or `storage_failed` instead of being tried again
+  as a network failure. The advice for `download_failed` stands: call again later, the download resumes.
+- **Failed downloads count in your statistics**, by reason (network, server, hash, signature, storage).
+- **Fixed: Quran Lab refused some analytics reports whole, and the SDK deleted them.** Seen from 3.0.0 to 3.1.5: the
+  sample clips fetched beside a model at its first open were counted as a download of no model version, and an
+  accelerator fallback outside a take was counted under the backend `npu` without its chip. A refused report lost
+  the day's takes, minutes and launches with it. Both values are now put right.
+
 ## 3.1.5
 
 A stop of the app while the accelerator's build is prepared no longer turns the accelerator off for good, and the
