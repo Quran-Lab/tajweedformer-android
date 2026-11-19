@@ -192,7 +192,7 @@ internal class SheetKit(val ctx: Context, val look: SheetLook) {
             name to LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).after(SheetDesign.NAME_GAP))
     }
 
-    /** A card of rows (the disclosure card, the guardian's): the card colour, rows 14 above and below, dividers between. */
+    /** A card of rows (the disclosure card): the card colour, rows 14 above and below, dividers between. */
     fun card(rows: List<View>): LinearLayout = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
         background = rounded(c.card, SheetDesign.CARD_RADIUS)
@@ -244,7 +244,7 @@ internal class SheetKit(val ctx: Context, val look: SheetLook) {
     }
 
     /**
-     * A row with a switch at the trailing edge (the guardian's confirmation, the settings switch). The whole row is one
+     * A row with a switch at the trailing edge (the settings switch). The whole row is one
      * switch for TalkBack (its text, "switch", on or off) and toggles on a tap anywhere in it.
      */
     fun switchRow(line: String, type: Type, padV: Float, onChange: (Boolean) -> Unit): Pair<LinearLayout, SheetSwitch> {

@@ -1,6 +1,5 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.accel.AcceleratorController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
@@ -23,16 +22,21 @@ internal class ModelHost(
     val microphone: () -> AudioInput? = { null },
     /** The signed config's `inference.context`, read when a Session starts. */
     val configContext: () -> String? = { null },
-    /** The accelerator of a context (made and started once per key); null: the CPU only. */
-    val accelerator: (ModelFolder, String) -> AcceleratorController? = { _, _ -> null },
-    /** Whether the signed config forces the CPU for this build. */
-    val forcedCpu: (ModelFolder) -> Boolean = { false },
-    /** A take that counts reported where the learner recited (surah, first ayah, last ayah): its one report. */
-    val recited: (Triple<Int, Int, Int>) -> Unit = { },
+    /** Brings another context of the build onto the device (downloaded, installed by the Core) while no model is open
+     *  in the Core; null: nothing can be fetched. */
+    val ensureContext: ((String) -> ModelFolder)? = null,
+    /** A take started and ended (the recited count of the Core's journal, SPEC 17.1): the take's Session, and at its
+     *  end whether it finished with its Heads. */
+    val takeStarted: (TajweedSession) -> Unit = {},
+    val takeEnded: (TajweedSession, Boolean) -> Unit = { _, _ -> },
+    /** The app reported where the learner recited in a take (SPEC 6.3, 17.9): held with the take until it is counted. */
+    val recited: (TajweedSession, RecitedReport) -> Unit = { _, _ -> },
     /** A waiting chunk was dropped because the app did not collect `chunks` (counted for `diagnose()`). */
     val chunkDropped: () -> Unit = { },
     /** The audio a take may hold ([TakeLimits.MAX_TAKE_MS]; the tests of the limit set a shorter one). */
     val maxTakeMs: Long = TakeLimits.MAX_TAKE_MS,
+    /** The accelerator of a context (R2: its program installed, the lease allows it), or null: the CPU only. */
+    val accelerator: (String) -> ai.quranlab.tajweedformer.core.AcceleratorPlan? = { null },
     val onClose: (TajweedModel) -> Unit = {},
 )
 
@@ -96,9 +100,42 @@ public class TajweedModel internal constructor(
     /** `calibration.json` as shipped, read only and never applied by the SDK; null when the folder has none. */
     public val calibration: TajweedCalibration? get() = folder.calibration
 
-    /** The expected units of each ayah, read-only data fetched on request; null when this build has none. */
-    public val reference: TajweedReference? = ModelProfile.reference(folder.manifest).takeIf { it.isNotEmpty() }
-        ?.let { TajweedReference(it, folder.dir, host.store, folder.manifest.tokensSha256) }
+    /**
+     * The expected units of each ayah, read-only data; null when this build has none. SDK 4.0: an encrypted build's
+     * reference table is read by the Quran Lab Core from its device form (R3), at the first lookup, under the lease.
+     */
+    public val reference: TajweedReference? = ModelProfile.reference(folder.manifest).takeIf { it.isNotEmpty() }?.let { files ->
+        val b = folder.protected
+        TajweedReference(files, folder.dir, host.store, folder.manifest.tokensSha256,
+            installed = b?.let { pb -> { files.all { pb.installed(it) } } },
+            table = b?.let { { coreReference() } })
+    }
+
+    /** The reference data of the open model (the Core's), looked up on the engine's thread. */
+    private fun coreReference(): ReferenceTable {
+        val r = recognizer ?: throw RecognizerException.SessionClosed()
+        return ReferenceTable { surah, ayah ->
+            r.onEngineBlocking { e ->
+                val m = (e as? ai.quranlab.tajweedformer.core.CoreTajweedEngine)?.coreModel ?: throw RecognizerException.SessionClosed()
+                try {
+                    val (units, starts) = m.referenceExpected(surah, ayah)
+                    // per unit, its word: the last word whose first unit is at or before it
+                    var w = 0
+                    val words = IntArray(units.size) { i ->
+                        while (w + 1 < starts.size && starts[w + 1] <= i) w++
+                        w
+                    }
+                    units to words
+                } catch (x: ai.quranlab.tajweedformer.core.CoreException) {
+                    when (x.status) {
+                        ai.quranlab.tajweedformer.core.Core.E_ARG -> null
+                        ai.quranlab.tajweedformer.core.Core.E_FILE -> throw RecognizerException.ReferenceMissing(x)
+                        else -> throw x.toError()
+                    }
+                }
+            }
+        }
+    }
 
     /** The sample clips of the folder (its self-test clips); empty when they are not on this device. */
     public val sampleClips: List<TajweedClip>
@@ -112,17 +149,16 @@ public class TajweedModel internal constructor(
             emptyList()
         }
 
-    /** The Backend the next Session will use. */
-    public val backend: TajweedBackend
-        get() {
-            val acc = recognizer?.accelerator() ?: return TajweedBackend.CPU
-            return TajweedBackend.of(acc.state.value, acc.key.soc)
-        }
+    /** The Backend the next Session will use: the CPU engine of the Core, or the accelerator once it passed its test. */
+    public val backend: TajweedBackend get() = recognizer?.backendChoice?.let { backendOf(it) } ?: TajweedBackend.CPU
 
-    internal fun backendFor(b: Backend): TajweedBackend {
-        if (b == Backend.NPU) return TajweedBackend.ofChunk(b, host.soc)
-        val acc = recognizer?.accelerator() ?: return TajweedBackend.CPU
-        return TajweedBackend.of(acc.state.value, acc.key.soc, acc.lastCpuReason ?: "cpu")
+    internal fun backendFor(b: Backend): TajweedBackend =
+        if (b == Backend.NPU) TajweedBackend.ofChunk(b, host.soc) else recognizer?.backendChoice?.takeIf { it.reason == "failover" }?.let { backendOf(it) } ?: TajweedBackend.CPU
+
+    private fun backendOf(c: BackendChoice): TajweedBackend = when {
+        c.backend == Backend.NPU -> TajweedBackend.ofChunk(Backend.NPU, host.soc)
+        c.reason == "failover" -> TajweedBackend.DEMOTED
+        else -> TajweedBackend.CPU
     }
 
     /**
@@ -223,16 +259,17 @@ public class TajweedModel internal constructor(
      */
     private suspend fun recognizerFor(context: String): Recognizer = switching.withLock {
         val now = recognizer
-        val wantCpu = host.forcedCpu(folder)
-        if (now != null && now.context == context && (now.options.backend == BackendPreference.CPU) == wantCpu) return now
+        if (now != null && now.context == context) return now
         withContext(Dispatchers.IO) {
-            if (context !in folder.availableContexts) {
-                val store = host.store ?: throw RecognizerException.ModelMissing("context $context is not in this folder")
-                folder = runInterruptible { store.ensureCpu(context) }
-            }
+            // the Core opens one model at a time and installs nothing while one is open: the engine in use is closed
+            // before another context is brought in and opened
             now?.close()
             recognizer = null
-            openRecognizer(folder, host, context, wantCpu).also { recognizer = it }
+            if (context !in folder.availableContexts) {
+                val ensure = host.ensureContext ?: throw RecognizerException.ModelMissing("context $context is not on this device")
+                folder = runInterruptible { ensure(context) }
+            }
+            openRecognizer(folder, host, context).also { recognizer = it }
         }
     }
 
@@ -240,6 +277,10 @@ public class TajweedModel internal constructor(
 
     /** The context of the engine that is loaded (the last Session's, or the one the Model was opened with). */
     internal fun contextInForce(): String? = recognizer?.context
+
+    /** The open engine as an accelerator host (R2), or null (another engine, no recognizer, closed). */
+    internal fun acceleratorHost(): ai.quranlab.tajweedformer.core.AcceleratorHost? =
+        try { recognizer?.onEngineBlocking { e -> e as? ai.quranlab.tajweedformer.core.AcceleratorHost } } catch (_: Exception) { null }
 
     /** The app left the foreground: an open `listen` take ends. */
     internal fun background() {
@@ -283,15 +324,14 @@ public class TajweedModel internal constructor(
                 // a context whose files are not here yet falls back to one that is (the Session fetches the other on use)
                 if (c in folder.availableContexts) c else folder.availableContexts.first()
             }
-            return TajweedModel(folder, host, openRecognizer(folder, host, ctx, host.forcedCpu(folder)))
+            val rec = openRecognizer(folder, host, ctx)
+            return TajweedModel(rec.model, host, rec)
         }
 
-        private fun openRecognizer(folder: ModelFolder, host: ModelHost, context: String, cpuOnly: Boolean): Recognizer {
-            val acc = if (cpuOnly) null else host.accelerator(folder, context)
-            return Recognizer.open(folder, Recognizer.Options(
-                context = context, sampleRate = host.warmRate, backend = if (cpuOnly) BackendPreference.CPU else BackendPreference.AUTO,
-                accelerator = acc, soc = host.soc, selfTest = true, engine = host.engine,
+        private fun openRecognizer(folder: ModelFolder, host: ModelHost, context: String): Recognizer =
+            Recognizer.open(folder, Recognizer.Options(
+                context = context, sampleRate = host.warmRate, backend = BackendPreference.AUTO, soc = host.soc, engine = host.engine,
+                accelerator = try { host.accelerator(context) } catch (_: Exception) { null },
             )).also { it.maxTakeMs = host.maxTakeMs }
-        }
     }
 }

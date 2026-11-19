@@ -72,7 +72,6 @@ internal object Screens {
 internal data class Case(
     val lang: String,
     val variant: ConsentState.Variant = ConsentState.Variant.FIRST,
-    val guardian: Boolean = false,
     val dark: Boolean = false,
     val fontScale: Float = 1f,
     val screen: DeviceConfig = Screens.PHONE,
@@ -228,7 +227,7 @@ abstract class SheetTestBase {
 
     /** The Views dialog's sheet for [case], in a screen with its backdrop, and the frame itself. */
     internal fun views(case: Case, onShare: () -> Unit = {}, onNotNow: () -> Unit = {}): Pair<View, SheetFrame> {
-        val frame = consentSheet(ctx, case.copy, case.variant, case.guardian, case.theme, onShare, onNotNow)
+        val frame = consentSheet(ctx, case.copy, case.variant, case.theme, onShare, onNotNow)
         frame.panel.box.startAtEnd = case.end
         // the test's window: no insets come from the system, the status bar's is set here
         frame.setOnApplyWindowInsetsListener(null)
@@ -244,7 +243,7 @@ abstract class SheetTestBase {
     internal fun compose(case: Case, onShare: () -> Unit = {}, onNotNow: () -> Unit = {}, wrap: (@Composable (@Composable () -> Unit) -> Unit)? = null): ComposeView =
         screen(case.dark) {
             val sheet = @Composable {
-                ConsentSheet(case.copy, case.variant, case.guardian, case.style, insetTop = Screens.STATUS_BAR.dp, insetBottom = 0.dp,
+                ConsentSheet(case.copy, case.variant, case.style, insetTop = Screens.STATUS_BAR.dp, insetBottom = 0.dp,
                     onShare = onShare, onNotNow = onNotNow, onDismiss = {}, startAtEnd = case.end)
             }
             if (wrap != null) wrap(sheet) else sheet()
@@ -330,20 +329,22 @@ internal fun lightest(image: Picture, l: Int, t: Int, r: Int, b: Int): Int {
     return best
 }
 
-/** The lines a sheet draws for the deck [c] and the variant: the name, the deck's lines whole, and the two labels. */
-internal fun expectedLines(c: SharingCopy, variant: ConsentState.Variant, guardian: Boolean): Set<String> {
+/**
+ * The lines a sheet draws for the deck [c] and the variant (the first ask or a re-ask; SDK 4.0 has one sheet for every
+ * app): the name, the deck's lines whole, and the two labels.
+ */
+internal fun expectedLines(c: SharingCopy, variant: ConsentState.Variant): Set<String> {
     val latin = SheetDesign.script(c.lang) == SheetDesign.Script.LATIN
     val l = mutableSetOf(
         SheetDesign.NAME,
-        c[if (guardian) "sheet.guardian.title" else "sheet.title"],
-        c[if (guardian) "sheet.guardian.body" else "sheet.body"],
+        c["sheet.title"],
+        c["sheet.body"],
         c["sheet.what"], c["sheet.who"], c["sheet.control"],
-        c[if (guardian) "sheet.guardian.share" else "sheet.share"], c["sheet.not_now"],
+        c["sheet.share"], c["sheet.not_now"],
     )
     c.hadith?.let { l += it }
     c.hadithRef?.let { l += if (latin) it.uppercase(java.util.Locale(c.lang)) else it }
-    if (!guardian) l += c["sheet.mistakes"]
-    if (guardian) l += c["sheet.guardian.confirm"]
+    l += c["sheet.mistakes"]
     if (variant == ConsentState.Variant.REASK) l += c["reask"]
     return l
 }

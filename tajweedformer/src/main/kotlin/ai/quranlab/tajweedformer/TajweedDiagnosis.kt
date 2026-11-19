@@ -43,9 +43,18 @@ public class TajweedDiagnosis internal constructor(
      *  speaks HTTP/1.1 only, so here it is `http/1.1` or null. Kept in memory: it is in no statistics and is never
      *  written to the device. An optional field of the report: a reader must not expect it from every SDK. */
     public val downloadProtocol: String? = null,
+    /**
+     * SDK 4.0, the protected model:
+     * `keyStore` (`strongbox`, `tee` or `software`: where the install's key lives; null before the install has one),
+     * `lease` (`valid`, `grace`, `expired`, `stopped` or `none`), `leaseExpires`, `refreshAfter` and `graceUntil`
+     * (unix seconds; `graceUntil` only while `lease` is `grace`), `leaseClass` (`7d` or `24h`) and `core` (the Core's
+     * release and target). In [toMap] as `protected`. Null where the client has no key (no lease is ever asked for).
+     * An optional field of the report: a reader must not expect it from every SDK.
+     */
+    public val protectedModel: Map<String, Any?>? = null,
 ) {
     /** The report as a plain map, in the layout the four SDKs share. */
-    public fun toMap(): Map<String, Any?> = linkedMapOf(
+    public fun toMap(): Map<String, Any?> = linkedMapOf<String, Any?>(
         "sdk" to linkedMapOf("version" to sdkVersion, "latest" to sdkLatest),
         "key" to linkedMapOf("accepted" to keyAccepted, "reason" to keyReason),
         "config" to config,
@@ -58,7 +67,7 @@ public class TajweedDiagnosis internal constructor(
         "droppedChunks" to droppedChunks,
         "connection" to connection,
         "downloadProtocol" to downloadProtocol,
-    )
+    ).also { m -> protectedModel?.let { m["protected"] = it } }
 
     /** The report as JSON. */
     public fun toJson(): String = Json.write(toMap())

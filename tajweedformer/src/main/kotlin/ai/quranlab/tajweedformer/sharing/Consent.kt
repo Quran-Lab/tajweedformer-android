@@ -6,18 +6,24 @@ import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * The consent state machine of recitation sharing, the same in every SDK: asked only after a completed
- * session with feedback (never on the install's first launch: [Sharing.firstLaunch]); the sheet is shown at
- * most 3 times per install, ever ([asks], the count of sheets shown or handed to the app's own UI): "Not now",
- * or a sheet that ended without an answer, may lead to a re-ask at least 7 sessions after the previous ask
- * until the third showing; a yes ends asking for good, whatever deck, wording or SDK version comes later, and
- * so does turning sharing off in the settings. Afterwards only the settings switch turns sharing on or off.
+ * The consent state of recitation sharing, the same in every SDK. SDK 4.0 asks as SHARE_ASK_40 (section 20) says,
+ * through [decide] ([ShareAsk]): never in the install's first 24 hours or before its third completed session, at a
+ * good moment (a minute of recitation in this app session), at most once per app session and per calendar day, at
+ * most 3 times per install ever ([asks], the asks that went on screen), each re-ask (a small card) at least 14 days
+ * and 7 sessions after the first, then 30 days and 10 sessions after the second; a yes ends asking for good,
+ * whatever deck, wording or SDK version comes later, and so does turning sharing off in the settings. Afterwards
+ * only the settings switch turns sharing on or off.
  *
  * A grant keeps the consent version (and for the app's own wording its text hash) in force at the moment
  * of agreement; every shared session carries that version. Persisted as
- * `{"v":1,"consent","asks","lastAskSession","sessions","thanked","decidedAt","consentVersion","consentTextSha256","guardian"}`.
+ * `{"v":1,"consent","asks","lastAskSession","sessions","thanked","decidedAt","consentVersion","consentTextSha256",
+ * "changes","deletedBelow","deletionUnfinished","installedAt","lastAskAt","lastAskDay"}` (the last three SDK 4.0's, 20.4).
  * The 2.0.0 file is the same without `consentTextSha256` and with `updateAsked` (read and dropped); its
  * `asks` carries over, and a 2.0.0 grant without a version reads as [LEGACY_CONSENT_VERSION].
+ *
+ * A file SDK 3.x wrote also has `guardian` (after `consentTextSha256`). SDK 4.0 has one sheet for every app (contract
+ * section 26): it never reads that field, and writes it back as it found it ([passThrough]), so a grant 3.x recorded
+ * is a grant like any other and stays one: no ask, sharing goes on.
  */
 internal class ConsentState internal constructor(private val file: File, private val clock: () -> Long = System::currentTimeMillis) {
     enum class Consent(val key: String) { UNKNOWN("unknown"), GRANTED("granted"), DECLINED("declined"), FINAL("final") }
@@ -35,12 +41,23 @@ internal class ConsentState internal constructor(private val file: File, private
     var asks = 0; private set
     var lastAskSession = 0; private set
     var sessions = 0; private set
+    /** SDK 4.0 (SHARE_ASK_40 20.4): the first launch with 4.0 or later (unix ms), the last ask on screen and its day. */
+    var installedAt: Long? = null; private set
+    var lastAskAt: Long? = null; private set
+    var lastAskDay: Long? = null; private set
+    /** This app session's part (20.4): in memory only. */
+    var app = ShareAsk.App(); private set
     var thanked = false; private set
     var decidedAt: Long? = null; private set
     var consentVersion: String? = null; private set
     /** The SHA-256 of the app's own wording the learner agreed to ([SharingCopy.consentTextSha256]); null for the deck's. */
     var consentTextSha256: String? = null; private set
-    var guardian = false; private set
+
+    /**
+     * The `guardian` field of a file SDK 3.x wrote, exactly as read: never
+     * read for anything, written back unchanged in its place; absent from a file 4.0 started.
+     */
+    private var passThrough: Map<String, Any?> = emptyMap()
 
     /**
      * How often the learner's answer changed between a yes and not a yes (SPEC 11.7): counted up when sharing goes
@@ -73,7 +90,10 @@ internal class ConsentState internal constructor(private val file: File, private
         decidedAt = (o["decidedAt"] as? Double)?.toLong()
         consentVersion = o["consentVersion"] as? String
         consentTextSha256 = o["consentTextSha256"] as? String
-        guardian = o["guardian"] as? Boolean ?: false
+        passThrough = if (o.containsKey(GUARDIAN_3X)) mapOf(GUARDIAN_3X to o[GUARDIAN_3X]) else emptyMap()
+        installedAt = ShareAsk.integral(o["installedAt"])
+        lastAskAt = ShareAsk.integral(o["lastAskAt"])
+        lastAskDay = ShareAsk.integral(o["lastAskDay"])
         // a state from before 3.0.1 has no count: 0, as the recordings made then
         changes = (o["changes"] as? Double)?.toInt() ?: 0
         deletedBelow = (o["deletedBelow"] as? Double)?.toInt() ?: 0
@@ -111,8 +131,10 @@ internal class ConsentState internal constructor(private val file: File, private
         file.parentFile?.mkdirs()
         val o = linkedMapOf<String, Any?>("v" to 1, "consent" to consent.key, "asks" to asks, "lastAskSession" to lastAskSession,
             "sessions" to sessions, "thanked" to thanked, "decidedAt" to decidedAt, "consentVersion" to consentVersion,
-            "consentTextSha256" to consentTextSha256, "guardian" to guardian,
-            "changes" to changes, "deletedBelow" to deletedBelow, "deletionUnfinished" to deletionUnfinished)
+            "consentTextSha256" to consentTextSha256)
+        o.putAll(passThrough)
+        o.putAll(linkedMapOf("changes" to changes, "deletedBelow" to deletedBelow, "deletionUnfinished" to deletionUnfinished,
+            "installedAt" to installedAt, "lastAskAt" to lastAskAt, "lastAskDay" to lastAskDay))
         if (asking) {
             // the server is being asked to delete: a process that ends before its answer finds sharing off and every
             // recording from before it, because the file says so already. This process goes on as it was.
@@ -157,54 +179,35 @@ internal class ConsentState internal constructor(private val file: File, private
     }
 
     /**
-     * The sheet that may be shown now under the cap, or null: a yes, an off switch, or [MAX_ASKS] showings end asking.
-     * The first ask is the first sheet; every later one is the re-ask, and [spaced] (at least 7 sessions after the
-     * previous ask) when the SDK chooses the moment. A sheet that ended without an answer (its window went with the
-     * activity, the process ended while it was shown) counts as "Not now" here: SDK 3.1.5; until then the first
-     * sheet came back at the next completed session.
-     */
-    private fun next(spaced: Boolean): Variant? = when {
-        asks >= MAX_ASKS -> null
-        consent == Consent.GRANTED || consent == Consent.FINAL -> null
-        consent == Consent.UNKNOWN && asks == 0 -> Variant.FIRST
-        spaced -> Variant.REASK
-        else -> null
-    }
-
-    /**
-     * After every completed session. [enabled]: the signed config offers sharing here and a sheet can be
-     * shown. Returns the sheet to show now, or null. An ask is counted before it is shown.
+     * SDK 4.0's ask (SHARE_ASK_40 20.5): [event] through [ShareAsk.decide] on the stored state and this app session's
+     * part; the new state kept (and written when a stored field changed). A "Not now" the decision makes by itself (a
+     * card dismissed by a take start or taken back) is stored as [decline] stores it; a yes is stored by [grant] (the
+     * version agreed to), never by the decision alone.
      */
     @Synchronized
-    fun sessionCompleted(feedback: Boolean, enabled: Boolean): Variant? {
-        sessions++
-        var v: Variant? = null
-        if (enabled && feedback) {
-            v = next(spaced = sessions - lastAskSession >= 7)
-            if (v != null) { asks++; lastAskSession = sessions }
+    fun decide(event: ShareAsk.Event, config: Any?, now: ShareAsk.Now): ShareAsk.Decision {
+        val before = ShareAsk.State(consent.key, asks, sessions, lastAskSession, installedAt, lastAskAt, lastAskDay, app)
+        val d = ShareAsk.decide(before, event, config, now)
+        val s = d.state
+        val stored = s.copy(app = ShareAsk.App()) != before.copy(app = ShareAsk.App()) ||
+            installedAt == null // the first launch with 4.0: its time is stored at once
+        asks = s.asks
+        sessions = s.sessions
+        lastAskSession = s.lastAskSession
+        installedAt = s.installedAt
+        lastAskAt = s.lastAskAt
+        lastAskDay = s.lastAskDay
+        app = s.app
+        if (s.consent != consent.key && (s.consent == Consent.DECLINED.key || s.consent == Consent.FINAL.key)) {
+            consent = Consent.values().first { it.key == s.consent }
+            decidedAt = clock() / 1000
         }
-        save()
-        return v
+        if (stored) save()
+        return d
     }
 
-    /** 2.0.0's signature; the version no longer matters (a yes is never asked again). */
-    @Deprecated("The consent version no longer decides an ask.", ReplaceWith("sessionCompleted(feedback, enabled)"))
-    fun sessionCompleted(feedback: Boolean, enabled: Boolean, @Suppress("UNUSED_PARAMETER") consentVersionNow: String): Variant? =
-        sessionCompleted(feedback, enabled)
-
-    /** The app's own timing (`askNow`): which sheet, or null when the learner must not be asked now. Counted as a showing. */
-    @Synchronized
-    fun askNow(): Variant? {
-        val v = next(spaced = true) ?: return null
-        asks++
-        lastAskSession = sessions
-        save()
-        return v
-    }
-
-    /** 2.0.0's signature; the version no longer matters (a yes is never asked again). */
-    @Deprecated("The consent version no longer decides an ask.", ReplaceWith("askNow()"))
-    fun askNow(@Suppress("UNUSED_PARAMETER") consentVersionNow: String): Variant? = askNow()
+    /** The ask in hand (20.4), or null. */
+    val askInHand: ShareAsk.Ask? get() = app.ask
 
     /**
      * The primary button: shared from now on, under [consentVersionNow] (a `custom-` version with the
@@ -213,27 +216,13 @@ internal class ConsentState internal constructor(private val file: File, private
      */
     @Synchronized
     @JvmOverloads
-    fun grant(consentVersionNow: String, byGuardian: Boolean, textSha256: String? = null) {
+    fun grant(consentVersionNow: String, textSha256: String? = null) {
         // sharing comes on from a no or from no answer: whatever is on disk now is from before
         if (consent != Consent.GRANTED) changes++
         consent = Consent.GRANTED
         decidedAt = clock() / 1000
         consentVersion = consentVersionNow
         consentTextSha256 = textSha256
-        guardian = byGuardian
-        save()
-    }
-
-    /** "Not now" or the sheet dismissed: declined, or final after the last re-ask. */
-    @Synchronized
-    fun decline() {
-        // a "Not now" from the app's own UI after a yes keeps the yes
-        if (consent == Consent.GRANTED) {
-            save()
-            return
-        }
-        consent = if (asks >= 3) Consent.FINAL else Consent.DECLINED
-        decidedAt = clock() / 1000
         save()
     }
 
@@ -243,12 +232,12 @@ internal class ConsentState internal constructor(private val file: File, private
      */
     @Synchronized
     @JvmOverloads
-    fun setFromSettings(on: Boolean, consentVersionNow: String, byGuardian: Boolean = guardian, textSha256: String? = null) {
+    fun setFromSettings(on: Boolean, consentVersionNow: String, textSha256: String? = null) {
         if (on && consent == Consent.GRANTED) {
             save()
             return
         }
-        if (on) grant(consentVersionNow, byGuardian, textSha256) else {
+        if (on) grant(consentVersionNow, textSha256) else {
             consent = Consent.FINAL
             decidedAt = clock() / 1000
             // in the same write as the no: every recording made so far is from before it
@@ -299,11 +288,14 @@ internal class ConsentState internal constructor(private val file: File, private
     }
 
     companion object {
-        /** The sheet is shown at most this many times per install, ever. */
-        const val MAX_ASKS = 3
+        /** The sheet is shown at most this many times per install, ever ([ShareAsk.HARD_MAX_ASKS]; the config may lower it). */
+        const val MAX_ASKS = ShareAsk.HARD_MAX_ASKS
 
         /** The consent version of the deck SDK 2.0.0 bundled, for a 2.0.0 grant stored without one. */
         const val LEGACY_CONSENT_VERSION = "share-2026-11-07"
+
+        /** The field of a 3.x state that 4.0 passes through unread ([passThrough]). */
+        private const val GUARDIAN_3X = "guardian"
     }
 }
 
@@ -338,6 +330,13 @@ internal class SharingCopy private constructor(
 ) {
     /** A string of the deck (or the app's wording for it); [ENGLISH]'s when this language lacks it. */
     operator fun get(key: String): String = strings[key] ?: (if (this !== ENGLISH) ENGLISH.strings[key] else null) ?: ""
+
+    /**
+     * The deck itself has the re-ask card's three lines (SHARE_ASK_40 20.7; every deck from 2026-11-15.1, or the app's
+     * wording), not through English's: a deck without them shows the 3.x re-ask sheet in its own language (20.6), as
+     * the Apple and C SDKs read it.
+     */
+    val hasCard: Boolean get() = ConsentWording.CARD_KEYS.all { !strings[it].isNullOrEmpty() }
 
     /** The hadith line, or null when the deck has no verified wording. */
     val hadith: String? get() = if (hadithVerified) strings["sheet.hadith"]?.takeIf { it.isNotEmpty() } else null
@@ -488,9 +487,12 @@ internal object ConsentWording {
     const val MINUTES = "impact.minutes."
     val CATEGORIES = listOf("zero", "one", "two", "few", "many", "other")
 
-    /** Every key an app may replace: the deck's strings and the plural lines of `impact.minutes`. */
+    /** SDK 4.0's card (SHARE_ASK_40 20.7): in every deck from 2026-11-15.1; kept here for a deck before it. */
+    val CARD_KEYS = listOf("card.line", "card.open", "card.not_now")
+
+    /** Every key an app may replace: the deck's strings, the plural lines of `impact.minutes` and the card's lines. */
     @JvmStatic
-    val KEYS: Set<String> by lazy { SharingCopy.ENGLISH.keys + CATEGORIES.map { MINUTES + it } }
+    val KEYS: Set<String> by lazy { SharingCopy.ENGLISH.keys + CATEGORIES.map { MINUTES + it } + CARD_KEYS }
 
     /** The overrides, checked: an unknown key or an empty or blank text throws [IllegalArgumentException]. */
     @JvmStatic

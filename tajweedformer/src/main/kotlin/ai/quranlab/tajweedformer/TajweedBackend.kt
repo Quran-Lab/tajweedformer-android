@@ -1,15 +1,13 @@
 package ai.quranlab.tajweedformer
 
-import ai.quranlab.tajweedformer.accel.AcceleratorState
-import ai.quranlab.tajweedformer.accel.Reasons
-import ai.quranlab.tajweedformer.accel.Stages
 
 /**
  * What ran or will run the model: the CPU engine or an accelerator, and where the accelerator's promotion stands.
  * Plain data, read from a Model (`model.backend`: what the next Session will use), a Session or a chunk.
  *
- * The CPU engine serves from the first take. On a phone with a supported NPU the SDK prepares the accelerator in the
- * background (download, compile, a test against the CPU engine) and later takes run on it once it passed.
+ * SDK 4.0 runs takes on the CPU engine inside the Quran Lab Core, or on the phone's NPU once the Core has the build's
+ * program ready from its own memory and it passed its golden test against the CPU (`stage` promoted). A take whose
+ * accelerator fails goes on on the CPU (`stage` demoted, `reason` failover).
  */
 public class TajweedBackend internal constructor(
     /** `cpu` or `accelerator`. */
@@ -46,22 +44,9 @@ public class TajweedBackend internal constructor(
     internal companion object {
         val CPU = TajweedBackend(Kind.CPU, "cpu", Stage.CPU)
 
-        /** The Backend a take would get now, from the accelerator's state ([soc] names the build). */
-        fun of(state: AcceleratorState?, soc: String?, cpuReason: String? = null): TajweedBackend = when (state) {
-            null, is AcceleratorState.Cpu -> CPU
-            is AcceleratorState.Preparing -> TajweedBackend(Kind.CPU, "cpu", when (state.stage) {
-                Stages.DOWNLOAD -> Stage.DOWNLOADING
-                Stages.COMPILE -> Stage.COMPILING
-                else -> Stage.TESTING
-            })
-            is AcceleratorState.Ready ->
-                // promoted, but this take may still run on the CPU (thermal, memory, the denylist, a busy accelerator)
-                if (cpuReason != null) TajweedBackend(Kind.CPU, "cpu", Stage.PROMOTED, cpuReason.takeIf { it == Reasons.DENYLIST })
-                else TajweedBackend(Kind.ACCELERATOR, "npu:${state.soc ?: soc ?: "unknown"}", Stage.PROMOTED)
-            is AcceleratorState.Disabled ->
-                TajweedBackend(Kind.CPU, "cpu", if (state.reason == Reasons.FAILOVER) Stage.DEMOTED else Stage.CPU,
-                    if (state.reason in Reasons.PIPELINE) state.reason else Reasons.OTHER)
-        }
+
+        /** The CPU after the accelerator failed in a take (the 2.0.2 failover). */
+        val DEMOTED = TajweedBackend(Kind.CPU, "cpu", Stage.DEMOTED, "failover")
 
         /** The Backend that ran a chunk. */
         fun ofChunk(b: Backend, soc: String?): TajweedBackend =

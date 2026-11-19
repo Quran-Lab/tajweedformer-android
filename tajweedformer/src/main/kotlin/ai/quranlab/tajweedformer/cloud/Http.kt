@@ -82,10 +82,13 @@ internal class HttpResponse(val status: Int, val headers: Map<String, String>, v
     /** qlab-api's `{"error","message"}`, or `http_<status>`. A redirect (3xx) is `http_<status>` whatever its body
      *  says: it is a failed request, never a refusal and never a stop of a model (SPEC 15.4). */
     val error: ApiError get() {
-        if (status in 300..399) return ApiError(status, "http_$status")
+        if (status in 300..399) return ApiError(status, "http_$status", retryAfter = retryAfter)
         val o = json()
-        return ApiError(status, o?.get("error") as? String ?: "http_$status", o?.get("min_sdk") as? String, o?.get("reason") as? String)
+        return ApiError(status, o?.get("error") as? String ?: "http_$status", o?.get("min_sdk") as? String, o?.get("reason") as? String, retryAfter)
     }
+
+    /** The answer's Retry-After in seconds (its delay form, read as 1 to 21600, 18.4.7), or null. */
+    val retryAfter: Int? get() = header("retry-after")?.trim()?.toLongOrNull()?.coerceIn(1, 21_600)?.toInt()
 }
 
 /** The network, replaceable in tests. Throws [IOException] when no response came. */
@@ -225,7 +228,13 @@ internal data class ApiError(
      *  with the reason `app_not_allowed`, `key_type_mismatch` or `origin_not_allowed`; a made-up or revoked key
      *  has none. */
     val reason: String? = null,
+    /** The answer's Retry-After in seconds (503 lease_unavailable: 30), when it gave one. */
+    val retryAfter: Int? = null,
 ) {
+    /** The API's own refusal (18.4.7.1): a 4xx other than 429 whose body is JSON with an `error` string (a page that is
+     *  not the API's has the code `http_<status>`). */
+    val apiRefusal: Boolean get() = status in 400..499 && status != 429 && !code.startsWith("http_")
+
     /**
      * What the app was refused for: the body's [reason] when the error catalogue has words for it (the `reasons` of
      * `server_rejected`), else the error [code]. The reason is read first; what the SDK does to its network calls
@@ -267,7 +276,13 @@ internal data class ApiError(
 }
 
 /** A request that did not succeed: an error answer, or no answer ([api] null: offline). */
-internal class CloudException(val api: ApiError?, message: String, cause: Throwable? = null) : Exception(message, cause) {
+internal class CloudException(
+    val api: ApiError?,
+    message: String,
+    cause: Throwable? = null,
+    /** The API path of the request (`/v1/config`), when known: an error report's stage. */
+    val path: String? = null,
+) : Exception(message, cause) {
     val offline: Boolean get() = api == null
 
     /** No answer because the system does not let the app use the network (no INTERNET permission). */

@@ -48,20 +48,14 @@ internal interface TajweedObserver {
     /** An error worth an issue report (no free text: a kind, a code, SDK frames). */
     fun onIssue(kind: String, code: String, error: Throwable? = null) {}
 
-    /** A promotion attempt of the accelerator ended (promoted or failed at a stage): `promotions` telemetry, and an
-     *  incident report (`promotion_failed`) when it failed. */
-    fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {}
 
-    /** A session switched from the accelerator to the CPU: `promotions` telemetry, and an incident report
-     *  (`accelerator_failover`). */
-    fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) {}
 
-    /** The CPU confirmed a blank stretch of an accelerator take: `promotions[].blank_confirmed_ok`, nothing else. */
-    fun onBlankConfirmed(e: ai.quranlab.tajweedformer.BlankConfirmedEvent) {}
 
     data class ModelLoad(val revision: String, val context: String, val backend: String, val ms: Double, val cold: Boolean, val build: String = "")
 
-    data class Download(val revision: String, val profile: String, val bytes: Long, val success: Boolean, val resumed: Boolean, val build: String = "")
+    data class Download(val revision: String, val profile: String, val bytes: Long, val success: Boolean, val resumed: Boolean, val build: String = "",
+                        /** A failed one's telemetry reason: `network`, `http`, `hash_mismatch`, `signature`, `storage`, `other`. */
+                        val failureReason: String? = null)
 
     data class SessionStart(
         /** The model's version. */
@@ -100,6 +94,8 @@ internal interface TajweedObserver {
         /** The take ended, cancelled or finished, before one sample of audio was pushed or captured: it is not a
          *  session (SPEC 6.1, contract 1.13.0), counts nothing, and is not a finished session for the sharing ask. */
         val withoutAudio: Boolean = false,
+        /** How the take ended (SHARE_ASK_40 20.2): `normal`, `interrupted`, `error` or `cancelled`. */
+        val end: String = if (completed) "normal" else "cancelled",
     )
 
     /** The fallback reasons of telemetry v2. */

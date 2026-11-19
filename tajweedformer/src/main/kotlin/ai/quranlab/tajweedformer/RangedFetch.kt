@@ -83,7 +83,7 @@ internal class RangedFetch(
     private fun first(k: Int) = k * plan.rangeSize
     private fun last(k: Int) = minOf(size, (k + 1) * plan.rangeSize) - 1
 
-    private fun fail(why: String, cause: Throwable? = null): Nothing = throw RecognizerException.DownloadFailed(e.path, why, cause)
+    private fun fail(why: String, cause: Throwable? = null): Nothing = throw RecognizerException.DownloadFailed(e.path, why, cause).tagged(e.path, why, cause)
 
     /** An answer that is not the file ([AnswerRule]): a failed attempt, with nothing on the device changed. */
     private fun wrong(what: String): Nothing = throw AnswerRule.failed(e.path, what)

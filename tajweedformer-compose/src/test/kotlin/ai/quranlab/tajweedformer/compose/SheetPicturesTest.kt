@@ -41,15 +41,9 @@ class SheetPicturesTest : SheetTestBase() {
         draw("10_en_largest_end", Case("en", fontScale = 2f, end = true))
         draw("11_ar_largest", Case("ar", fontScale = 2f))
         draw("12_fr_largest_narrow_320", Case("fr", fontScale = 2f, screen = Screens.NARROW))
-        // the longest label of the eight decks: at 200 % on 320 dp both labels step down together to fit in two lines
-        draw("22_bn_guardian_largest_narrow_320", Case("bn", guardian = true, fontScale = 2f, screen = Screens.NARROW))
-    }
-
-    /** The guardian variant: as it opens, and at its end with the switch off (the share button disabled). */
-    @Test fun guardian() {
-        draw("13_en_guardian", Case("en", guardian = true))
-        draw("14_en_guardian_end", Case("en", guardian = true, end = true))
-        draw("15_ar_guardian_end_dark", Case("ar", guardian = true, end = true, dark = true))
+        // Bengali's labels, the longest of the eight decks: at 200 % on 320 dp both labels step down together to fit in
+        // two lines
+        draw("22_bn_largest_narrow_320", Case("bn", fontScale = 2f, screen = Screens.NARROW))
     }
 
     /** A 320 dp wide phone, and the centred card of a wide screen. */

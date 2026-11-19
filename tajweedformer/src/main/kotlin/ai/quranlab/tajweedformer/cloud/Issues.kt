@@ -1,6 +1,5 @@
 package ai.quranlab.tajweedformer.cloud
 
-import ai.quranlab.tajweedformer.AcceleratorIncident
 import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.SdkInfo
 import java.io.File
@@ -51,19 +50,6 @@ internal class IssueQueue(private val dir: File, private val clock: () -> Long =
         true
     }
 
-    /**
-     * Queues an accelerator incident (platform client doc, section 7.1): kind `accelerator_failover` or
-     * `promotion_failed`, code `<stage>:<cause>`, the revision, the error's path-stripped [message][stripMessage] and the
-     * closed `detail` object. The usual dedupe applies (one per signature per day), except that the FIRST report of each
-     * kind per model revision on this install is always queued, and kept (never trimmed from the queue) until the
-     * server accepted or refused it, at most [INCIDENT_KEEP_MS]. Returns whether it was queued.
-     */
-    fun addIncident(i: AcceleratorIncident, frames: List<String>, app: AppIdentity, device: DeviceProfile): Boolean {
-        if (i.kind !in INCIDENT_KINDS) return false
-        // the report's revision is the model's version; the build id goes in detail.build (SDK 3.0)
-        val rev = cleanRevision(ai.quranlab.tajweedformer.ModelIds.version(i.revision)) ?: return false
-        return addIncidentBody(i.kind, cleanCode(i.code), rev, stripMessage(i.message ?: i.error?.message), detail(i), frames, clock(), app, device)
-    }
 
     /**
      * Moves the [spool]'s incidents (made before the app configured Quran Lab) into the queue, each as made at its
@@ -192,7 +178,7 @@ internal class IssueQueue(private val dir: File, private val clock: () -> Long =
 
     companion object {
         /** The accelerator incidents (section 7.1). */
-        val INCIDENT_KINDS = setOf(AcceleratorIncident.FAILOVER, AcceleratorIncident.PROMOTION_FAILED)
+        val INCIDENT_KINDS = setOf("accelerator_failover", "promotion_failed")
 
         /** The queue's own field on a pinned first report (never sent). */
         const val PIN = "_pin"
@@ -233,64 +219,8 @@ internal class IssueQueue(private val dir: File, private val clock: () -> Long =
             return s.take(200).takeIf { it.isNotEmpty() }
         }
 
-        /**
-         * `detail.divergence` in the server's shape for SDK 3.0: `tokens_expected`; `heads` (per compared CTC head
-         * `token_edits`, `lp_mean`, `lp_p99`, `frames`, null for a head whose shapes differed; `attr`: `p_mean`,
-         * `values`); `tolerance` (the build's signed entry, left out when it signs none); `failed`. Each part is left
-         * out when there is nothing to say. Never the 2.x `tokens_differ`, `sites_differ`, `words_differ`.
-         */
-        @JvmStatic
-        fun divergence(v: ai.quranlab.tajweedformer.accel.Divergence): Map<String, Any?> {
-            val o = LinkedHashMap<String, Any?>()
-            o["tokens_expected"] = v.tokensExpected.coerceIn(0, 100_000)
-            val heads = LinkedHashMap<String, Any?>()
-            for ((name, m) in v.heads.entries.take(7)) {
-                heads[name] = m?.let { linkedMapOf("token_edits" to it.tokenEdits.coerceIn(0, 100_000), "lp_mean" to it.lpMean.coerceIn(0.0, 30.0),
-                    "lp_p99" to it.lpP99.coerceIn(0.0, 30.0), "frames" to it.frames) }
-            }
-            v.pMean?.let { heads["attr"] = linkedMapOf("p_mean" to it.coerceIn(0.0, 1.0), "values" to v.values) }
-            if (heads.isNotEmpty()) o["heads"] = heads
-            v.tolerance?.let { t ->
-                val tol = LinkedHashMap<String, Any?>()
-                for ((name, h) in t.heads) tol[name] = linkedMapOf("token_edits" to h.tokenEdits, "lp_mean" to h.lpMean, "lp_p99" to h.lpP99)
-                t.pMean?.let { tol["attr"] = linkedMapOf("p_mean" to it) }
-                if (tol.isNotEmpty()) o["tolerance"] = tol
-            }
-            if (v.failed.isNotEmpty()) o["failed"] = v.failed.take(32)
-            return o
-        }
-
         /** The closed `detail` object of section 7.1: every value checked against its type and range, absent when unknown. */
         @JvmStatic
-        fun detail(i: AcceleratorIncident): Map<String, Any?> {
-            val d = LinkedHashMap<String, Any?>()
-            d["stage"] = if (i.stage in STAGES) i.stage else "session"
-            d["cause"] = if (i.cause in CAUSES) i.cause else "other"
-            ai.quranlab.tajweedformer.ModelIds.build(i.revision).takeIf { it.isNotEmpty() }?.let { d["build"] = it }
-            val e = i.error
-            clean(e?.javaClass?.simpleName, 64) { it.isLetterOrDigit() || it in "_.:-" }?.let { d["error_domain"] = it }
-            clean(i.errorCode, 32) { it.isLetterOrDigit() || it in "_.:-" }?.let { d["error_code"] = it }
-            i.chunk?.let { d["chunk"] = it.coerceIn(0, 1_000_000) }
-            fun ms(v: Double?) = v?.takeIf { it.isFinite() }?.let { Math.round(it.coerceIn(0.0, 600_000.0) * 10) / 10.0 }
-            ms(i.elapsedMs)?.let { d["elapsed_ms"] = it }
-            ms(i.deadlineMs)?.let { d["deadline_ms"] = it }
-            clean(i.clip, 32) { it.isLetterOrDigit() || it in "_.-" }?.let { d["clip"] = it }
-            i.divergence?.let { v -> d["divergence"] = divergence(v) }
-            clean(i.deviceModel?.replace(' ', '_'), 32) { it.isLetterOrDigit() || it in "_.,-" }?.let { d["device_model"] = it }
-            clean(i.osBuild?.replace(' ', '_'), 64) { it.isLetterOrDigit() || it in "_.:/-" }?.let { d["os_build"] = it }
-            i.chip?.takeIf { SOC.matches(it) }?.let { d["chip"] = it }
-            i.accelerator.takeIf { it == "ane" || it == "gpu" || (it.startsWith("npu:") && SOC.matches(it.substring(4))) }?.let { d["accelerator"] = it }
-            i.computeUnits?.takeIf { it in COMPUTE_UNITS }?.let { d["compute_units"] = it }
-            clean(i.delegate, 48) { it.isLetterOrDigit() || it in "_.:/ -" }?.let { d["delegate"] = it }
-            i.context.takeIf { SOC.matches(it) }?.let { d["context"] = it }
-            i.thermal?.takeIf { it in THERMAL }?.let { d["thermal"] = it }
-            i.lowPower?.let { d["low_power"] = it }
-            i.stallMs?.takeIf { it.isFinite() }?.let { d["stall_ms"] = Math.round(it).toInt().coerceIn(0, 600_000) }
-            i.attempt?.let { d["attempt"] = it.coerceIn(1, 100) }
-            // a promotion's stop of the process only; absent when not known
-            if (i.kind == AcceleratorIncident.PROMOTION_FAILED && d["cause"] == "crash_on_last_run") i.foreground?.let { d["foreground"] = it }
-            return d
-        }
 
         val KINDS = setOf("engine_failed", "model_load", "checksum_mismatch", "signature_invalid", "update_failed", "fallback",
             "self_test_failed", "audio_input", "other") + INCIDENT_KINDS
@@ -332,20 +262,6 @@ internal class IssueQueue(private val dir: File, private val clock: () -> Long =
 internal class IncidentSpool(private val dir: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val file = File(dir, "incidents-offline.json")
 
-    fun add(i: AcceleratorIncident, frames: List<String>) = synchronized(LOCK) {
-        if (i.kind !in IssueQueue.INCIDENT_KINDS) return
-        val rev = IssueQueue.cleanRevision(i.revision) ?: return
-        val now = clock()
-        val e = LinkedHashMap<String, Any?>()
-        e["at_ms"] = now
-        e["kind"] = i.kind
-        e["code"] = IssueQueue.cleanCode(i.code)
-        e["revision"] = rev
-        IssueQueue.stripMessage(i.message ?: i.error?.message)?.let { e["message"] = it }
-        e["detail"] = IssueQueue.detail(i)
-        if (frames.isNotEmpty()) e["frames"] = frames.take(16)
-        write((read(now) + e).takeLast(MAX))
-    }
 
     /** The kept incidents (the expired ones dropped). */
     fun pending(): List<Map<String, Any?>> = synchronized(LOCK) { read(clock()) }
@@ -389,9 +305,5 @@ internal class IncidentSpool(private val dir: File, private val clock: () -> Lon
  * incident (a failed promotion, a failover) is kept in the [IncidentSpool] for when it does.
  */
 internal class OfflineIncidents(private val spool: IncidentSpool) : TajweedObserver {
-    override fun onPromotion(e: ai.quranlab.tajweedformer.PromotionEvent) {
-        if (!e.promoted) e.incident?.let { spool.add(it, IssueQueue.frames(it.error)) }
-    }
 
-    override fun onFailover(e: ai.quranlab.tajweedformer.AcceleratorFailoverEvent) = spool.add(e.incident, IssueQueue.frames(e.incident.error))
 }

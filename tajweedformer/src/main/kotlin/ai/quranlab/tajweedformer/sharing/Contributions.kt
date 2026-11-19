@@ -61,6 +61,8 @@ internal interface SharingGate {
     fun contributorReadable(): Boolean = true
     /** A refusal that is an SDK bug (400): one issue a day. */
     fun badRequest(route: String) {}
+    /** A shared recording that will not be uploaded, or a segment refused for good. */
+    fun lost(status: Int, code: String) {}
     /** A line for the developer's log (debuggable builds). */
     fun log(message: String) {}
     /** The learner's own yes is in force, whatever the signed config says now (its pause is not a no). */
@@ -72,7 +74,8 @@ internal interface SharingGate {
 }
 
 /**
- * One recording being shared: Ogg Opus segments written while it runs, into its folder in the
+ * One recording being shared: Ogg Opus segments (SDK 4.0: Ogg FLAC at the capture rate, when the signed config's
+ * `flags.share_flac` is on and the capture is not at 48 kHz, SHARING_40.md 19.3) written while it runs, into its folder in the
  * outbox, each closed segment handed to the outbox at once. Audio is copied on the caller's thread
  * and encoded on a thread of its own, so recognition never waits for the encoder. Each segment is
  * encoded at the outbox's [BitrateLadder] rate in force when it opens; a closed segment tells the ladder
@@ -83,14 +86,18 @@ internal interface SharingGate {
  */
 internal class ShareCapture(
     private val outbox: ContributionOutbox,
-    /** The session JSON for an input rate and route. */
-    private val session: (Int, String) -> ByteArray,
+    /** The session JSON for an input rate, a route and whether the recording is FLAC. */
+    private val session: (Int, String, Boolean) -> ByteArray,
     private val route: String,
     private val stillOn: () -> Boolean,
     /** How long a caller waits for the encoder when [MAX_WAITING_MS] of audio already waits for it, ms. */
     private val catchUpMs: Long = CATCH_UP_MS,
     /** The count of consent changes when this recording was made ([ConsentState.changes]): written into its folder. */
     private val consent: Int = 0,
+    /** SDK 4.0 (SHARING_40.md 19.3): whether a recording captured at this rate is FLAC, asked once when it starts. */
+    private val flac: (Int) -> Boolean = { false },
+    /** Test seam: the FLAC stream's serial (null: random). */
+    private val flacSerial: Int? = null,
 ) : Recording {
     /** Samples copied for the encoder that it has not taken yet. */
     private val waiting = java.util.concurrent.atomic.AtomicLong()
@@ -101,7 +108,7 @@ internal class ShareCapture(
     val id: String = UUID.randomUUID().toString().replace("-", "").lowercase()
     val folder = File(outbox.root, id)
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "tj-share").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } }
-    private var writer: OggOpusWriter? = null
+    private var writer: ShareWriter? = null
     private var rate = 0
     @Volatile private var failed = false
     private var segments = 0
@@ -176,13 +183,24 @@ internal class ShareCapture(
             try {
                 if (writer == null) {
                     folder.mkdirs()
-                    File(folder, ShareFiles.SESSION).writeBytes(session(sampleRate, route))
+                    // the form is decided once, when the recording starts, and holds for the whole of it (19.3)
+                    val lossless = sampleRate != OggOpusWriter.RATE && sampleRate in 8_000..192_000 && flac(sampleRate)
+                    File(folder, ShareFiles.SESSION).writeBytes(session(sampleRate, route, lossless))
                     rate = sampleRate
-                    val w = OggOpusWriter({ File(folder, ShareFiles.name(it) + ".opus") }, SegmentPlan.SECONDS, sampleRate,
-                        bitrateFor = ::opened) { closed(it) }
-                    preSkip = w.preSkip
-                    ShareFiles.writeCapture(folder, w.preSkip, bitrates, consent)
-                    writer = w
+                    if (lossless) {
+                        // capture.json first: the segments' suffix and granule rate are read from it
+                        ShareFiles.writeCapture(folder, 0, bitrates, consent, flacRate = sampleRate)
+                        val w = OggFlacWriter({ File(folder, ShareFiles.name(it) + ShareFiles.FLAC) }, sampleRate,
+                            serial = flacSerial ?: kotlin.random.Random.nextInt()) { closed(it) }
+                        preSkip = 0
+                        writer = w
+                    } else {
+                        val w = OggOpusWriter({ File(folder, ShareFiles.name(it) + ShareFiles.OPUS) }, SegmentPlan.SECONDS, sampleRate,
+                            bitrateFor = ::opened) { closed(it) }
+                        preSkip = w.preSkip
+                        ShareFiles.writeCapture(folder, w.preSkip, bitrates, consent)
+                        writer = w
+                    }
                 }
                 if (sampleRate == rate) writer?.append(copy)
             } catch (_: Exception) {
@@ -203,7 +221,7 @@ internal class ShareCapture(
     private fun closed(seg: OggSegment) {
         segments = seg.n
         try {
-            ShareFiles.mark(folder, seg.n, seg.granule, seg.bitrate)
+            ShareFiles.mark(folder, seg.n, seg.granule, seg.bitrate.takeIf { it > 0 })
         } catch (_: Exception) {
             failed = true
             return
@@ -299,9 +317,18 @@ internal class ShareCapture(
                         takeSeq: Int? = null,
                         /** SDK 3.0: wall ms from the end of the install's previous recording to this one's start
                          *  (a multiple of 100, 0 to 3,600,000); null: absent. */
-                        gapMsPrev: Int? = null): ByteArray {
-            val audio = sortedMapOf<String, Any?>("codec" to "opus", "container" to "ogg", "sample_rate" to 48_000, "channels" to 1,
-                "input_sample_rate" to inputSampleRate.coerceIn(8_000, 192_000), "input_route" to inputRoute)
+                        gapMsPrev: Int? = null,
+                        /** SDK 4.0 (SHARING_40.md 19.5): a FLAC recording's audio block (the capture rate, 16 bits). */
+                        flac: Boolean = false,
+                        /** SDK 4.0 (19.2): the device's model code, normalised ([DeviceModel]); null: left out. */
+                        deviceModel: String? = null): ByteArray {
+            val audio = if (flac) {
+                sortedMapOf<String, Any?>("codec" to "flac", "container" to "ogg", "sample_rate" to inputSampleRate, "channels" to 1,
+                    "bits_per_sample" to 16, "input_sample_rate" to inputSampleRate, "input_route" to inputRoute)
+            } else {
+                sortedMapOf<String, Any?>("codec" to "opus", "container" to "ogg", "sample_rate" to 48_000, "channels" to 1,
+                    "input_sample_rate" to inputSampleRate.coerceIn(8_000, 192_000), "input_route" to inputRoute)
+            }
             val decode = sortedMapOf<String, Any?>("model_revision" to modelRevision?.take(64), "backend" to backend,
                 "weights_sha256" to weightsSha256, "sdk_version" to SdkInfo.VERSION)
             modelBuild?.takeIf { Regex("^[0-9a-f]{40}$").matches(it) }?.let { decode["model_build"] = it }
@@ -314,6 +341,7 @@ internal class ShareCapture(
             recoveryHash?.let { o["recovery_hash"] = it }
             takeSeq?.takeIf { it >= 1 }?.let { o["take_seq"] = it }
             gapMsPrev?.takeIf { it in 0..3_600_000 && it % 100 == 0 }?.let { o["gap_ms_prev"] = it }
+            deviceModel?.let { ai.quranlab.tajweedformer.cloud.DeviceModel.of(it) }?.let { o["device_model"] = it }
             return Json.write(o).toByteArray(Charsets.UTF_8)
         }
     }
@@ -428,7 +456,9 @@ internal class ContributionOutbox internal constructor(
     fun backlogSeconds(): Double = synchronized(records) {
         scan()
         records.values.filter { it.state == "active" }.sumOf { r ->
-            ShareFiles.seconds(ShareFiles.markers(File(root, r.id))) { ShareFiles.name(it.n) + ".opus" in r.uploaded }
+            val f = File(root, r.id)
+            val suffix = ShareFiles.suffix(f)
+            ShareFiles.seconds(ShareFiles.markers(f), ShareFiles.granuleRate(f)) { ShareFiles.name(it.n) + suffix in r.uploaded }
         }
     }
 
@@ -664,8 +694,9 @@ internal class ContributionOutbox internal constructor(
             rec.urls.putAll(urls)
             save(rec)
         }
+        val suffix = ShareFiles.suffix(folder)
         for (m in markers) {
-            val name = ShareFiles.name(m.n) + ".opus"
+            val name = ShareFiles.name(m.n) + suffix
             if (name in rec.uploaded) continue
             val u = rec.urls[m.n]
             if (u == null || u.second - clock() / 1000 <= 300) {
@@ -711,7 +742,7 @@ internal class ContributionOutbox internal constructor(
             if (!fetchUrls(id, last + 1, token)) return !lastOffline
         }
         rec = synchronized(records) { records[id] } ?: return true
-        if (end == null || !rec.started || markers.isEmpty() || !markers.all { ShareFiles.name(it.n) + ".opus" in rec.uploaded }) return true
+        if (end == null || !rec.started || markers.isEmpty() || !markers.all { ShareFiles.name(it.n) + suffix in rec.uploaded }) return true
         if (halted()) return true
         rec.state = "uploaded"
         rec.lastError = null
@@ -799,9 +830,9 @@ internal class ContributionOutbox internal constructor(
 
     /** Milliseconds of audio in the segments that went up (from the last one's granule position). */
     private fun uploadedMs(folder: File, rec: Record): Long {
-        val last = ShareFiles.markers(folder).lastOrNull { ShareFiles.name(it.n) + ".opus" in rec.uploaded } ?: return 0
-        val preSkip = (ShareFiles.readJson(File(folder, ShareFiles.CAPTURE))?.get("preSkip") as? Double)?.toLong() ?: 312
-        return maxOf(0L, last.granule - preSkip) / 48
+        val suffix = ShareFiles.suffix(folder)
+        val last = ShareFiles.markers(folder).lastOrNull { ShareFiles.name(it.n) + suffix in rec.uploaded } ?: return 0
+        return maxOf(0L, last.granule - ShareFiles.preSkip(folder)) * 1000 / ShareFiles.granuleRate(folder)
     }
 
     /** The take list call is over: sent, dropped, or (null) there was none to send. */
@@ -903,12 +934,13 @@ internal class ContributionOutbox internal constructor(
     /** The capped tier's segment cap: what is up is the session (the audio so far stays valid). */
     private fun finishAtCap(id: String) {
         val rec = synchronized(records) { records[id] } ?: return
+        try { gate.lost(403, "segment_cap") } catch (_: Exception) {}
         rec.state = "uploaded"
         rec.lastError = "segment_cap"
         // a recording of several takes: the list of those inside what went up follows once the capture has ended
         if (id in ShareCapture.ACTIVE || ShareFiles.takes(File(root, id)) != null) rec.takes = TAKES_PENDING
         save(rec)
-        for (f in File(root, id).listFiles() ?: emptyArray()) if (f.name.endsWith(".opus")) f.delete()
+        for (f in File(root, id).listFiles() ?: emptyArray()) if (f.name.endsWith(ShareFiles.OPUS) || f.name.endsWith(ShareFiles.FLAC)) f.delete()
     }
 
     private fun retry(id: String, why: String, immediately: Boolean = false, longWait: Boolean = false) {
@@ -920,6 +952,7 @@ internal class ContributionOutbox internal constructor(
 
     private fun fail(id: String, e: ApiError) {
         val rec = synchronized(records) { records[id] } ?: return
+        try { gate.lost(e.status, e.code) } catch (_: Exception) {}
         rec.state = "failed"
         rec.failCode = e.code
         rec.lastError = e.toString()
@@ -1030,7 +1063,7 @@ internal class ContributionOutbox internal constructor(
         }
         val day = ShareFiles.readJson(File(f, ShareFiles.SESSION))?.get("day") as? String ?: ""
         return Contribution(r.id, markers.size, markers.sumOf { it.bytes }, end?.durationMs ?: 0, day, end?.completed, status, r.attempts, r.lastError,
-            markers.map { it.bitrate ?: ShareFiles.LEGACY_BITRATE }, ShareFiles.takes(f)?.size ?: 1)
+            markers.map { it.bitrate ?: if (ShareFiles.flac(f)) 0 else ShareFiles.LEGACY_BITRATE }, ShareFiles.takes(f)?.size ?: 1)
     }
 
     /** Where the take list of an item stands (null: none to send, else [TAKES_PENDING], [TAKES_SENT] or [TAKES_DROPPED]). */

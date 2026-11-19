@@ -17,6 +17,12 @@ internal object ModelIds {
         versions[m.build] = v
     }
 
+    /** The build [build] the signed config named is of [version] (before its manifest verified: a failed fetch of the
+     *  manifest is counted under its version, contract 24.8). */
+    fun expect(build: String?, version: String?) {
+        if (build != null && version != null && ModelManifest.isVersion(version)) versions.putIfAbsent(build, version)
+    }
+
     /** The version of the build [id]; [id] itself when it is not a known build (a 2.x style revision in a test). */
     fun version(id: String?): String = id?.let { versions[it] ?: it } ?: ""
 

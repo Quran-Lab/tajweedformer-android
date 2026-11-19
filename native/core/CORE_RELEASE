@@ -1,0 +1,5 @@
+release 4.0.0-c3
+source quranlab-core f006676002529c881d61cdb241af2ca1927a4087
+android-arm64-v8a qlcore.so b2441cff74182fad3d526a76210717f95dc77fa5e5b14521b917b292ad7432a0
+android-armeabi-v7a qlcore.so 0e8deefa4ea1f6fce5c3de0da24e42c67a063942b2ae81db3b79796d7182318c
+android-x86_64 qlcore.so d5e9b7eae6ba211139da8d9daffcedbebd931be6c2d25e45ef21265f9c60607a

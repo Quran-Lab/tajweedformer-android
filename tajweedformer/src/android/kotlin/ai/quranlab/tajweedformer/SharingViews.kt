@@ -30,7 +30,7 @@ import java.util.concurrent.Executors
 import kotlin.math.min
 
 /**
- * The look of the SDK's sharing sheets (consent, guardian, thanks, settings and their dialogs; Views toolkit; the
+ * The look of the SDK's sharing sheets (consent, thanks, settings and their dialogs; Views toolkit; the
  * Compose module's `SharingStyle` is the same for Compose). Since 3.1.1 the sheets follow Quran Lab's sheet design,
  * the same on Android, Apple and web: by default its colours, light or dark with the system's night mode, and the
  * accent of the app's theme (`android:colorAccent`, when the app's theme or a library theme it uses sets it), else
@@ -107,40 +107,21 @@ internal object SdkText {
  * what the screenshot tests draw. [onShare] and [onNotNow] are the two buttons; the frame's [SheetFrame.onOutside] and
  * the panel's [SheetPanel.onDragDismiss] are for the dialog to set.
  */
-internal fun consentSheet(ctx: Context, c: SharingCopy, variant: ConsentState.Variant, guardian: Boolean, theme: SharingTheme,
+internal fun consentSheet(ctx: Context, c: SharingCopy, variant: ConsentState.Variant, theme: SharingTheme,
                           onShare: () -> Unit, onNotNow: () -> Unit): SheetFrame {
     val k = SheetKit(ctx, theme.look(ctx, c))
-    val title: String
-    val body: String
-    if (guardian) {
-        title = c["sheet.guardian.title"]
-        body = c["sheet.guardian.body"]
-    } else {
-        title = c["sheet.title"]
-        body = c["sheet.body"]
-    }
     // the disclosure, each line whole, in this order, with its icon
     val rows = listOf(SheetIcon.MIC to c["sheet.what"], SheetIcon.SHIELD to c["sheet.who"], SheetIcon.TOGGLE to c["sheet.control"])
     val col = k.column()
     col.addView(k.header())
-    col.addView(k.title(title), k.gap(SheetDesign.HEADER_GAP))
+    col.addView(k.title(c["sheet.title"]), k.gap(SheetDesign.HEADER_GAP))
     if (variant == ConsentState.Variant.REASK) col.addView(k.body(c["reask"]), k.gap(SheetDesign.BLOCK_GAP))
-    col.addView(k.body(body), k.gap(SheetDesign.BLOCK_GAP))
+    col.addView(k.body(c["sheet.body"]), k.gap(SheetDesign.BLOCK_GAP))
     col.addView(k.card(rows.map { (icon, line) -> k.row(icon, line) }), k.gap(SheetDesign.BLOCK_GAP))
     c.hadith?.let { col.addView(k.hadith(it, c.hadithRef), k.gap(SheetDesign.BLOCK_GAP)) }
-    if (!guardian) col.addView(k.mistakes(c["sheet.mistakes"]), k.gap(SheetDesign.BLOCK_GAP))
-    val share = k.button(c[if (guardian) "sheet.guardian.share" else "sheet.share"], primary = true)
+    col.addView(k.mistakes(c["sheet.mistakes"]), k.gap(SheetDesign.BLOCK_GAP))
+    val share = k.button(c["sheet.share"], primary = true)
     val notNow = k.button(c["sheet.not_now"], primary = false)
-    if (guardian) {
-        // the parent or guardian turns the switch on first; until then "Share" is disabled (and "Not now" never is)
-        share.isEnabled = false
-        share.alpha = SheetDesign.DISABLED_ALPHA
-        val (row, _) = k.switchRow(c["sheet.guardian.confirm"], SheetDesign.row(k.look.script).scaled(k.look.bodyScale), SheetDesign.ROW_PAD_V) { on ->
-            share.isEnabled = on
-            share.alpha = if (on) 1f else SheetDesign.DISABLED_ALPHA
-        }
-        col.addView(k.card(listOf(row)), k.gap(SheetDesign.BLOCK_GAP))
-    }
     share.setOnClickListener { onShare() }
     notNow.setOnClickListener { onNotNow() }
     return k.frame(col, share, notNow)
@@ -151,12 +132,23 @@ internal object SharingDialogs {
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "quranlab-sharing-ui").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
 
-    /** Shows what the SDK asked for (a consent sheet, the thank-you, the impact line), with the app's own wording where it set one. */
+    /**
+     * Shows what the SDK asked for (a consent sheet, the share card, the thank-you, the impact line), with the app's own
+     * wording where it set one. A sheet or card is counted right before it goes on screen ([Sharing.SheetRequest.Consent.shown]),
+     * and shown only when the SDK's decision allows it (SHARE_ASK_40 20.6); the SDK takes it back with `onDismiss`.
+     */
     @JvmStatic
     @JvmOverloads
     fun show(activity: Activity, sharing: Sharing, request: Sharing.SheetRequest, theme: SharingTheme = SharingTheme()) {
         when (request) {
-            is Sharing.SheetRequest.Consent -> consent(activity, sharing, request.variant, request.guardian, theme)
+            is Sharing.SheetRequest.Consent -> {
+                if (!request.shown()) return
+                val d = consentDialog(activity, sharing.copy, request.variant, theme) { exit -> exit.record(sharing) }
+                // taken back by the SDK (the switch turned, a new app session): closed without an answer
+                request.onDismiss = { main.post { d.setOnDismissListener(null); if (d.isShowing) d.dismiss() } }
+                d.show()
+            }
+            is Sharing.SheetRequest.Card -> SharingCards.show(activity, sharing, request, theme)
             is Sharing.SheetRequest.Thanks -> message(activity, sharing.copy, sharing.copy["thanks"], theme)
             is Sharing.SheetRequest.Impact -> message(activity, sharing.copy, sharing.copy.impactMinutes(request.minutes), theme)
         }
@@ -172,8 +164,8 @@ internal object SharingDialogs {
      */
     @JvmStatic
     @JvmOverloads
-    fun consent(activity: Activity, sharing: Sharing, variant: ConsentState.Variant, guardian: Boolean, theme: SharingTheme = SharingTheme()) {
-        consentDialog(activity, sharing.copy, variant, guardian, theme) { exit -> exit.record(sharing, guardian) }.show()
+    fun consent(activity: Activity, sharing: Sharing, variant: ConsentState.Variant, theme: SharingTheme = SharingTheme()) {
+        consentDialog(activity, sharing.copy, variant, theme) { exit -> exit.record(sharing) }.show()
     }
 
     /**
@@ -182,11 +174,11 @@ internal object SharingDialogs {
      * A dialog whose window is removed with its activity (a configuration change, the activity finishing) is not
      * dismissed, and [onExit] hears nothing, as in 3.1.0. [startAtEnd]: the device test's pictures.
      */
-    internal fun consentDialog(activity: Activity, c: SharingCopy, variant: ConsentState.Variant, guardian: Boolean, theme: SharingTheme,
+    internal fun consentDialog(activity: Activity, c: SharingCopy, variant: ConsentState.Variant, theme: SharingTheme,
                                startAtEnd: Boolean = false, onExit: (SheetExit) -> Unit): Dialog {
         var answered = false
         var d: Dialog? = null
-        val frame = consentSheet(activity, c, variant, guardian, theme,
+        val frame = consentSheet(activity, c, variant, theme,
             onShare = { answered = true; onExit(SheetExit.SHARE); d?.dismiss() },
             onNotNow = { answered = true; onExit(SheetExit.NOT_NOW); d?.dismiss() })
         frame.panel.box.startAtEnd = startAtEnd
@@ -331,6 +323,96 @@ internal object SharingDialogs {
             }
         }
     }
+}
+
+/**
+ * SDK 4.0's re-ask card (SHARE_ASK_40 20.6), Views: non-blocking, in the activity's own window (no dim, no focus taken,
+ * no dialog), at the bottom above the system bar, at most 480 wide, in the sheet's colours and type with a corner
+ * radius of 18: the emblem, the line (announced politely once, never focused), and two equal buttons, "See how it
+ * helps" (the accent) and "Not now" (the tint). No timeout: it stays until a button, or until the SDK takes it back
+ * (a take starts, the app leaves).
+ */
+internal object SharingCards {
+    private val main = Handler(Looper.getMainLooper())
+
+    fun show(activity: Activity, sharing: Sharing, r: Sharing.SheetRequest.Card, theme: SharingTheme) {
+        val content = activity.findViewById<ViewGroup>(android.R.id.content) as? FrameLayout
+        if (content == null || activity.isFinishing) {
+            sharing.notShown(r)
+            return
+        }
+        if (!r.shown()) return
+        val c = sharing.copy
+        val k = SheetKit(activity, theme.look(activity, c))
+        var done = false
+        lateinit var view: View
+        fun remove() {
+            if (done) return
+            done = true
+            content.removeView(view)
+        }
+        view = card(k, r.line, r.openLabel, r.notNowLabel, onOpen = { remove(); r.open() }, onNotNow = { remove(); r.notNow() })
+        r.onDismiss = { main.post { remove() } }
+        val dm = activity.resources.displayMetrics
+        val side = k.dp(16f)
+        val lp = FrameLayout.LayoutParams(min(dm.widthPixels - 2 * side, k.dp(SheetDesign.CARD_MAX_WIDTH)), ViewGroup.LayoutParams.WRAP_CONTENT,
+            android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL)
+        // above the navigation bar where the app draws behind it
+        val frame = android.graphics.Rect()
+        content.getWindowVisibleDisplayFrame(frame)
+        val at = IntArray(2)
+        content.getLocationInWindow(at)
+        lp.bottomMargin = side + maxOf(0, at[1] + content.height - frame.bottom)
+        content.addView(view, lp)
+    }
+
+    /** The card's views. */
+    internal fun card(k: SheetKit, line: String, open: String, notNow: String, onOpen: () -> Unit, onNotNow: () -> Unit): View {
+        val box = LinearLayout(k.ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = k.rounded(k.c.background, CARD_RADIUS)
+            elevation = k.dpf(6f)
+            val p = k.dp(16f)
+            setPadding(p, p, p, p)
+            // touches on the card stay on the card
+            isClickable = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val row = LinearLayout(k.ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        val emblem = FrameLayout(k.ctx).apply {
+            background = k.rounded(k.c.tint, SheetDesign.EMBLEM_RADIUS)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            addView(android.widget.ImageView(k.ctx).apply { setImageDrawable(SheetIconDrawable(SheetIcon.WAVEFORM, k.c.accentInk)) },
+                FrameLayout.LayoutParams(k.dp(SheetDesign.GLYPH), k.dp(SheetDesign.GLYPH), android.view.Gravity.CENTER))
+        }
+        val text = k.body(line).apply {
+            setTextColor(k.c.text)
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        val e = LinearLayout.LayoutParams(k.dp(SheetDesign.EMBLEM), k.dp(SheetDesign.EMBLEM))
+        val t = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        if (k.look.rtl) {
+            t.rightMargin = k.dp(12f)
+            row.addView(text, t)
+            row.addView(emblem, e)
+        } else {
+            t.leftMargin = k.dp(12f)
+            row.addView(emblem, e)
+            row.addView(text, t)
+        }
+        box.addView(row)
+        val o = k.button(open, primary = true).apply { setOnClickListener { onOpen() } }
+        val n = k.button(notNow, primary = false).apply { setOnClickListener { onNotNow() } }
+        box.addView(k.buttonRow(o, n), k.gap(12f))
+        return box
+    }
+
+    /** The card's corner radius (20.6): 18 at the design's scale. */
+    const val CARD_RADIUS = 18f
 }
 
 /**

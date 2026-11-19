@@ -39,8 +39,20 @@ internal data class DeviceProfile(
     val osVersion: String,
     /** `lt2|2_4|4_8|8_16|ge16`. */
     val ramTier: String? = null,
+    /** SDK 4.0 (SHARING_40.md 19.2): the model code for a shared recording's start body only, as [DeviceModel] makes
+     *  it (Android: `Build.MANUFACTURER` and `Build.MODEL`); null where the platform has none (the JVM). */
+    val model: String? = null,
+    /** Contract 24.2 (error reports, native only): the model code as `Build.MODEL` says it, spaces as `_`
+     *  (`SM-A155F`, `Pixel_8`), never a name or a serial; null where the platform has none (the JVM). */
+    val modelCode: String? = null,
+    /** Contract 24.2: the process's ABI (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`; the desktop JVM `arm64`, `x86_64`). */
+    val abi: String? = null,
 ) {
     companion object {
+        /** [modelCode] from `Build.MODEL`: spaces as `_`; null unless it is a token of 24.2 (never cut into one). */
+        @JvmStatic
+        fun modelCode(model: String?): String? = model?.trim()?.replace(' ', '_')?.takeIf { ErrorRules.DEVICE_MODEL.matches(it) }
+
         private val TOKEN = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,23}$")
 
         /** A token the schema takes from free text: unsafe characters dropped, at most 24. */
@@ -83,6 +95,47 @@ internal data class DeviceProfile(
             return DeviceProfile(arch, arch, major, v.take(32), null)
         }
     }
+}
+
+/**
+ * SHARING_40.md 19.2: `device_model` (`tools/sharing40.py` `device_model`, `vectors/sharing40/device_model.json`): each
+ * part trimmed, the non-empty ones joined with one space, every code point outside `A-Z a-z 0-9`, space and
+ * `_ . , + ( ) / -` replaced by one `_`, runs of spaces made one, characters up to the first letter or digit dropped,
+ * cut to 64 characters, trailing spaces dropped; null when nothing is left. The result always matches
+ * `^[A-Za-z0-9][A-Za-z0-9 _.,+()/-]{0,63}$`.
+ */
+internal object DeviceModel {
+    private fun ok(c: Int) = c in 'A'.code..'Z'.code || c in 'a'.code..'z'.code || c in '0'.code..'9'.code || c.toChar() in " _.,+()/-"
+    private fun alnum(c: Char) = c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9'
+
+    @JvmStatic
+    fun of(vararg parts: String?): String? {
+        // Python's str.strip(): whitespace as Unicode defines it
+        val joined = parts.mapNotNull { p -> p?.let { stripped(it) }?.takeIf { it.isNotEmpty() } }.joinToString(" ")
+        val b = StringBuilder()
+        var i = 0
+        while (i < joined.length) {
+            val cp = joined.codePointAt(i)
+            b.append(if (cp < 0x80 && ok(cp)) cp.toChar() else '_')
+            i += Character.charCount(cp)
+        }
+        var s = b.toString()
+        while ("  " in s) s = s.replace("  ", " ")
+        val first = s.indexOfFirst { alnum(it) }
+        s = if (first < 0) "" else s.substring(first)
+        s = s.take(64).trimEnd(' ')
+        return s.ifEmpty { null }
+    }
+
+    private fun stripped(s: String): String {
+        var a = 0
+        var z = s.length
+        while (a < z && isSpace(s.codePointAt(a))) a += Character.charCount(s.codePointAt(a))
+        while (z > a && isSpace(s.codePointBefore(z))) z -= Character.charCount(s.codePointBefore(z))
+        return s.substring(a, z)
+    }
+
+    private fun isSpace(cp: Int) = Character.isWhitespace(cp) || Character.isSpaceChar(cp) || cp in 0x1C..0x1F || cp == 0x85
 }
 
 /** UTC days, the finest time anything the SDK sends carries. */

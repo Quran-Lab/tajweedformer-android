@@ -35,6 +35,8 @@ class SharingTest : OpenChecked() {
     @Before fun up() {
         OggTestKit.requireOpus()
         stub = StubQlab()
+        // the clients' clock moves on by days in the tests of the ask (SHARE_ASK_40): the signed config outlasts them
+        stub.expiresIn = 400L * 86_400
         storage = Files.createTempDirectory("tj-share").toFile()
     }
 
@@ -57,12 +59,26 @@ class SharingTest : OpenChecked() {
         return c
     }
 
-    /** A session over [seconds] of audio at [rate] through the observer hooks; [end]: finish, cancel or open. */
-    private fun session(c: QuranLabCloud, seconds: Double, rate: Int = 48_000, end: String = "finish", feedback: Boolean = true) {
+    /**
+     * A session over [seconds] of audio at [rate] through the observer hooks; [end]: finish, cancel or open. [speech]:
+     * the speech the model found in it (SDK 4.0: a minute by default, so a finished take is a good moment to ask).
+     */
+    private fun session(c: QuranLabCloud, seconds: Double, rate: Int = 48_000, end: String = "finish", feedback: Boolean = true,
+                        speech: Int = AskKit.MINUTE_FRAMES) {
         c.onSessionStart(TajweedObserver.SessionStart("v4.0+abc", "c16_l64", "cpu", sampleRate = rate, inputRoute = "built_in",
             decodeBackend = "mock"))
         feed(c, seconds, rate)
-        if (end != "open") endSession(c, end == "finish", feedback)
+        if (end != "open") endSession(c, end == "finish", feedback, speech)
+    }
+
+    /** SDK 4.0: an install past its first day, never asked: its next good moment asks ([AskKit.ready]). */
+    private fun ready(at: File = storage) = storedState(AskKit.ready(stub.clock()), at)
+
+    /** The next day: a new app session (the Client started again), and [takes] takes of a minute of speech each. */
+    private fun nextDay(c: QuranLabCloud, takes: Int = 1, days: Int = 1) {
+        stub.skewMs += days * ShareAsk.DAY_MS
+        c.sharing.launched()
+        repeat(takes) { session(c, 0.1) }
     }
 
     private var seed = 1L
@@ -84,8 +100,10 @@ class SharingTest : OpenChecked() {
      * take follows within the window: the clients' clock moves past it and the window's check (what its timer does)
      * closes the recording. Takes in a row are SharingTakesTest's.
      */
-    private fun endSession(c: QuranLabCloud, completed: Boolean, feedback: Boolean = true) {
-        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = feedback))
+    private fun endSession(c: QuranLabCloud, completed: Boolean, feedback: Boolean = true, speech: Int = AskKit.MINUTE_FRAMES) {
+        c.onSessionEnd(TajweedObserver.SessionEnd(0.0, completed, feedbackShown = feedback, speechFrames = speech))
+        // SDK 4.0: the settle of SHARE_ASK_40 20.6 is over at once on this fake clock
+        c.sharing.settleNow()
         stub.skewMs += TakeJoin.DEFAULT_WINDOW_MS + 1
         c.sharing.checkJoinWindow()
         c.sharing.lastCapture?.await()
@@ -176,6 +194,49 @@ class SharingTest : OpenChecked() {
         val head = OggTestKit.pages(segs[0])[0].packets[0]
         assertEquals(44_100, java.nio.ByteBuffer.wrap(head, 12, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).int)
         assertEquals(12 * 48_000, OggTestKit.decode(segs.reduce { a, b -> a + b }).size)
+    }
+
+    /**
+     * SDK 4.0 (SHARING_40.md 19.3 to 19.5): with the signed config's `flags.share_flac`, a capture at a rate other than
+     * 48 kHz is shared lossless, Ogg FLAC at its own rate, its start body names it (and the device's model), its
+     * segments go to `.oga` URLs; a 48 kHz capture stays Opus.
+     */
+    @Suppress("UNCHECKED_CAST")
+    @Test fun aSixteenKilohertzSessionIsLosslessOnceTheConfigSaysSo() {
+        stub.flags = stub.flags + ("share_flac" to true)
+        val c = QuranLabCloud(CloudOptions(stub.key, contributions = true, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
+            stub.environment(storage, device = ai.quranlab.tajweedformer.cloud.DeviceProfile("SM-S921", "sm8650", 15, "15", "8_16",
+                model = ai.quranlab.tajweedformer.cloud.DeviceModel.of("samsung", "SM-S921B"))))
+        c.refreshConfig()
+        c.sharing.accept()
+        session(c, 25.0, rate = 16_000)
+        val item = settle(c)[0]
+        assertEquals(25_000, item.durationMs)
+        val start = stub.starts().single().json!!
+        assertEquals("flac", (start["audio"] as Map<String, Any?>)["codec"])
+        assertEquals("no bit rate: lossless", listOf(0, 0), item.segmentBitrates)
+        assertEquals(mapOf("codec" to "flac", "container" to "ogg", "sample_rate" to 16_000.0, "channels" to 1.0, "bits_per_sample" to 16.0,
+            "input_sample_rate" to 16_000.0, "input_route" to "built_in"), start["audio"])
+        assertEquals("samsung SM-S921B", start["device_model"])
+        // 25 s at 16 kHz: 98 frames, 40 in segment 1 (10.24 s) and the 58 left in segment 2
+        assertEquals((1..2).map { "/r2/qlab-contributions/v1/${item.id}/seg-0000$it.oga" }, stub.puts.map { it.path })
+        for (p in stub.puts) assertEquals("audio/ogg", p.headers["content-type"])
+        val segs = stub.segments(item.id)
+        val pages = segs.map { OggTestKit.pages(it) }
+        assertEquals(listOf(42, 58), pages.map { it.size })
+        assertEquals("fLaC", String(pages[0][0].packets[0], 9, 4))
+        assertEquals(51, pages[0][0].packets[0].size)
+        assertTrue(String(pages[0][1].packets[0], 8, pages[0][1].packets[0].size - 12).startsWith("QuranLab SDK "))
+        assertEquals("the last page ends the stream", 0x04, pages.last().last().flags)
+        assertEquals(25L * 16_000, pages.last().last().granule)
+        val left = File(File(storage, "outbox"), item.id).list()!!
+        assertFalse("the audio goes once uploaded", left.any { it.endsWith(".oga") })
+        // a 48 kHz capture stays Opus under the same config
+        session(c, 12.0, rate = 48_000)
+        settle(c, 2)
+        val opus = stub.starts().last().json!!["audio"] as Map<String, Any?>
+        assertEquals("opus", opus["codec"])
+        assertEquals(48_000.0, opus["sample_rate"])
     }
 
     @Test fun shortCancelledSessionsStayLocal() {
@@ -350,41 +411,57 @@ class SharingTest : OpenChecked() {
         assertNotEquals(id, c.sharing.contributor.id)
     }
 
+    /**
+     * SDK 4.0 (SHARE_ASK_40): never in the install's first 24 hours or before its third completed session, then at a good
+     * moment; the re-asks 14 days and 7 sessions, then 30 days and 10 sessions after the ask before, one an app session;
+     * three at most. The deck has the card's lines (2026-11-15.1): each re-ask is the card.
+     */
     @Test fun theSdkAsksAtTheRightMoment() {
         val c = cloud(consent = false)
         val asked = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { asked.add(it) }
-        // a session without feedback, a cancelled one: no ask
-        session(c, 0.2, feedback = false)
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); (it as? Sharing.SheetRequest.Card)?.shown(); asked.add(it) }
+        c.sharing.launched()
+        // a cancelled take, a take without speech: no session
         session(c, 0.2, end = "cancel")
-        assertTrue(asked.isEmpty())
-        session(c, 0.2)
-        assertEquals(listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST, false)), asked)
+        session(c, 0.2, speech = 0)
+        assertEquals(0, c.sharing.state.sessions)
+        repeat(3) { session(c, 0.2) }
+        assertTrue("not in the first 24 hours: $asked", asked.isEmpty())
+        nextDay(c)
+        assertEquals(listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST)), asked)
         c.sharing.decline()
-        // re-asks: at least 7 sessions apart, at most twice
+        // one good take a day from here
         val at = ArrayList<Int>()
-        for (i in 1..40) {
+        for (d in 1..60) {
             val before = asked.size
-            session(c, 0.1)
-            if (asked.size > before) { at.add(i); c.sharing.decline() }
+            nextDay(c)
+            if (asked.size > before) { at.add(d); c.sharing.decline() }
         }
-        assertEquals(listOf(7, 14), at)
+        assertEquals(listOf(14, 44), at)
         assertEquals(ConsentState.Consent.FINAL, c.sharing.state.consent)
-        assertTrue(asked.drop(1).all { it == Sharing.SheetRequest.Consent(ConsentState.Variant.REASK, false) })
+        assertEquals(2, asked.drop(1).size)
+        assertTrue("each re-ask is the card: $asked", asked.drop(1).all { it is Sharing.SheetRequest.Card && it.line == c.sharing.copy["card.line"] })
         // the learner opens the setting
         c.sharing.setOn(true)
         assertTrue(c.sharing.isOn)
     }
 
-    @Test fun guardianVariantAndThanksOnce() {
-        val c = stub.cloud(storage, CloudOptions(stub.key, contributions = true, audience = CloudOptions.Audience.CHILDREN, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)))
-        c.refreshConfig()
+    /**
+     * SDK 4.0: one sheet for every app. The ask hands the UI the sheet and its variant only, the
+     * yes takes no argument, a state 4.0 started holds no field of a 3.x variant, and the thank-you shows once.
+     */
+    @Test fun oneSheetForEveryAppAndThanksOnce() {
+        ready()
+        val c = cloud(consent = false)
         val asked = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { asked.add(it) }
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
         session(c, 0.2)
-        assertEquals(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST, true), asked.single())
+        assertEquals(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST), asked.single())
+        assertEquals("the request carries the variant only", listOf("variant"),
+            Sharing.SheetRequest.Consent::class.java.declaredFields.map { it.name }.filter { it == "variant" || "guardian" in it.lowercase() })
         c.sharing.accept()
-        assertTrue(c.sharing.state.guardian)
+        assertTrue(c.sharing.isOn)
+        assertFalse(File(File(storage, "sharing"), "state.json").readText().contains("guardian"))
         session(c, 3.0)
         settle(c)
         session(c, 3.0)
@@ -392,19 +469,112 @@ class SharingTest : OpenChecked() {
         assertEquals("the thank-you once", 1, asked.count { it == Sharing.SheetRequest.Thanks })
     }
 
-    @Test fun anAskNowFromTheAppIsCountedAndRespected() {
+    /**
+     * The exact file SDK 3.1.x wrote for a learner who said yes on its guardian sheet (`guardian: true`), in 3.1.x's key
+     * order: granted under [version], thanked, asked once.
+     */
+    private fun state3xGuardianYes(version: String) =
+        "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":3,\"sessions\":9,\"thanked\":true,\"decidedAt\":1762980000," +
+            "\"consentVersion\":\"$version\",\"consentTextSha256\":null,\"guardian\":true," +
+            "\"changes\":1,\"deletedBelow\":0,\"deletionUnfinished\":false}"
+
+    /**
+     * Contract 26.1 item 4 and 26.4 (never re-ask consent, Quran Lab's permanent rule): a yes SDK 3.x recorded on its
+     * guardian sheet is a yes like any other. 4.0 reads the state as granted: no ask (neither the SDK's own moment, nor
+     * the app's ask(), nor a later day), every take is shared under the version agreed to, and `guardian` is written back
+     * unchanged, in its place, by every write 4.0 makes (takes counted, the switch off and on again, a new process).
+     */
+    @Test fun aYesGivenOnA3xGuardianSheetStaysAYesAndItsFieldPassesThrough() {
+        storedState(state3xGuardianYes("share-2026-11-09"))
+        val file = File(File(storage, "sharing"), "state.json")
+        @Suppress("UNCHECKED_CAST")
+        fun stored() = ai.quranlab.tajweedformer.Json.parse(file.readText()) as Map<String, Any?>
+        fun inPlace() = assertEquals("guardian written back in its place: ${file.readText()}", listOf("consentTextSha256", "guardian", "changes"),
+            stored().keys.toList().let { k -> k.subList(k.indexOf("consentTextSha256"), k.indexOf("consentTextSha256") + 3) })
         val c = cloud(consent = false)
-        assertEquals(ConsentState.Variant.FIRST, c.sharing.askNow())
+        val asked = ArrayList<Sharing.SheetRequest>()
+        c.sharing.prompts = { r -> (r as? Sharing.SheetRequest.Consent)?.shown(); (r as? Sharing.SheetRequest.Card)?.shown(); asked.add(r) }
+        c.sharing.launched()
+        assertTrue("granted", c.sharing.isOn && c.sharing.active)
+        assertEquals("share-2026-11-09", c.sharing.state.consentVersion)
+        assertFalse("the app's ask asks nothing", c.sharing.askNow())
+        val before = stub.starts().size
+        session(c, 3.0)
+        repeat(3) { session(c, 0.1) }
+        settle(c, 4)
+        val starts = stub.starts().drop(before)
+        assertEquals("every take shared", 4, starts.size)
+        assertTrue(starts.all { it.json!!["consent_version"] == "share-2026-11-09" })
+        // 4.0 wrote the state (the takes are counted) and passed the field through
+        assertTrue((stored()["sessions"] as Double).toInt() > 9)
+        assertEquals(true, stored()["guardian"])
+        inPlace()
+        // a later day, more good takes: still no ask
+        nextDay(c, takes = 2)
+        assertFalse(c.sharing.askNow())
+        assertTrue("never asked: $asked", asked.none { it is Sharing.SheetRequest.Consent || it is Sharing.SheetRequest.Card })
+        // the switch off and on again (the learner's own act): the field is still what 3.x wrote
+        c.sharing.setOn(false)
+        assertEquals("final", stored()["consent"])
+        assertEquals(true, stored()["guardian"])
+        c.sharing.setOn(true)
+        assertEquals("granted", stored()["consent"])
+        assertEquals(true, stored()["guardian"])
+        inPlace()
+        // a new process reads the grant and keeps the field
+        val again = cloud(consent = false)
+        assertTrue(again.sharing.isOn)
+        assertFalse(again.sharing.askNow())
+        assertEquals(true, stored()["guardian"])
+        // a 3.x state with the field false or another value is passed through the same, never read
+        for ((v, read) in listOf("false" to false, "\"yes\"" to "yes")) {
+            val at = Files.createTempDirectory("tj-3x").toFile()
+            storedState(state3xGuardianYes("share-2026-11-12").replace("\"guardian\":true", "\"guardian\":$v"), at)
+            val d = cloud(consent = false, at = at)
+            assertTrue(d.sharing.isOn)
+            d.sharing.setOn(false)
+            d.sharing.setOn(true)
+            @Suppress("UNCHECKED_CAST")
+            val back = ai.quranlab.tajweedformer.Json.parse(File(File(at, "sharing"), "state.json").readText()) as Map<String, Any?>
+            assertEquals(read, back["guardian"])
+            at.deleteRecursively()
+        }
+    }
+
+    /**
+     * SDK 4.0 (SHARE_ASK_40 20.9): the app's ask() keeps its moment and loses the cadence: shown only when an ask is due
+     * by the same rules (the minute of speech aside), never at launch, never twice in an app session.
+     */
+    @Test fun anAskNowFromTheAppIsCountedAndRespected() {
+        ready()
+        val c = cloud(consent = false)
+        val asked = ArrayList<Sharing.SheetRequest>()
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
+        c.sharing.launched()
+        assertFalse("never at launch", c.sharing.askNow())
+        // a short take: not a good moment for the SDK's own ask, but the app's may come after it
+        session(c, 0.2, speech = 100)
+        assertTrue(asked.isEmpty())
+        assertTrue(c.sharing.askNow())
+        assertEquals(listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST)), asked)
         c.sharing.decline()
-        assertEquals(ConsentState.Variant.REASK, c.sharing.askNow())
-        c.sharing.decline()
-        assertEquals(ConsentState.Variant.REASK, c.sharing.askNow())
-        c.sharing.decline()
-        assertNull("never again", c.sharing.askNow())
+        assertFalse("not twice in an app session", c.sharing.askNow())
+        nextDay(c, takes = 0)
+        session(c, 0.2, speech = 100)
+        assertFalse("under the cadence", c.sharing.askNow())
         // 2.0.1: the backend decides whether the sheet is offered; the app's option neither vetoes nor forces it
-        assertEquals(ConsentState.Variant.FIRST, cloud(consent = false, contributions = false, at = Files.createTempDirectory("tj-n").toFile()).sharing.askNow())
+        fun appAsks(contributions: Boolean): Boolean {
+            val at = Files.createTempDirectory("tj-n").toFile()
+            ready(at)
+            val d = cloud(consent = false, contributions = contributions, at = at)
+            d.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown() }
+            d.sharing.launched()
+            session(d, 0.2, speech = 100)
+            return d.sharing.askNow()
+        }
+        assertTrue(appAsks(contributions = false))
         stub.flags = stub.flags + ("contributions" to false)
-        assertNull(cloud(consent = false, contributions = true, at = Files.createTempDirectory("tj-o").toFile()).sharing.askNow())
+        assertFalse(appAsks(contributions = true))
     }
 
     @Test fun offeredIsNotConsentAndAGrantToAnOlderDeckKeepsSharingUnderIt() {
@@ -416,11 +586,11 @@ class SharingTest : OpenChecked() {
         c.sharing.outbox.drain(ignoringBackoff = true)
         assertTrue(c.sharing.items.isEmpty() && stub.starts().isEmpty())
         // a 2.0.1 grant to an earlier deck, the 2026-11-09.1 deck in force: no ask, shared under the version agreed to
-        c.sharing.state.grant("share-2026-11-01", byGuardian = false)
+        c.sharing.state.grant("share-2026-11-01")
         val asked = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { asked.add(it) }
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
         assertTrue(c.sharing.isOn)
-        assertNull(c.sharing.askNow())
+        assertFalse(c.sharing.askNow())
         session(c, 12.0)
         repeat(20) { session(c, 0.1) }
         settle(c, 21) { it.status == Contribution.Status.UPLOADED }
@@ -439,15 +609,15 @@ class SharingTest : OpenChecked() {
         for (agreed in listOf("share-2026-11-12", "share-2026-11-09")) {
             val at = Files.createTempDirectory("tj-yes").toFile()
             // the yes as the earlier SDK stored it (the state file of the same consent code), then a start of 3.1.2
-            cloud(consent = false, at = at).sharing.state.grant(agreed, byGuardian = false)
+            cloud(consent = false, at = at).sharing.state.grant(agreed)
             assertTrue(File(File(at, "sharing"), "state.json").readText().contains(agreed))
             val c = cloud(consent = false, at = at)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
             assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
             assertTrue(c.sharing.isOn && c.sharing.active)
             assertEquals(agreed, c.sharing.state.consentVersion)
-            assertNull("$agreed: asked again", c.sharing.askNow())
+            assertFalse("$agreed: asked again", c.sharing.askNow())
             val before = stub.starts().size
             session(c, 3.0)
             repeat(5) { session(c, 0.1) }
@@ -491,11 +661,11 @@ class SharingTest : OpenChecked() {
             storedState(state311(stored, sha), at)
             val c = cloud(consent = false, at = at)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
             assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
             assertTrue(c.sharing.isOn && c.sharing.active)
             assertEquals(stored, c.sharing.state.consentVersion)
-            assertNull("$stored: asked again", c.sharing.askNow())
+            assertFalse("$stored: asked again", c.sharing.askNow())
             val before = stub.starts().size
             session(c, 3.0)
             repeat(10) { session(c, 0.1) }
@@ -531,7 +701,7 @@ class SharingTest : OpenChecked() {
             storedState(state200(stored), at)
             val c = cloud(consent = false, at = at)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); asked.add(it) }
             assertEquals("share-2026-11-09", c.sharing.copy.consentVersion)
             assertTrue(c.sharing.isOn && c.sharing.active)
             assertEquals(expected, c.sharing.state.consentVersion)
@@ -541,7 +711,7 @@ class SharingTest : OpenChecked() {
             repeat(30) { session(c, 0.1) }
             settle(c, 31)
             assertTrue("no sheet: $asked", asked.isEmpty())
-            assertNull(c.sharing.askNow())
+            assertFalse(c.sharing.askNow())
             val starts = stub.starts().drop(before)
             assertEquals(31, starts.size)
             c.background()
@@ -570,30 +740,53 @@ class SharingTest : OpenChecked() {
         storedState("{\"v\":1,\"consent\":\"declined\",\"asks\":2,\"lastAskSession\":10,\"sessions\":10,\"thanked\":false,\"decidedAt\":1762510000," +
             "\"consentVersion\":null,\"guardian\":false,\"updateAsked\":null}")
         val c = cloud(consent = false)
-        val asked = ArrayList<Pair<Int, ConsentState.Variant>>()
+        val asked = ArrayList<Pair<Int, String>>()
         var n = 0
-        c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) { asked.add(n to it.variant); c.sharing.decline() } }
-        while (n < 40) { n++; session(c, 0.1) }
-        assertEquals("the third and last showing, 7 sessions after 2.0.0's second", listOf(7 to ConsentState.Variant.REASK), asked)
+        c.sharing.prompts = {
+            when (it) {
+                is Sharing.SheetRequest.Consent -> { it.shown(); asked.add(n to it.variant.name); c.sharing.decline() }
+                is Sharing.SheetRequest.Card -> { it.shown(); asked.add(n to "CARD"); it.notNow() }
+                else -> {}
+            }
+        }
+        c.sharing.launched()
+        // a good take a day: 4.0 starts the clock of the last ask at the upgrade (2.0.0 kept no time of it)
+        while (n < 40) { n++; nextDay(c) }
+        assertEquals("the third and last showing, a card, 30 days and 10 sessions after the upgrade", listOf(30 to "CARD"), asked)
         assertEquals(ConsentState.Consent.FINAL, c.sharing.state.consent)
-        assertNull(c.sharing.askNow())
+        assertFalse(c.sharing.askNow())
         assertFalse(c.sharing.isOn)
     }
 
     /** Three "Not now" answers: no fourth sheet, across many sessions and a restart; the settings switch still turns it on. */
     @Test fun aThirdNotNowIsTheLastAskAcrossSessionsAndARestart() {
+        ready()
         val c = cloud(consent = false)
-        val asked = ArrayList<ConsentState.Variant>()
-        c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) { asked.add(it.variant); c.sharing.decline() } }
-        repeat(60) { session(c, 0.1) }
-        assertEquals(listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK, ConsentState.Variant.REASK), asked)
+        val asked = ArrayList<String>()
+        c.sharing.prompts = {
+            when (it) {
+                is Sharing.SheetRequest.Consent -> { it.shown(); asked.add(it.variant.name); c.sharing.decline() }
+                is Sharing.SheetRequest.Card -> { it.shown(); asked.add("CARD"); it.notNow() }
+                else -> {}
+            }
+        }
+        c.sharing.launched()
+        session(c, 0.1)
+        repeat(60) { nextDay(c) }
+        assertEquals("the sheet, then two cards (deck 2026-11-15.1 has the card's lines)", listOf("FIRST", "CARD", "CARD"), asked)
         assertEquals(3, c.sharing.state.asks)
-        assertNull(c.sharing.askNow())
+        assertFalse(c.sharing.askNow())
         // a restart reads the count back
         val again = cloud(consent = false)
-        again.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it.variant) }
-        repeat(30) { session(again, 0.1) }
-        assertNull(again.sharing.askNow())
+        again.sharing.prompts = {
+            when (it) {
+                is Sharing.SheetRequest.Consent -> { it.shown(); asked.add(it.variant.name) }
+                is Sharing.SheetRequest.Card -> { it.shown(); asked.add("CARD") }
+                else -> {}
+            }
+        }
+        repeat(40) { nextDay(again) }
+        assertFalse(again.sharing.askNow())
         assertEquals(3, asked.size)
         assertTrue(again.sharing.items.isEmpty() && stub.starts().isEmpty())
         // only the settings switch turns it on, under the version in force then
@@ -614,15 +807,15 @@ class SharingTest : OpenChecked() {
             val at = Files.createTempDirectory("tj-off").toFile()
             val c = cloud(consent = yesFirst, at = at)
             val asked = ArrayList<Sharing.SheetRequest>()
-            c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it) }
+            c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); if (it is Sharing.SheetRequest.Consent) asked.add(it) }
             c.sharing.setOn(false)
             assertFalse(c.sharing.isOn)
             repeat(30) { session(c, 0.1) }
-            assertNull(c.sharing.askNow())
+            assertFalse(c.sharing.askNow())
             val again = cloud(consent = false, at = at)
-            again.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it) }
+            again.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); if (it is Sharing.SheetRequest.Consent) asked.add(it) }
             repeat(10) { session(again, 0.1) }
-            assertNull(again.sharing.askNow())
+            assertFalse(again.sharing.askNow())
             assertTrue(asked.isEmpty())
             again.sharing.setOn(true)
             assertEquals("share-2026-11-09", again.sharing.state.consentVersion)
@@ -665,7 +858,7 @@ class SharingTest : OpenChecked() {
         assertFalse(d.sharing.isOn)
         assertTrue(d.sharing.items.isEmpty())
         val asked = ArrayList<Sharing.SheetRequest>()
-        d.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it) }
+        d.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); if (it is Sharing.SheetRequest.Consent) asked.add(it) }
         repeat(10) { session(d, 0.1) }
         assertTrue("not asked after a deletion", asked.isEmpty())
         at.deleteRecursively()
@@ -799,12 +992,14 @@ class SharingTest : OpenChecked() {
         assertEquals("share-2026-11-09", deck)
         assertNull(c.sharing.consentTextSha256)
         val asked = ArrayList<Sharing.SheetRequest>()
-        c.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) asked.add(it) }
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); if (it is Sharing.SheetRequest.Consent) asked.add(it) }
         session(c, 3.0)
         settle(c)
         assertFalse(stub.starts().single().json!!.containsKey("consent_text_sha256"))
         // refused wording changes nothing
-        for (bad in listOf(mapOf("sheet.nope" to "x"), mapOf("sheet.what" to "  "), mapOf("sheet.what" to ""))) {
+        // SDK 4.0: the keys deck 2026-11-19.1 removed are unknown keys like any other
+        val removed = listOf("title", "body", "confirm", "share").map { mapOf("sheet.guardian.$it" to "x") }
+        for (bad in listOf(mapOf("sheet.nope" to "x"), mapOf("sheet.what" to "  "), mapOf("sheet.what" to "")) + removed) {
             try { c.sharing.setWording(bad); fail("accepted $bad") } catch (_: IllegalArgumentException) {}
             assertEquals(deck, c.sharing.copy.consentVersion)
             assertTrue(c.sharing.isOn)
@@ -819,16 +1014,17 @@ class SharingTest : OpenChecked() {
         // the learner agreed to the deck's words: still on, never asked, the deck's version and no hash
         assertTrue(c.sharing.isOn)
         repeat(10) { session(c, 0.1) }
-        assertNull(c.sharing.askNow())
+        assertFalse(c.sharing.askNow())
         settle(c, 11)
         assertTrue(asked.isEmpty())
         assertTrue(stub.starts().all { it.json!!["consent_version"] == deck && !it.json!!.containsKey("consent_text_sha256") })
 
         // a learner who agrees under the app's words, then the app changes them
         val at = Files.createTempDirectory("tj-w").toFile()
+        ready(at)
         val d = cloud(consent = false, at = at)
         d.sharing.setWording(words)
-        d.sharing.prompts = { if (it is Sharing.SheetRequest.Consent) { asked.add(it); d.sharing.accept() } }
+        d.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); if (it is Sharing.SheetRequest.Consent) { asked.add(it); d.sharing.accept() } }
         session(d, 0.2)
         assertEquals(1, asked.size)
         assertEquals("custom-df8c4e50965be0005aaca5d6", d.sharing.state.consentVersion)
@@ -840,7 +1036,7 @@ class SharingTest : OpenChecked() {
         assertTrue(d.sharing.isOn)
         val before = stub.starts().size
         repeat(10) { session(d, 0.1) }
-        assertNull(d.sharing.askNow())
+        assertFalse(d.sharing.askNow())
         settle(d, 10)
         assertEquals(1, asked.size)
         val js = stub.starts().drop(before).map { it.json!! }
@@ -854,9 +1050,15 @@ class SharingTest : OpenChecked() {
         at.deleteRecursively()
 
         // a learner who agrees after the change records the new version and its hash
-        val e = cloud(consent = false, at = Files.createTempDirectory("tj-w2").toFile())
+        val eAt = Files.createTempDirectory("tj-w2").toFile()
+        ready(eAt)
+        val e = cloud(consent = false, at = eAt)
         e.sharing.setWording(newer)
-        assertEquals(ConsentState.Variant.FIRST, e.sharing.askNow())
+        val eAsked = ArrayList<Sharing.SheetRequest>()
+        e.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown(); eAsked.add(it) }
+        session(e, 0.2, speech = 100)
+        assertTrue(e.sharing.askNow())
+        assertEquals(listOf<Sharing.SheetRequest>(Sharing.SheetRequest.Consent(ConsentState.Variant.FIRST)), eAsked)
         e.sharing.accept()
         assertEquals(newVersion, e.sharing.state.consentVersion)
         assertEquals(e.sharing.consentTextSha256, e.sharing.state.consentTextSha256)
@@ -868,6 +1070,7 @@ class SharingTest : OpenChecked() {
 
     /** 2.0.1: under the app's own wording nothing is captured before the grant; withdrawal and deletion work as for the deck's. */
     @Test fun ownWordingNeverSharesBeforeTheGrantAndWithdrawalWorks() {
+        ready()
         val c = cloud(consent = false)
         c.sharing.setWording(mapOf("sheet.title" to "Help other learners", "sheet.share" to "Share", "sheet.not_now" to "Not now"))
         assertEquals("custom-a33668d3d103a75b669688e4", c.sharing.copy.consentVersion)
@@ -875,8 +1078,10 @@ class SharingTest : OpenChecked() {
         session(c, 3.0)
         c.sharing.outbox.drain(ignoringBackoff = true)
         assertTrue("offered is not consent", c.sharing.items.isEmpty() && stub.starts().isEmpty())
-        assertEquals(ConsentState.Variant.FIRST, c.sharing.askNow())
+        c.sharing.prompts = { (it as? Sharing.SheetRequest.Consent)?.shown() }
+        assertTrue(c.sharing.askNow())
         c.sharing.accept()
+        c.sharing.prompts = null
         session(c, 3.0)
         settle(c)
         assertEquals("a33668d3d103a75b669688e45d3a674fc52a754ee197dd502e88e30baab0e0ab", stub.starts().single().json!!["consent_text_sha256"])
@@ -903,32 +1108,47 @@ class SharingTest : OpenChecked() {
     /** 2.0.1: the app's own UI is asked where the SDK counts an ask; asks and answers reach the telemetry as for the SDK's sheet. */
     @Suppress("UNCHECKED_CAST")
     @Test fun ownUiAsksAreCountedLikeTheSheetAndReachTelemetry() {
+        // a re-ask due: the app's own UI is handed it (the card: deck 2026-11-15.1 has its lines), shows the deck's
+        // strings, never says it is shown, and the learner taps "Not now": the answer counts the ask
+        storedState(AskKit.reaskDue(stub.clock()))
         val c = cloud(consent = false)
         val asked = ArrayList<Sharing.SheetRequest>()
-        // the app's own UI: it shows the deck's strings and the learner taps "Not now"
         c.sharing.prompts = { r ->
             asked.add(r)
-            if (r is Sharing.SheetRequest.Consent) {
-                assertTrue(c.sharing.copy["sheet.what"].isNotEmpty())
-                c.sharing.decline()
+            if (r is Sharing.SheetRequest.Card) {
+                assertEquals(c.sharing.copy["card.line"], r.line)
+                assertTrue(r.line.isNotEmpty() && r.openLabel.isNotEmpty() && r.notNowLabel.isNotEmpty())
+                r.notNow()
             }
         }
+        c.sharing.launched()
         session(c, 0.2)
-        repeat(7) { session(c, 0.1) }
-        assertEquals("the first ask and one re-ask 7 sessions later, as for the SDK's sheet",
-            listOf(ConsentState.Variant.FIRST, ConsentState.Variant.REASK), asked.map { (it as Sharing.SheetRequest.Consent).variant })
+        assertEquals(1, asked.size)
+        assertTrue("the re-ask is the card: $asked", asked.single() is Sharing.SheetRequest.Card)
+        assertEquals(2, c.sharing.state.asks)
+        assertEquals(ConsentState.Consent.DECLINED, c.sharing.state.consent)
         assertTrue(c.sharing.items.isEmpty())
-        // at the app's own moment the learner taps "Share"
-        c.sharing.prompts = null
-        assertEquals(ConsentState.Variant.REASK, c.sharing.askNow())
-        c.sharing.accept()
         // the settings switch is not a sheet answer
-        c.sharing.setOn(false)
         c.sharing.setOn(true)
+        c.sharing.setOn(false)
         c.background()
         val b = stub.parse(c.telemetry.pendingReports().single().readBytes())
-        assertEquals(3.0, b["share_asked"])
-        assertEquals(1.0, b["share_yes"])
-        assertEquals(2.0, b["share_no"])
+        assertEquals(1.0, b["share_asked"])
+        assertFalse(b.containsKey("share_yes"))
+        assertEquals(1.0, b["share_no"])
+        // at the app's own moment another learner taps "Share" on the app's own UI
+        val at = Files.createTempDirectory("tj-own").toFile()
+        ready(at)
+        val d = cloud(consent = false, at = at)
+        d.sharing.prompts = { r -> if (r is Sharing.SheetRequest.Consent) d.sharing.accept() }
+        d.sharing.launched()
+        session(d, 0.2, speech = 100)
+        assertTrue(d.sharing.askNow())
+        assertTrue(d.sharing.isOn)
+        d.background()
+        val e = stub.parse(d.telemetry.pendingReports().single().readBytes())
+        assertEquals(1.0, e["share_asked"])
+        assertEquals(1.0, e["share_yes"])
+        assertFalse(e.containsKey("share_no"))
     }
 }

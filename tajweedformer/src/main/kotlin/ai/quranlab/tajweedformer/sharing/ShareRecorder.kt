@@ -19,7 +19,8 @@ internal data class Take(
  * vector `takes_join.json`:
  *
  * - When a take ends while sharing is on, its recording stays open for the JOIN WINDOW ([window]: the signed
- *   config's `flags.share_join_ms`, a whole number 0 to 10000; absent or anything else 3000; 0 never joins).
+ *   config's `flags.share_join_ms`, a whole number 0 to 60000 from SDK 4.0, 0 to 10000 before it; absent or anything
+ *   else 3000; 0 never joins; contract sdk_4.0.0/SHARE_JOIN_40.md, section 23).
  * - The next take joins it when it starts within the window (its start minus the end of the previous take that had
  *   audio, wall ms, at most the window) with the same input sample rate, while the app is in the foreground, sharing
  *   is still on, and the contributor, the consent version and the model revision are the recording's: its audio
@@ -42,7 +43,8 @@ internal data class Take(
  */
 internal object TakeJoin {
     const val DEFAULT_WINDOW_MS = 3000
-    const val MAX_WINDOW_MS = 10_000
+    /** SDK 4.0 (section 23): 60 s (2.0.3 to 3.x: 10 s). Also the largest gap a take list holds. */
+    const val MAX_WINDOW_MS = 60_000
     /** A recording holds at most 20 minutes of audio: a take that would take it further starts a new one. */
     const val CAP_MS = 20 * 60 * 1000L
     /** The take list call takes at most 256 entries: the 257th take starts a new recording. */
@@ -80,7 +82,7 @@ internal object TakeJoin {
     @JvmStatic
     fun gapPrevMs(gap: Long): Int? = if (gap < 0 || gap > GAP_PREV_MAX_MS) null else minOf((gap + 50) / 100 * 100, GAP_PREV_MAX_MS).toInt()
 
-    /** `flags.share_join_ms`: a whole number 0 to 10000, else [DEFAULT_WINDOW_MS] (a JSON number reads as a Double). */
+    /** `flags.share_join_ms`: a whole number 0 to 60000, else [DEFAULT_WINDOW_MS] (a JSON number reads as a Double). */
     @JvmStatic
     fun window(v: Any?): Int {
         if (v is Boolean || v !is Number) return DEFAULT_WINDOW_MS

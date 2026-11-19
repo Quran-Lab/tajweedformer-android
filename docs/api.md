@@ -17,6 +17,8 @@ public class TajweedClient
     public suspend fun diagnose(): TajweedDiagnosis
     public fun background()
     public fun foreground()
+    public companion object
+        public val current: TajweedClient?
 public class TajweedAnalytics
     public fun reportChecks(rule: String, checked: Int, flagged: Int)
 ```
@@ -26,10 +28,7 @@ public class TajweedClientOptions
     public val appId: String?
     public val appVersion: String?
     public val storage: File?
-    public val analytics: Analytics
-    public val audience: Audience
-    public enum class Analytics
-    public enum class Audience
+    public val unmeteredOnly: Boolean
 public class TajweedSessionOptions
     public val context: String?
     public val sampleRate: Int
@@ -69,7 +68,7 @@ public class TajweedSession
     public suspend fun finish(): TajweedHeads
     public fun cancel()
     public val backend: TajweedBackend
-    public fun reportRecited(surah: Int, ayahFrom: Int, ayahTo: Int)
+    public fun reportRecited(surah: Int, ayahFrom: Int, ayahTo: Int, outcome: RecitedOutcome? = null, perAyah: Map<Int, RecitedOutcome>? = null)
 ```
 
 ```kotlin
@@ -229,6 +228,7 @@ public class TajweedDiagnosis
     public val droppedChunks: Long,
     public val connection: String,
     public val downloadProtocol: String?
+    public val protectedModel: Map<String, Any?>?
     public fun toMap(): Map<String, Any?>
     public fun toJson(): String
 ```
@@ -238,6 +238,16 @@ public open class TajweedError
     public val code: String,
     public val fix: String
     public val docs: String
+```
+
+```kotlin
+public class RecitedOutcome
+    public val correct: Boolean,
+    public val mistakes: Int?,
+    public val rules: List<String>,
+    public companion object
+        public fun correct(): RecitedOutcome
+        public fun incorrect(mistakes: Int? = null, rules: List<String> = emptyList()): RecitedOutcome
 ```
 
 ## Android only

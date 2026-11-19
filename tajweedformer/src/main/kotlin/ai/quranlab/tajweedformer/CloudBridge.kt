@@ -26,6 +26,8 @@ internal class CloudBridge(
     private val sessionOpen: (Boolean) -> Unit = {},
     private val profilePrefix: String = SdkInfo.PLATFORM,
 ) : SdkObserver {
+    /** A cohort's backend as the server's schema has it: `cpu` or `npu:<soc>` (`npu:unknown` without a SoC), never a bare
+     *  `npu`. A fallback and a self-test outside a take named it `npu` until 3.1.5, and the server refused the whole report. */
     private fun backendName(b: Backend, soc: String?) = if (b == Backend.NPU) "npu:${soc ?: "unknown"}" else "cpu"
 
     override fun onModelLoad(load: ModelLoadInfo) =
@@ -33,7 +35,7 @@ internal class CloudBridge(
             ModelIds.build(load.revision)))
 
     override fun onSelfTest(result: SelfTestResult) =
-        cloud.onSelfTest(ModelIds.version(result.revision), result.context ?: "", result.backend.key, result.passed, ModelIds.build(result.revision))
+        cloud.onSelfTest(ModelIds.version(result.revision), result.context ?: "", backendName(result.backend, result.soc), result.passed, ModelIds.build(result.revision))
 
     override fun onBackendSelected(choice: BackendChoice) {
         if (!choice.isFallback) return
@@ -46,28 +48,21 @@ internal class CloudBridge(
             "denylist" -> TajweedObserver.FallbackReason.OTHER
             else -> TajweedObserver.FallbackReason.NPU_UNAVAILABLE
         }
-        cloud.onFallback(ModelIds.version(choice.revision), choice.context ?: "", "npu", reason, ModelIds.build(choice.revision))
+        cloud.onFallback(ModelIds.version(choice.revision), choice.context ?: "", backendName(Backend.NPU, choice.soc), reason, ModelIds.build(choice.revision))
     }
 
-    /** The NPU's time to ready as a model load of backend `npu:<soc>`. */
-    override fun onAcceleratorState(state: ai.quranlab.tajweedformer.accel.AcceleratorState, key: ai.quranlab.tajweedformer.accel.AcceleratorKey) {
-        if (state is ai.quranlab.tajweedformer.accel.AcceleratorState.Ready) {
-            cloud.onModelLoad(TajweedObserver.ModelLoad(ModelIds.version(key.revision), key.context, "npu:${key.soc ?: "unknown"}",
-                state.timeToReadyMs.toDouble(), false, ModelIds.build(key.revision)))
-        }
-    }
 
-    override fun onPromotion(event: PromotionEvent) = cloud.onPromotion(event)
 
-    override fun onFailover(event: AcceleratorFailoverEvent) = cloud.onFailover(event)
 
-    override fun onBlankConfirmed(event: BlankConfirmedEvent) = cloud.onBlankConfirmed(event)
 
     override fun onDownloadFinished(result: DownloadResult) {
         if (result.ok && result.networkBytes == 0L) return
+        // a file of no model version (the app's model data) is not a download of a model: until 3.1.5 it went out with the
+        // version "" (the sample clips too, which 4.0 fetches with their build), and the server refused the whole report
+        if (result.revision.isEmpty()) return
         val profile = if (result.role.startsWith("npu")) "$profilePrefix-npu" else "$profilePrefix-cpu"
         cloud.onDownload(TajweedObserver.Download(ModelIds.version(result.revision), profile, result.networkBytes, result.ok, result.resumedFrom > 0,
-            ModelIds.build(result.revision)))
+            ModelIds.build(result.revision), if (result.ok) null else result.failureReason ?: "other"))
     }
 
     override fun onSessionStart(session: SessionInfo) {
@@ -98,8 +93,16 @@ internal class CloudBridge(
             audioMs = stats.audioMs, computeUs = stats.computeUs, speechFrames = stats.speechFrames, silenceFrames = stats.silenceFrames,
             tokens = stats.tokens,
             // no sample reached the take (an app that opens a session only to warm the engine, and cancels it at once)
-            withoutAudio = stats.audioSeconds <= 0.0))
+            withoutAudio = stats.audioSeconds <= 0.0, end = endOf(stats)))
         sessionOpen(false)
+    }
+
+    /** SHARE_ASK_40 20.2 and 20.10: finished by the app or with `SILENCE`, `LIMIT`, `SOURCE_END` is `normal`; with
+     *  `BACKGROUND`, `HIDDEN`, `INTERRUPTED` `interrupted`; failed `error`; cancelled `cancelled`. */
+    private fun endOf(stats: SessionStats): String = when (stats.outcome) {
+        "finished" -> if (stats.endedBy in setOf("BACKGROUND", "HIDDEN", "INTERRUPTED")) "interrupted" else "normal"
+        "failed" -> "error"
+        else -> "cancelled"
     }
 
     override fun onError(where: String, error: Throwable) = cloud.onIssue(where, error.javaClass.simpleName, error)

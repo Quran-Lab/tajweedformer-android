@@ -55,8 +55,25 @@ class TelemetryVectorsTest : OpenChecked() {
 
     private val six = listOf("ayahs", "surah_ayahs", "coverage", "words", "rule_checks", "rule_flags")
 
+    /** SDK 4.0 (SPEC 17.1): the app's report is its fallback count, `app_ayahs` and `app_surah_ayahs`; `coverage` is
+     *  not sent. The 3.0 vectors' app-reported fields under the 4.0 names. */
+    private val four = listOf("app_ayahs", "app_surah_ayahs", "words", "rule_checks", "rule_flags")
+
+    @Suppress("UNCHECKED_CAST")
+    private fun v40(x: Any?): Any? = when (x) {
+        is Map<*, *> -> x.entries.filter { it.key != "coverage" }.associate { (k, v) ->
+            (when (k) { "ayahs" -> "app_ayahs"; "surah_ayahs" -> "app_surah_ayahs"; else -> k }) to (if (k == "reported") v40(v) else v)
+        }
+        is List<*> -> x.filter { it != "coverage" }.map { when (it) { "ayahs" -> "app_ayahs"; "surah_ayahs" -> "app_surah_ayahs"; else -> it } }
+        else -> x
+    }
+
     /** The day's app-reported fields and the `reported` list, as the body has them. */
-    private fun reported(t: Telemetry): Map<String, Any?> = (t.peek(ctx) ?: emptyMap()).filterKeys { it in six || it == "reported" }
+    private fun reported(t: Telemetry): Map<String, Any?> = (t.peek(ctx) ?: emptyMap()).filterKeys { it in four || it == "reported" }
+
+    /** The 17.8 and 17.9 fields of SDK 4.0, which the 3.0 example payload does not have. */
+    private val fields40 = setOf("juz_ayahs", "hour_speech_s", "take_s", "session_s", "learner", "learner_gap", "streak", "repeat_ayahs",
+        "recited_takes", "lease", "app_ayahs", "app_surah_ayahs", "judged", "judged_surah_ayahs", "correct_surah_ayahs", "judged_tenure", "trend")
 
     private fun same(name: String, want: Any?, got: Any?) {
         when (want) {
@@ -104,15 +121,16 @@ class TelemetryVectorsTest : OpenChecked() {
         // the whole body has no field the server's closed schema does not know (the example is one whole delta)
         val example = v["example_payload"] as Map<String, Any?>
         val body = t.peek(ctx)!!
-        assertEquals(emptySet<String>(), body.keys - example.keys)
+        assertEquals(emptySet<String>(), body.keys - example.keys - fields40)
         assertEquals(emptySet<String>(), cohorts.flatMap { it.keys }.toSet() - (example["cohorts"] as List<Map<String, Any?>>)[0].keys)
         // the example is the vector's own version's; the body names this SDK's (the next line)
         assertTrue(ai.quranlab.tajweedformer.ModelManifest.versionAtLeast(SdkInfo.VERSION, example["sdk_version"] as String))
         assertEquals(SdkInfo.VERSION, body["sdk_version"])
         assertEquals(2.0, body["v"])
         // a day on which the app called neither API: none of the six fields and no `reported`
-        assertEquals((v["nothing_reported"] as Map<String, Any?>)["fields"], reported(t))
+        assertEquals(v40((v["nothing_reported"] as Map<String, Any?>)["fields"]), reported(t))
         assertEquals(v["reported_order"], six)
+        assertEquals(v40(v["reported_order"]), four)
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -136,12 +154,12 @@ class TelemetryVectorsTest : OpenChecked() {
         val seq = r["sequence"] as Map<String, Any?>
         val t = Telemetry(temp()) { noon }
         for (c in seq["calls"] as List<Map<String, Any?>>) assertEquals("${c["call"]}", c["result"], call(t, c["call"] as List<Any?>))
-        same("the day after the sequence", seq["day_after"], reported(t))
+        same("the day after the sequence", v40(seq["day_after"]), reported(t))
         // 32 rules a day: the 33rd is dropped and the call still returns normally
         val many = r["rules_a_day"] as Map<String, Any?>
         val u = Telemetry(temp()) { noon }
         assertEquals(many["results"], (many["calls"] as List<List<Any?>>).map { call(u, it) })
-        same("the day after 33 rules", many["day_after"], reported(u))
+        same("the day after 33 rules", v40(many["day_after"]), reported(u))
         // the rules are kept with the day, across its deltas: after a send point the 33rd is still dropped
         assertEquals(1, u.seal(ctx))
         assertEquals("ok", call(u, listOf("rule_40", 3.0, 1.0)))
@@ -207,8 +225,11 @@ class TelemetryVectorsTest : OpenChecked() {
         val files = TestKit.v4Files()
         TestKit.writeDecoded(dir, files, TestKit.sign(TestKit.manifest(files)))
         val engine = Engine()
+        // SDK 4.0: the take's report goes to the recited count (no Core here: the detector counts nothing, so a take
+        // that finished counts the app's report, once; a cancelled or failed one counts nothing)
+        val rc = ai.quranlab.tajweedformer.cloud.RecitedCount(temp(), t, { noon }, core = { null })
         val model = TajweedModel.of(ModelFolder.open(dir, TestKit.verifier), ModelHost(verifier = TestKit.verifier, engine = { _, _, _ -> engine },
-            recited = { x -> t.recited(x.first, x.second, x.third) }))
+            takeStarted = { s -> rc.takeStarted(s) }, takeEnded = { s, f -> rc.takeEnded(s, f) }, recited = { s, x -> rc.report(s, x) }))
         val piece = FloatArray(5120)
         for (take in r["takes"] as List<Map<String, Any?>>) withTimeout(60_000) {
             val name = take["name"] as String
@@ -249,7 +270,8 @@ class TelemetryVectorsTest : OpenChecked() {
                 assertEquals("$name: how the take ended", if (how.startsWith("ended:")) listOf(how) else emptyList(), ended)
             }
             assertEquals("$name results", take["results"], results)
-            same("$name: the day after", take["day_after"], reported(t))
+            rc.flush()
+            same("$name: the day after", v40(take["day_after"]), reported(t))
         }
         model.close()
     }

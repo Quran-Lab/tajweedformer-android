@@ -55,7 +55,7 @@ internal class OggOpusWriter @JvmOverloads constructor(
     /** The bit rate of segment n (1-based), asked when it opens; null: [settings]' bitrate throughout. */
     private val bitrateFor: ((Int) -> Int)? = null,
     private val onSegment: (OggSegment) -> Unit = {},
-) : AutoCloseable {
+) : ShareWriter {
     private val encoder: OpusEncoding
     private val resampler: ShareResampler?
     private var out: FileOutputStream? = null
@@ -97,12 +97,12 @@ internal class OggOpusWriter @JvmOverloads constructor(
     var lastGranule = 0L
         private set
 
-    val preSkip: Int get() = encoder.preSkip
+    override val preSkip: Int get() = encoder.preSkip
     val packetFrames: Int get() = settings.packetFrames
     val pagePackets: Int get() = settings.pagePackets
 
     /** Audio seconds written so far (at the input rate). */
-    val duration: Double get() = inputFrames.toDouble() / inputRate
+    override val duration: Double get() = inputFrames.toDouble() / inputRate
 
     /** One file. */
     constructor(file: File, inputRate: Int, settings: OpusSettings = OpusSettings.SHARED, serial: Int = Random.nextInt(),
@@ -140,7 +140,7 @@ internal class OggOpusWriter @JvmOverloads constructor(
     }
 
     /** Encodes mono samples at the input rate. */
-    fun append(samples: FloatArray, offset: Int = 0, length: Int = samples.size - offset) {
+    override fun append(samples: FloatArray, offset: Int, length: Int) {
         if (length <= 0 || ended) return
         inputFrames += length
         if (clean.size < length) clean = FloatArray(length)
@@ -160,7 +160,7 @@ internal class OggOpusWriter @JvmOverloads constructor(
     }
 
     /** Flushes the resampler and the encoder, writes the last pages and closes the last segment. Returns the duration in ms. */
-    fun finish(): Int {
+    override fun finish(): Int {
         if (!ended) {
             ended = true
             resampler?.flush { x, o, n -> encoder.encodeTo(x, o, n, sink) }
@@ -173,7 +173,7 @@ internal class OggOpusWriter @JvmOverloads constructor(
     }
 
     /** Stops without finishing (the caller removes the files). */
-    fun abandon() {
+    override fun abandon() {
         ended = true
         try { out?.close() } catch (_: IOException) {}
         out = null

@@ -22,6 +22,18 @@ import java.io.File
  * `client.background()` and `client.foreground()` when the app has one. Set `options.appId` and
  * `options.appVersion` to the app's own.
  */
+/** The process's ABI as an error report names it: `arm64`, `x86_64` (`x86_64_mac` on a Mac), `x86`. */
+internal fun jvmAbi(arch: String? = System.getProperty("os.arch"), os: String? = System.getProperty("os.name")): String? {
+    val a = arch?.lowercase() ?: return null
+    val mac = os?.lowercase()?.startsWith("mac") == true
+    return when (a) {
+        "aarch64", "arm64" -> "arm64"
+        "amd64", "x86_64" -> if (mac) "x86_64_mac" else "x86_64"
+        "x86", "i386", "i686" -> "x86"
+        else -> null
+    }
+}
+
 @JvmOverloads
 public fun TajweedClient(key: String, storage: File, options: TajweedClientOptions = TajweedClientOptions()): TajweedClient {
     val dir = options.storage ?: storage
@@ -30,14 +42,21 @@ public fun TajweedClient(key: String, storage: File, options: TajweedClientOptio
         storage = dir,
         app = AppIdentity(options.appId ?: "ai.quranlab.tajweedformer.desktop", AppIdentity.cleanVersion(options.appVersion)),
         device = DeviceProfile(DeviceProfile.deviceClass(System.getProperty("os.arch") ?: "jvm"), null,
-            os.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: 1, os.take(32)),
+            os.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: 1, os.take(32), abi = jvmAbi()),
         contributorKeys = FileContributorKeyStore(File(dir, "keys")),
         secretBox = PlainSecretBox,
     )
-    // the install records' key: derived from the machine id and the user name; a machine without an id keeps a key
-    // file in the storage folder (SPEC 15.2). Where the id is read by a command (Windows, macOS) the id that was read is
-    // kept beside it, and serves when a later read fails
-    val cloudDir = File(dir, "cloud")
-    return TajweedClient(key, options, ClientPlatform(cloud = env, installKeys = MachineInstallKey(File(cloudDir, "install.key"),
-        keptId = File(cloudDir, MachineInstallKey.KEPT_ID_NAME).takeIf { MachineInstallKey.READ_BY_COMMAND })))
+    // SDK 4.0: the install's keys are software P-256 keys in the storage folder, and the
+    // boot's id is the system's (Linux) or the boot's start to the minute
+    return TajweedClient(key, options, ClientPlatform(cloud = env, bootId = bootId()))
+}
+
+/** The boot's id for the Core's clock: Linux's boot_id, else the boot's start to the minute (SHA-256 of either). */
+internal fun bootId(): ByteArray {
+    val text = try {
+        File("/proc/sys/kernel/random/boot_id").takeIf { it.isFile }?.readText()?.trim()
+    } catch (_: Exception) {
+        null
+    } ?: "boot-at:${(System.currentTimeMillis() - System.nanoTime() / 1_000_000) / 60_000}"
+    return java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
 }

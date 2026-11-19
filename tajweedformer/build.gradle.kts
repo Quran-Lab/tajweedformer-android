@@ -1,3 +1,4 @@
+import java.security.MessageDigest
 import java.util.zip.ZipFile
 
 plugins {
@@ -25,18 +26,15 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
         ndk {
-            // x86_64 is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks, on the CPU engine only:
-            // the 35 conformance clips are bit-exact on it through this library (DeviceEndToEndTest on an x86_64
-            // emulator, scripts/emulator_proof.py). SdkInfo.ABIS says the same.
+            // x86_64 is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: the Core's x86_64 build
+            // is development-only (its release record lists it in `dev_only`: it leases to development keys only).
+            // SdkInfo.ABIS says the same.
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
         externalNativeBuild {
             cmake {
-                // the engine is built in its exact release configuration by native/CMakeLists.txt
+                // the JNI bridge to the Core and the Opus encoder; the Core itself is prebuilt (coreShip below)
                 arguments += listOf("-DANDROID_STL=none")
-                // another engine checkout than the submodule (the JVM build's variable of the same name)
-                System.getenv("ZF_ENGINE_DIR")?.let { arguments += "-DZF_ENGINE_DIR=$it" }
-                // -PnativeRelease: optimised native code in every variant (the device test's timing)
                 if (project.hasProperty("nativeRelease")) arguments += "-DCMAKE_BUILD_TYPE=Release"
                 targets += listOf("tajweedformer_jni", "tajweedformer_opus")
             }
@@ -56,10 +54,23 @@ android {
         }
     }
 
+    // The Core ships as the file its release tool built and stripped: its integrity digest is over
+    // that file as mapped, so no build step may strip or rewrite it (an app's own build neither: see the README).
+    packaging {
+        jniLibs {
+            keepDebugSymbols += "**/libqlcore.so"
+        }
+    }
+
     // src/main/kotlin is plain JVM Kotlin, shared with :tajweedformer-jvm; src/android/kotlin is the
     // Android-only part (microphone, SoC, network, the one-call client).
     sourceSets {
         getByName("main").kotlin.srcDir("src/android/kotlin")
+        // the Core's shipped libraries, renamed libqlcore.so per ABI by prepareCore
+        getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("core-jni"))
+        // the 4.0 test kit and the contract's vectors, shared with the JVM tests
+        getByName("androidTest").kotlin.srcDir("src/sharedTest/kotlin")
+        getByName("androidTest").resources.srcDir("src/sharedTest/resources")
     }
 
     publishing {
@@ -81,6 +92,36 @@ android {
     }
 }
 
+// The Quran Lab Core (quranlab-core, closed): the shipped binaries of one release, as its release tool wrote them
+// (`make_release.py build`: <out>/ship/android-<abi>/qlcore.so and <out>/record.json). -PcoreShip=<out> names the
+// release folder; the default is build/core-release (scripts/build_core.py makes it: the test release 4.0.0-c1).
+// Each file is copied as libqlcore.so, unchanged (the name Android packages and loads), and its SHA-256 is checked
+// against the release record, so a binary that is not the release's never ships.
+val coreShip: File = (project.findProperty("coreShip") as String?)?.let(::file) ?: rootProject.layout.buildDirectory.dir("core-release").get().asFile
+val prepareCore by tasks.registering {
+    description = "Copies the Core's shipped libraries (libqlcore.so per ABI) into the native libraries, checked against the release record."
+    val out = layout.buildDirectory.dir("core-jni")
+    outputs.dir(out)
+    outputs.upToDateWhen { false }
+    doLast {
+        val record = coreShip.resolve("record.json")
+        check(record.isFile) { "no Core release at $coreShip (scripts/build_core.py, or -PcoreShip=<a release folder>)" }
+        @Suppress("UNCHECKED_CAST")
+        val files = (groovy.json.JsonSlurper().parse(record) as Map<String, Any?>)["files"] as Map<String, String>
+        for (abi in listOf("arm64-v8a", "armeabi-v7a", "x86_64")) {
+            val rel = "ship/android-$abi/qlcore.so"
+            val src = coreShip.resolve(rel)
+            check(src.isFile) { "the Core release has no $rel" }
+            val sha = MessageDigest.getInstance("SHA-256").digest(src.readBytes()).joinToString("") { "%02x".format(it) }
+            check(sha == files[rel]) { "$rel is not the file the release record names (sha256 $sha)" }
+            val dst = out.get().asFile.resolve("$abi/libqlcore.so")
+            dst.parentFile.mkdirs()
+            src.copyTo(dst, overwrite = true)
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(prepareCore) }
+
 // Only the types of NAMING.md are public: every public declaration says so, everything else is internal.
 kotlin { explicitApi() }
 
@@ -94,8 +135,8 @@ publishing {
             pom {
                 name.set("TajweedFormer for Android")
                 description.set(
-                    "TajweedFormer V4 on Android: an on-device inference engine for Quran recitation. Audio in; the model's " +
-                        "raw heads, greedy tokens and the decoded layer out, chunk by chunk while the learner recites."
+                    "TajweedFormer V4 on Android: on-device inference for Quran recitation, through the Quran Lab Core. Audio " +
+                        "in; the model's raw heads, greedy tokens and the decoded layer out, chunk by chunk while the learner recites."
                 )
                 url.set("https://github.com/Quran-Lab/tajweedformer-android")
                 licenses {
@@ -166,11 +207,11 @@ val centralBundle by tasks.registering(Zip::class) {
                 check("$base$file.asc" in names) { "the bundle has no signature of $base$file" }
             }
         }
-        // the native engine must be in the AAR for both Android ABIs
+        // the Core, its bridge and the Opus encoder must be in the AAR for both Android ABIs
         val aar = bundleDir.get().asFile.walkTopDown().single { it.name == "tajweedformer-${project.version}.aar" }
         val entries = ZipFile(aar).use { z -> z.entries().asSequence().map { it.name }.toSet() }
         for (abi in listOf("arm64-v8a", "armeabi-v7a")) {
-            for (lib in listOf("libtajweedformer_jni.so", "libtajweedformer_opus.so")) {
+            for (lib in listOf("libqlcore.so", "libtajweedformer_jni.so", "libtajweedformer_opus.so")) {
                 check("jni/$abi/$lib" in entries) { "the AAR has no jni/$abi/$lib" }
             }
         }
@@ -186,6 +227,14 @@ dependencies {
     // when Quran Lab's signed config gives the Cloud project number (flags.play_integrity_project_number), for model
     // downloads and attested sharing; without it, or where Play services are missing, the token is unattested
     implementation("com.google.android.play:integrity:1.4.0")
+    // R2: the Quran Lab Core opens LiteRT's libLiteRt.so itself, when the app has it, and hands it the accelerator
+    // program from its own memory (the SDK's Kotlin calls nothing of LiteRT). LiteRT is NOT a dependency of the AAR
+    // (Stage B, 11-18): at 4.0's launch no NPU program is served, and LiteRT 2.2.0's litert and litert-api share one
+    // namespace, which the Android Gradle plugin 9 refuses unless the app sets android.uniquePackageNames=false. An app
+    // that wants the NPU adds com.google.ai.edge.litert:litert 2.2.0 or later itself; without it the SDK fetches no NPU
+    // program (DispatchLibrary.runtimeMissing) and runs the CPU engine. The device tests are such an app: their APK
+    // adds LiteRT, so the NPU path runs there as it would in an app that adds it.
+    androidTestRuntimeOnly("com.google.ai.edge.litert:litert:2.2.0")
 
     androidTestImplementation("androidx.test:runner:1.5.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

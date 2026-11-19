@@ -46,9 +46,9 @@ internal class QuranLabApi(
         val r = try {
             http.send(HttpRequest(method, base + path, h, bytes))
         } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}", e)
+            throw CloudException(null, "$method $path: ${e.message}", e, path)
         }
-        if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}")
+        if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}", path = path)
         return r
     }
 
@@ -68,6 +68,25 @@ internal class QuranLabApi(
         AppToken.from(call("POST", "/v1/attest", Credential.Key(key), linkedMapOf(
             "platform" to app.platform, "bundle_id" to app.bundleId, "challenge" to challenge, "integrity_token" to integrityToken)))
 
+    // SDK 4.0: the protected model
+
+    /** `GET /v1/attest/challenge` with the app token: a challenge bound to the token's key (the lease's, 18.4.1). */
+    fun challenge(token: String): String =
+        call("GET", "/v1/attest/challenge", Credential.Token(token)).json()?.get("challenge") as? String
+            ?: throw CloudException(ApiError(200, "no_challenge"), "no challenge in the answer")
+
+    /**
+     * `POST /v1/attest` with the install keys (18.4.3): `platform`, `bundle_id`, `challenge`, `install_key`,
+     * `install_sign_key`, `install_sig`, `install_hw`, and on Android `key_attestation`, `previous_cert`,
+     * `integrity_token` when given. The raw answer: 200 carries `token` and `install_cert`.
+     */
+    fun attestInstall(key: QuranLabKey, body: Map<String, Any?>): HttpResponse =
+        call("POST", "/v1/attest", Credential.Key(key), body, expectOk = false)
+
+    /** `POST /v1/model-key` (18.4.4): the raw answer, a lease (200) or a refusal of 18.4.10. */
+    fun modelKey(token: String, body: Map<String, Any?>): HttpResponse =
+        call("POST", "/v1/model-key", Credential.Token(token), body, expectOk = false)
+
     // section 3
 
     /**
@@ -83,7 +102,7 @@ internal class QuranLabApi(
         if (modelVersion != null) q.append("&model_version=${enc(modelVersion)}")
         val extra = if (etag != null) mapOf("if-none-match" to etag) else emptyMap()
         val r = call("GET", "/v1/config$q", cred, extra = extra, expectOk = false)
-        if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}")
+        if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}", path = "/v1/config")
         return r
     }
 
@@ -116,7 +135,7 @@ internal class QuranLabApi(
         cred.apply(h)
         h["content-type"] = "application/json"
         return try { http.send(HttpRequest(method, base + path, h, body)) } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}")
+            throw CloudException(null, "$method $path: ${e.message}", e, path)
         }
     }
 
@@ -206,6 +225,7 @@ internal class AppToken(val token: String, val expiresAt: Long, val attested: Bo
             return AppToken(token, exp, att, via)
         }
 
+        @JvmStatic
         internal fun from(r: HttpResponse): AppToken {
             val o = r.json() ?: throw CloudException(ApiError(r.status, "no_token"), "no token in the answer")
             val t = o["token"] as? String ?: throw CloudException(ApiError(r.status, "no_token"), "no token in the answer")

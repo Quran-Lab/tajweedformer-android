@@ -37,6 +37,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -62,7 +64,6 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
@@ -91,6 +92,9 @@ import androidx.savedstate.findViewTreeSavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -117,7 +121,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 
 /**
- * The look of the Compose sharing sheets (consent, guardian, thanks, settings): background ([container]),
+ * The look of the Compose sharing sheets (consent, thanks, settings): background ([container]),
  * text ([content]), secondary text, accent, corner radius (or a whole [shape]) and the title and body
  * fonts. Since 3.1.1 the sheets follow Quran Lab's sheet design, the same on Android, Apple and web: by default its
  * colours, light or dark with the system's night mode, and the app's `MaterialTheme` primary colour as the accent
@@ -311,10 +315,10 @@ private fun fittedButtonType(labels: List<String>, look: ComposeLook, width: Dp)
 
 /** One of the bar's buttons: [primary] filled with the accent, label on-accent; else the tint, label in the accent or its fallback. */
 @Composable
-private fun SheetButton(label: String, primary: Boolean, look: ComposeLook, type: SheetDesign.Type, enabled: Boolean = true, onClick: () -> Unit) {
+private fun SheetButton(label: String, primary: Boolean, look: ComposeLook, type: SheetDesign.Type, onClick: () -> Unit) {
     val k = look.colors
-    Box(Modifier.alpha(if (enabled) 1f else SheetDesign.DISABLED_ALPHA).clip(RoundedCornerShape(look.radius(SheetDesign.BUTTON_RADIUS)))
-        .background(Color(if (primary) k.accent else k.tint)).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+    Box(Modifier.clip(RoundedCornerShape(look.radius(SheetDesign.BUTTON_RADIUS)))
+        .background(Color(if (primary) k.accent else k.tint)).clickable(role = Role.Button, onClick = onClick)
         .padding(horizontal = SheetDesign.BUTTON_PAD_H.dp, vertical = SheetDesign.BUTTON_PAD_V.dp), contentAlignment = Alignment.Center) {
         SheetText(label, type, if (primary) k.onAccent else k.accentInk, look, align = TextAlign.Center)
     }
@@ -401,15 +405,13 @@ private fun SheetFrame(look: ComposeLook, insetTop: Dp, insetBottom: Dp, startAt
 
 /**
  * The consent sheet, in the design of [SheetDesign]: the deck's lines in the design's order, two equal choices,
- * nothing pre-ticked; the guardian variant asks the parent or guardian to turn the switch on first. [onShare] and
- * [onNotNow] are the buttons, [onDismiss] a tap beside the sheet or a drag down. [insetTop] and [insetBottom]: the
- * system bars (the window is drawn behind them); [startAtEnd]: open scrolled to the end (the screenshot tests).
+ * nothing pre-ticked; the same sheet in every app. [onShare] and [onNotNow] are the buttons,
+ * [onDismiss] a tap beside the sheet or a drag down. [insetTop] and [insetBottom]: the system bars (the window is drawn behind them); [startAtEnd]: open scrolled to the end (the screenshot tests).
  */
 @Composable
 internal fun ConsentSheet(
     c: SharingCopy,
     variant: ConsentState.Variant,
-    guardian: Boolean,
     style: SharingStyle,
     insetTop: Dp,
     insetBottom: Dp,
@@ -421,37 +423,27 @@ internal fun ConsentSheet(
     val look = rememberLook(style, c)
     val k = look.colors
     val s = look.script
-    var confirmed by remember { mutableStateOf(false) }
-    val title: String
-    val body: String
-    if (guardian) {
-        title = c["sheet.guardian.title"]
-        body = c["sheet.guardian.body"]
-    } else {
-        title = c["sheet.title"]
-        body = c["sheet.body"]
-    }
     // the disclosure, each line whole, in this order, with its icon
     val rows = listOf(SheetIcon.MIC to c["sheet.what"], SheetIcon.SHIELD to c["sheet.who"], SheetIcon.TOGGLE to c["sheet.control"])
     CompositionLocalProvider(LocalLayoutDirection provides if (c.rtl) LayoutDirection.Rtl else LayoutDirection.Ltr) {
         SheetFrame(look, insetTop, insetBottom, startAtEnd, onDismiss, bar = { labelWidth ->
-            val share = c[if (guardian) "sheet.guardian.share" else "sheet.share"]
+            val share = c["sheet.share"]
             val notNow = c["sheet.not_now"]
             val type = fittedButtonType(listOf(share, notNow), look, labelWidth)
             EqualButtons(
-                { SheetButton(share, primary = true, look, type, enabled = !guardian || confirmed, onClick = onShare) },
+                { SheetButton(share, primary = true, look, type, onClick = onShare) },
                 { SheetButton(notNow, primary = false, look, type, onClick = onNotNow) },
             )
         }) {
             SheetHeader(look)
             Spacer(Modifier.height(SheetDesign.HEADER_GAP.dp))
-            SheetText(title, SheetDesign.title(s), k.text, look, family = look.titleFont ?: look.bodyFont)
+            SheetText(c["sheet.title"], SheetDesign.title(s), k.text, look, family = look.titleFont ?: look.bodyFont)
             if (variant == ConsentState.Variant.REASK) {
                 Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
                 SheetText(c["reask"], SheetDesign.body(s), k.body, look)
             }
             Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
-            SheetText(body, SheetDesign.body(s), k.body, look)
+            SheetText(c["sheet.body"], SheetDesign.body(s), k.body, look)
             Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
             SheetCard(look, rows = rows.map { (icon, line) -> @Composable { SheetRow(icon, line, look) } })
             c.hadith?.let { h ->
@@ -462,22 +454,8 @@ internal fun ConsentSheet(
                     c.hadithRef?.let { SheetText(it, SheetDesign.reference(s), k.secondary, look) }
                 }
             }
-            if (!guardian) {
-                Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
-                SheetText(c["sheet.mistakes"], SheetDesign.mistakes(s), k.body, look)
-            }
-            if (guardian) {
-                // the parent or guardian turns the switch on first; until then "Share" is disabled (and "Not now" never is)
-                Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
-                SheetCard(look, rows = listOf(@Composable {
-                    Row(Modifier.fillMaxWidth().toggleable(value = confirmed, role = Role.Switch, onValueChange = { confirmed = it })
-                        .padding(vertical = SheetDesign.ROW_PAD_V.dp), verticalAlignment = Alignment.CenterVertically) {
-                        SheetText(c["sheet.guardian.confirm"], SheetDesign.row(s), k.text, look, Modifier.weight(1f))
-                        Spacer(Modifier.width(SheetDesign.ICON_GAP.dp))
-                        SheetSwitchImage(confirmed, look)
-                    }
-                }))
-            }
+            Spacer(Modifier.height(SheetDesign.BLOCK_GAP.dp))
+            SheetText(c["sheet.mistakes"], SheetDesign.mistakes(s), k.body, look)
         }
     }
 }
@@ -488,10 +466,10 @@ internal fun ConsentSheet(
  * as 3.1.0's dialog did on back and on a click outside; a sheet that leaves the composition records nothing.
  */
 @Composable
-internal fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Variant, guardian: Boolean = sharing.guardian,
+internal fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Variant,
                                   style: SharingStyle = SharingStyle(), onDone: (Boolean) -> Unit) {
-    ConsentDialog(sharing.copy, variant, guardian, style) { exit ->
-        exit.record(sharing, guardian)
+    ConsentDialog(sharing.copy, variant, style) { exit ->
+        exit.record(sharing)
         onDone(exit == SheetExit.SHARE)
     }
 }
@@ -505,14 +483,14 @@ internal fun SharingConsentDialog(sharing: Sharing, variant: ConsentState.Varian
  * [startAtEnd]: the device check's pictures.
  */
 @Composable
-internal fun ConsentDialog(c: SharingCopy, variant: ConsentState.Variant, guardian: Boolean, style: SharingStyle, startAtEnd: Boolean = false,
+internal fun ConsentDialog(c: SharingCopy, variant: ConsentState.Variant, style: SharingStyle, startAtEnd: Boolean = false,
                            onExit: (SheetExit) -> Unit) {
     val view = LocalView.current
     val parent = rememberCompositionContext()
     val light = !rememberLook(style, c).colors.dark
     val exit by rememberUpdatedState(onExit)
     val sheet by rememberUpdatedState<@Composable (Dp, Dp) -> Unit> { top, bottom ->
-        ConsentSheet(c, variant, guardian, style, insetTop = top, insetBottom = bottom,
+        ConsentSheet(c, variant, style, insetTop = top, insetBottom = bottom,
             onShare = { exit(SheetExit.SHARE) },
             onNotNow = { exit(SheetExit.NOT_NOW) },
             onDismiss = { exit(SheetExit.CLOSED) },
@@ -550,6 +528,61 @@ internal fun ConsentDialog(c: SharingCopy, variant: ConsentState.Variant, guardi
     }
 }
 
+/**
+ * SDK 4.0's re-ask card (SHARE_ASK_40 20.6): the emblem, [line] (announced politely, never focused) and two equal
+ * buttons, [open] (the accent) and [notNow] (the tint); the sheet's colours and type, corner radius 18, at most 480 wide.
+ */
+@Composable
+internal fun SharingCard(c: SharingCopy, line: String, open: String, notNow: String, style: SharingStyle, onOpen: () -> Unit, onNotNow: () -> Unit) {
+    val look = rememberLook(style, c)
+    val k = look.colors
+    CompositionLocalProvider(LocalLayoutDirection provides if (c.rtl) LayoutDirection.Rtl else LayoutDirection.Ltr) {
+        Column(Modifier.widthIn(max = SheetDesign.CARD_MAX_WIDTH.dp).fillMaxWidth().clip(RoundedCornerShape(look.radius(18f)))
+            .background(Color(k.background)).pointerInput(Unit) { detectTapGestures { } }.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(SheetDesign.EMBLEM.dp).clip(RoundedCornerShape(look.radius(SheetDesign.EMBLEM_RADIUS))).background(Color(k.tint))
+                    .clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+                    SheetIconImage(SheetIcon.WAVEFORM, k.accentInk, SheetDesign.GLYPH.dp)
+                }
+                Spacer(Modifier.width(12.dp))
+                SheetText(line, SheetDesign.body(look.script), k.text, look, Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite })
+            }
+            Spacer(Modifier.height(12.dp))
+            val type = SheetDesign.button(look.script)
+            Row(horizontalArrangement = Arrangement.spacedBy(SheetDesign.BUTTON_GAP.dp)) {
+                Box(Modifier.weight(1f)) { SheetButton(open, primary = true, look, type, onClick = onOpen) }
+                Box(Modifier.weight(1f)) { SheetButton(notNow, primary = false, look, type, onClick = onNotNow) }
+            }
+        }
+    }
+}
+
+/**
+ * [SharingCard] in the activity's own window, at the bottom above the navigation bar: no dialog, no dim, no focus
+ * taken. It leaves with the composition (an answer, or the SDK taking it back).
+ */
+@Composable
+internal fun SharingCardOverlay(c: SharingCopy, line: String, open: String, notNow: String, style: SharingStyle,
+                                onOpen: () -> Unit, onNotNow: () -> Unit) {
+    val view = LocalView.current
+    val parent = rememberCompositionContext()
+    val card by rememberUpdatedState<@Composable () -> Unit> { SharingCard(c, line, open, notNow, style, onOpen, onNotNow) }
+    DisposableEffect(view) {
+        val activity = generateSequence(view.context) { (it as? ContextWrapper)?.baseContext }.firstOrNull { it is Activity } as? Activity
+        val content = activity?.findViewById<ViewGroup>(android.R.id.content) as? FrameLayout ?: return@DisposableEffect onDispose {}
+        val host = ComposeView(activity).apply {
+            setParentCompositionContext(parent)
+            setViewTreeLifecycleOwner(view.findViewTreeLifecycleOwner())
+            setViewTreeSavedStateRegistryOwner(view.findViewTreeSavedStateRegistryOwner())
+            setContent {
+                Box(Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp), contentAlignment = Alignment.BottomCenter) { card() }
+            }
+        }
+        content.addView(host, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, android.view.Gravity.BOTTOM))
+        onDispose { content.removeView(host) }
+    }
+}
+
 /** A short line in a dialog: the thank-you (once) or the impact line, in the sheet's colours and type. */
 @Composable
 internal fun SharingMessage(text: String, copy: SharingCopy, style: SharingStyle = SharingStyle(), onDone: () -> Unit) {
@@ -579,11 +612,30 @@ public fun SharingSheetHost(client: TajweedClient, style: SharingStyle = Sharing
     DisposableEffect(client) {
         // while this host is on screen the SDK's requests come here; afterwards its own dialogs take them again
         val before = sharing.prompts
-        sharing.prompts = { request = it }
+        sharing.prompts = { r ->
+            // the SDK takes a sheet or card back (a take started, the app left, the switch turned): it goes, unanswered
+            when (r) {
+                is Sharing.SheetRequest.Consent -> r.onDismiss = { if (request === r) request = null }
+                is Sharing.SheetRequest.Card -> r.onDismiss = { if (request === r) request = null }
+                else -> {}
+            }
+            request = r
+        }
         onDispose { sharing.prompts = before }
     }
     when (val r = request) {
-        is Sharing.SheetRequest.Consent -> SharingConsentDialog(sharing, r.variant, r.guardian, style) { request = null }
+        is Sharing.SheetRequest.Consent -> {
+            // SDK 4.0 (SHARE_ASK_40 20.6): counted right before it goes on screen, and shown only when the decision allows
+            val shown = remember(r) { r.shown() }
+            if (shown) SharingConsentDialog(sharing, r.variant, style) { request = null }
+            else LaunchedEffect(r) { request = null }
+        }
+        is Sharing.SheetRequest.Card -> {
+            val shown = remember(r) { r.shown() }
+            if (shown) SharingCardOverlay(sharing.copy, r.line, r.openLabel, r.notNowLabel, style,
+                onOpen = { request = null; r.open() }, onNotNow = { request = null; r.notNow() })
+            else LaunchedEffect(r) { request = null }
+        }
         is Sharing.SheetRequest.Thanks -> SharingMessage(sharing.copy["thanks"], sharing.copy, style) { request = null }
         is Sharing.SheetRequest.Impact -> SharingMessage(sharing.copy.impactMinutes(r.minutes), sharing.copy, style) { request = null }
         null -> {}

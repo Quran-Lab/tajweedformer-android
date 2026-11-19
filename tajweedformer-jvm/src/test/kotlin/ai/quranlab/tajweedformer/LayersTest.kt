@@ -31,7 +31,7 @@ class LayersTest : OpenChecked() {
     @Test
     fun decodedLayer() {
         // the default top-k ranking is the engine's (zf_tajweed_topk), so this runs with the JNI library
-        org.junit.Assume.assumeTrue("the JNI library is not loadable", ai.quranlab.tajweedformer.engine.TajweedJni.available)
+        org.junit.Assume.assumeTrue("the JNI library is not loadable", true)
         //            frame: 0  1  2  3  4  5  6  7
         val tops = intArrayOf(0, 5, 5, 0, 5, 1, 7, 7)
         val secs = intArrayOf(5, 0, 0, 5, 0, 0, 0, 3)
@@ -86,7 +86,7 @@ class LayersTest : OpenChecked() {
 
     @Test
     fun topKComesFromTheEngineForTokenAndClassHeads() {
-        org.junit.Assume.assumeTrue("the JNI library is not loadable", ai.quranlab.tajweedformer.engine.TajweedJni.available)
+        org.junit.Assume.assumeTrue("the JNI library is not loadable", true)
         val rnd = java.util.Random(3)
         val n40 = 6
         val m = HashMap<HeadId, FloatArray>()

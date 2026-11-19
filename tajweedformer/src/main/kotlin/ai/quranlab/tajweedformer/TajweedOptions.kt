@@ -5,6 +5,11 @@ import java.io.File
 /**
  * The options of a [TajweedClient]. Every one is optional: `TajweedClient(context, key)` is enough.
  * On Android the app id and version are read from the app.
+ *
+ * SDK 4.0: anonymous analytics (daily counts and durations only, never audio, text, names or device identifiers) are
+ * always on; no option turns them off. Quran Lab's signed config is the only switch.
+ *
+ * SDK 4.0: every app shows the same sharing sheet under the same ask rules; no option changes the sheet.
  */
 public class TajweedClientOptions @JvmOverloads constructor(
     /** The app's id as registered at sdk.quranlab.ai. Null: the app's own (Android: the package name). */
@@ -14,16 +19,13 @@ public class TajweedClientOptions @JvmOverloads constructor(
     /** Where the SDK keeps its files (the model, the signed config, the sharing queue). Null: the platform's
      *  private folder (Android: `noBackupFilesDir/quranlab`). */
     public val storage: File? = null,
-    /** Anonymous usage statistics (daily sums, no audio, no text, no identifier). On by default; [Analytics.OFF]
-     *  sends none. */
-    public val analytics: Analytics = Analytics.ON,
-    /** [Audience.CHILDREN]: the sharing sheet addresses the parent or guardian. */
-    public val audience: Audience = Audience.GENERAL,
-) {
-    public enum class Analytics { ON, OFF }
-
-    public enum class Audience { GENERAL, CHILDREN }
-}
+    /**
+     * SDK 4.0 (SPEC 17.3): the SDK's own downloads (the recited-ayah index, an update of a build) wait for Wi-Fi or
+     * Ethernet. Off (the default): they go on any network unless the system says to save data (Data Saver on for the
+     * app, or roaming). `client.model()` and `prefetch()` are not affected: they keep their own argument.
+     */
+    public val unmeteredOnly: Boolean = false,
+)
 
 /**
  * The options of one Session (`model.listen(options)`, `model.session(options)`). Every one is optional.
@@ -47,7 +49,10 @@ public class TajweedSessionOptions @JvmOverloads constructor(
      * `inter1_log_probs`, `timing_log_probs`, `gem`, `attr_qalqalah`, `conf`).
      */
     public val heads: List<String>? = null,
-    /** [Backend.AUTO]: the CPU engine first, an accelerator once it passed its test. [Backend.CPU]: the CPU engine only. */
+    /**
+     * [Backend.AUTO]: the best engine the Quran Lab Core has on this phone; in 4.0 that is its CPU engine (the
+     * accelerator comes with a later Core, without a change here). [Backend.CPU]: the CPU engine only.
+     */
     public val backend: Backend = Backend.AUTO,
     /** How many ranked tokens each decoded frame carries (0: only the best and the runner-up; up to 38). */
     public val topK: Int = 0,

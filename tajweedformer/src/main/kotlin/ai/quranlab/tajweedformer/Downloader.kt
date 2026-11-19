@@ -176,6 +176,7 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
             permitted { transport.get(url, h, cancel) }
         } catch (x: IOException) {
             throw RecognizerException.DownloadFailed(path, "network: ${x.message}", x)
+                .at(fileStage(path), if (ai.quranlab.tajweedformer.cloud.ErrorRules.timedOut(x)) "timeout" else "network")
         }
         if (r.code in ok) {
             auth?.served()
@@ -183,10 +184,10 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
         }
         val body = try { readSome(r.body, MAX_ERROR_BODY) } catch (_: IOException) { ByteArray(0) } finally { r.close() }
         // a success that is not the answer asked for (a 204, say): a failed attempt ([AnswerRule])
-        if (r.code in 200..299) throw AnswerRule.failed(path, "HTTP ${r.code}")
+        if (r.code in 200..299) throw AnswerRule.failed(path, "HTTP ${r.code}", r.code)
         // a redirect is never followed, and it is a failed request whatever its body says (SPEC 15.4): no renewal and
         // no refusal is read from it, so nothing is remembered and nothing is removed; asked once
-        if (r.code in 300..399) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}")
+        if (r.code in 300..399) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}").at(fileStage(path), "redirect", r.code)
         if (auth != null && !renewed && auth.renewal(r.code, body)) {
             auth.renew()
             renewed = true
@@ -196,16 +197,45 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
         // or a 403, SPEC 15.3), unless it says that the network the request came from is not served (503
         // `network_blocked`: asked once, SPEC 16.2)
         if (r.code >= 500 && !networkBlocked(r.code, body)) {
-            throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", ServerFailed(r.code))
+            throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", ServerFailed(r.code)).at(fileStage(path), "http", r.code)
         }
+        // contract 24.3: the answer's error (and reason) name it in an error report
+        val o = try { Json.parse(String(body, Charsets.UTF_8)) as? Map<*, *> } catch (_: Exception) { null }
+        val error = o?.get("error") as? String
+        val reason = o?.get("reason") as? String
+        val why = ai.quranlab.tajweedformer.cloud.ErrorRules.reasonOf(r.code, error, reason)
         // a refusal: read first (a download in ranges records it as the call's error at once), then its work on the device
         auth?.refused(r.code, body)?.let { refusal ->
             auth?.refuse(r.code, body)
-            throw refusal
+            throw refusal.at(fileStage(path), if (r.code == 401 || r.code == 403) "refused" else why, r.code, reason ?: error)
         }
-        throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}")
+        throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}").at(fileStage(path), why, r.code, error)
     }
 }
+
+/**
+ * The cause of a download's failure as an error report names it: a write that failed for space
+ * (`quota`) or on the store (`storage`), the request ended by the call (`aborted`), a wait that ran out (`timeout`), or
+ * the network. Read and write share their failures' type (an IOException); the system's error tells them apart.
+ */
+internal fun RecognizerException.DownloadFailed.tagged(path: String, why: String, cause: Throwable?): RecognizerException.DownloadFailed {
+    val rules = ai.quranlab.tajweedformer.cloud.ErrorRules
+    return when {
+        why == "cancelled" -> at(fileStage(path), "aborted")
+        cause != null && rules.noSpace(cause) -> at(fileStage(path), "quota", errorCode = rules.errnoCode(cause))
+        cause is StoreWriteFailed || why.startsWith("cannot write") || why.startsWith("cannot keep") ->
+            at(fileStage(path), "storage", errorCode = cause?.let { rules.errnoCode(it) })
+        cause is IOException -> at(fileStage(path), if (rules.timedOut(cause)) "timeout" else "network")
+        else -> this
+    }
+}
+
+/** A write of a downloaded file on the device that failed (an IOException as the network's are, told apart by its type). */
+internal class StoreWriteFailed(cause: IOException) : IOException(cause.message, cause)
+
+/** The stage of a model request in an error report: the manifest's, or a file's download. */
+internal fun fileStage(path: String): String =
+    if (path == ModelManifest.FILE_NAME || path.endsWith("/" + ModelManifest.FILE_NAME)) "manifest" else "download"
 
 /**
  * Which answer to a model request is the file (SDK 3.1.3, the same in every Quran Lab SDK). A 2xx is accepted only as
@@ -223,8 +253,9 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
  */
 internal object AnswerRule {
     /** The failure of an attempt whose answer was not the file: `download_failed`, with [WrongAnswer] as its cause. */
-    fun failed(path: String, what: String): RecognizerException.DownloadFailed =
+    fun failed(path: String, what: String, status: Int? = null): RecognizerException.DownloadFailed =
         RecognizerException.DownloadFailed(path, "the server's answer is not the file ($what); nothing on the device was changed", WrongAnswer(what))
+            .at(fileStage(path), "invalid_answer", status)
 
     private val CONTENT_RANGE = Regex("^bytes\\s+(\\d+)-(\\d+)/(\\d+)$")
 
@@ -309,8 +340,11 @@ internal class RetryPlan(val pausesMs: LongArray) {
         /** Whether a failed model request is one the rule asks for again: no answer, a connection that ended, a stall
          *  (all three an IOException of the transport), a server failure, or a success that was not the file
          *  ([AnswerRule]). Not the system's refusal of the network. */
-        fun resumable(x: Throwable): Boolean = x is RecognizerException.DownloadFailed &&
+        fun resumable(x: Throwable): Boolean = x is RecognizerException.DownloadFailed && x.cause40?.reason !in STORE &&
             ((x.cause is IOException && x.cause !is NetworkNotPermitted) || x.cause is ServerFailed || x.cause is WrongAnswer)
+
+        /** The reasons of a write that failed on the device: never asked for again. */
+        private val STORE = setOf("storage", "quota")
     }
 }
 
@@ -361,6 +395,10 @@ internal fun interface NetworkPolicy {
      * `prefetch(unmeteredOnly = true)` downloads on `unmetered` and `unknown` and waits on `metered` and `none`.
      */
     fun connection(): String = if (isUnmetered()) "unmetered" else "metered"
+
+    /** SPEC 17.3: the system says the user wants to save data (Android: Data Saver on for the app, or roaming): the
+     *  SDK's own downloads wait. False where the platform cannot tell. */
+    fun saveData(): Boolean = false
 
     companion object {
         /** Treats every network as unmetered (tests). */
@@ -493,6 +531,8 @@ internal class FetchStats {
     /** Bytes of the stored file that were on the device from an earlier call. */
     @Volatile var resumedFrom = 0L
     @Volatile var ranged = false
+    /** The resumes the call made of the file beyond the first request. */
+    @Volatile var retries = 0
     /** Body bytes per protocol (`http/1.1`, `h2`, `h3`), with every protocol an answer came over. */
     private val byProtocol = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
 
@@ -585,8 +625,11 @@ internal class ModelDownloader @JvmOverloads constructor(
         require(baseUrl.endsWith("/")) { "baseUrl must end in /" }
     }
 
-    /** The file the SDK keeps for [e]. */
-    fun local(e: ModelManifest.FileEntry): File = File(root, e.localPath)
+    /** The file the SDK keeps for [e]: a qle1 container (SDK 4.0) is kept as its CDN form under `cdn/` by its decoded
+     *  path, where the Core reads it at install; every other file by its local path. */
+    fun local(e: ModelManifest.FileEntry): File = File(root, prefix(e) + e.localPath)
+
+    private fun prefix(e: ModelManifest.FileEntry): String = if (e.encoding == ModelManifest.Encoding.QLE1) CDN_DIR else ""
 
     /** Whether [e]'s kept file is in place with its size and SHA-256 (see [VerifiedStamps]). */
     fun isInPlace(e: ModelManifest.FileEntry): Boolean = stamps.verified(local(e), e.localSize, e.localSha256)
@@ -622,7 +665,7 @@ internal class ModelDownloader @JvmOverloads constructor(
             throw RecognizerException.ManifestInvalid("bad path ${e.path}")
         }
         // one download per file in the process: two stores of one folder (a Client's, a worker's) never write one part
-        val lock = LOCKS.computeIfAbsent(File(root, e.localPath).absolutePath) { Any() }
+        val lock = LOCKS.computeIfAbsent(local(e).absolutePath) { Any() }
         synchronized(lock) {
             val t0 = System.nanoTime()
             if (isInPlace(e)) return DownloadResult(e.path, e.role, 0, e.size, 0, true, revision = revision)
@@ -631,8 +674,12 @@ internal class ModelDownloader @JvmOverloads constructor(
                 download(e, cancel, onProgress, t0, stats).copy(revision = revision)
             } catch (x: TajweedError) {
                 val why = (x as? RecognizerException.DownloadFailed)?.reason ?: x.code
+                // contract 24.2: the resumes made inside the call; 24.8: the failure's telemetry name
+                x.cause40?.let { c -> if (c.retries == null && stats.retries > 0) x.cause40 = c.copy(retries = stats.retries) }
+                val cause = ai.quranlab.tajweedformer.cloud.ErrorCause.of(x)
                 val r = DownloadResult(e.path, e.role, stats.network.get(), e.size, stats.resumedFrom, false, why,
-                    (System.nanoTime() - t0) / 1_000_000, revision, stats.ranged, stats.protocols())
+                    (System.nanoTime() - t0) / 1_000_000, revision, stats.ranged, stats.protocols(),
+                    ai.quranlab.tajweedformer.cloud.ErrorRules.telemetryReason(cause.reason))
                 SdkEvents.emit { it.onDownloadFinished(r) }
                 throw x
             }
@@ -642,17 +689,18 @@ internal class ModelDownloader @JvmOverloads constructor(
     }
 
     private fun fail(e: ModelManifest.FileEntry, why: String, cause: Throwable? = null): Nothing =
-        throw RecognizerException.DownloadFailed(e.path, why, cause)
+        throw RecognizerException.DownloadFailed(e.path, why, cause).tagged(e.path, why, cause)
 
     private fun download(e: ModelManifest.FileEntry, cancel: Cancellation?, onProgress: ((DownloadProgress) -> Unit)?, t0: Long,
                          stats: FetchStats): DownloadResult {
-        val part = File(root, e.path + ".part")
-        val validator = File(root, e.path + ".part.v")
-        val map = File(root, e.path + RangedFetch.MAP_SUFFIX)
+        val part = File(root, prefix(e) + e.path + ".part")
+        val validator = File(root, prefix(e) + e.path + ".part.v")
+        val map = File(root, prefix(e) + e.path + RangedFetch.MAP_SUFFIX)
         part.parentFile?.mkdirs()
         val progress = FileProgress(e, onProgress)
         // the file's resumes in this call ([RetryPlan]): the ranges and the one request count on the same five
         val resumes = Resumes(retry)
+        try {
         if (e.size > ranges.threshold) {
             val parallel = if (transport.separateConnections) ranges.parallel else 1
             RangedFetch(e, part, validator, map, transport, headers, baseUrl + e.path, ranges, parallel, cancel, progress, stats, resumes) { given, whole ->
@@ -665,17 +713,21 @@ internal class ModelDownloader @JvmOverloads constructor(
             if (map.exists()) RangedFetch.wipe(part, validator, map)
             single(e, part, validator, cancel, progress, stats, null, resumes, whole = false)
         }
+        } finally {
+            stats.retries = resumes.generation
+        }
         progress.end(part.length())
         if (part.length() < e.size) fail(e, "the connection ended at ${part.length()} of ${e.size} bytes (the part is kept for a resume)")
         val (size, sha) = ModelManifest.digest(part)
         if (size != e.size || sha != e.sha256.lowercase()) {
             RangedFetch.wipe(part, validator, map)
-            fail(e, "the stored bytes do not match the manifest (size $size, sha256 $sha)")
+            throw RecognizerException.ChecksumMismatch(e.path).at("download", "hash")
         }
         val dst = local(e)
         dst.parentFile?.mkdirs()
         val d = e.decoded
-        if (d == null) {
+        if (d == null || e.encoding != ModelManifest.Encoding.GZIP) {
+            // identity files and qle1 containers are kept as they came (a container is decrypted only by the Core)
             move(part, dst)
         } else {
             val tmp = File(dst.path + ".tmp")
@@ -833,7 +885,7 @@ internal class ModelDownloader @JvmOverloads constructor(
                     AnswerRule.range(resp, start, e.size - 1, e.size)?.let { wrong(it) }
                     if (v != null && stored != null && v != stored) wrong("a range of another version of the file")
                     try {
-                        FileOutputStream(part, true).use { out -> copy(e, resp, out, e.size - start, cancel, progress, stats) }
+                        storeOut(part, true).use { out -> copy(e, resp, out, e.size - start, cancel, progress, stats) }
                     } catch (x: IOException) {
                         // what arrived is the file's: the part stays for a resume
                         fail(e, "network: ${x.message}", x)
@@ -850,7 +902,7 @@ internal class ModelDownloader @JvmOverloads constructor(
                     progress.start(0)
                     var more = false
                     val got = try {
-                        FileOutputStream(target, false).use { out ->
+                        storeOut(target, false).use { out ->
                             val n = copy(e, resp, out, e.size, cancel, progress, stats)
                             // a body that runs past the file's size is cut off, and the attempt failed
                             if (n == e.size) more = try { resp.body.read() >= 0 } catch (_: IOException) { false }
@@ -898,12 +950,20 @@ internal class ModelDownloader @JvmOverloads constructor(
             if (cancel?.isCancelled == true || Thread.currentThread().isInterrupted) fail(e, "cancelled")
             val n = resp.body.read(buf, 0, minOf(buf.size.toLong(), most - have).toInt())
             if (n < 0) break
-            out.write(buf, 0, n)
+            // a write that fails is the device's store, not the network
+            try { out.write(buf, 0, n) } catch (x: IOException) { throw StoreWriteFailed(x) }
             have += n
             stats.bytes(resp, n)
             progress.add(n.toLong())
         }
         return have
+    }
+
+    /** A file of the store opened for writing; a failure to open it is the store's ([StoreWriteFailed]). */
+    private fun storeOut(f: File, append: Boolean): FileOutputStream = try {
+        FileOutputStream(f, append)
+    } catch (x: IOException) {
+        throw StoreWriteFailed(x)
     }
 
     private fun move(from: File, to: File) {
@@ -925,6 +985,9 @@ internal class ModelDownloader @JvmOverloads constructor(
 
         /** One lock per kept file in the process. */
         private val LOCKS = ConcurrentHashMap<String, Any>()
+
+        /** Where the CDN forms of qle1 files wait for the Core's install (SDK 4.0). */
+        const val CDN_DIR = "cdn/"
     }
 }
 

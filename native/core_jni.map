@@ -1,0 +1,5 @@
+/* libtajweedformer_jni exports JNI_OnLoad and nothing else: the natives are registered by name. */
+{
+  global: JNI_OnLoad;
+  local: *;
+};

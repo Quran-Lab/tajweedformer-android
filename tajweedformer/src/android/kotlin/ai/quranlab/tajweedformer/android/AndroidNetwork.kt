@@ -30,4 +30,14 @@ internal class AndroidNetwork(context: Context) : NetworkPolicy {
     } catch (_: Exception) {
         "unknown"
     }
+
+    /** SPEC 17.3: Data Saver on for this app (`RESTRICT_BACKGROUND_STATUS_ENABLED`; `WHITELISTED` means the user
+     *  exempted the app), or roaming (no `NET_CAPABILITY_NOT_ROAMING`). */
+    override fun saveData(): Boolean = try {
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        cm.restrictBackgroundStatus == ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED ||
+            (caps != null && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING))
+    } catch (_: Exception) {
+        false
+    }
 }
