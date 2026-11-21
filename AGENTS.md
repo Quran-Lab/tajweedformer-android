@@ -134,8 +134,8 @@ hands out its weights or keys. The SDKs around it are open source.
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.0` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.0"`, product `TajweedFormer` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.1` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.0 |
 | [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
@@ -152,10 +152,10 @@ revision your learners get, and see the problems your app's learners hit.
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:4.0.0") }
+dependencies { implementation("ai.quranlab:tajweedformer:4.0.1") }
 ```
 
-Maven Central serves 4.0.0 today. 4.0.1 follows there once it is released; the quick start below is the same for both.
+
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
