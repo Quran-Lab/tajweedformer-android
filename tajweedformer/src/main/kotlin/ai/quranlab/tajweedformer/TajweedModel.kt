@@ -325,7 +325,13 @@ public class TajweedModel internal constructor(
                 if (c in folder.availableContexts) c else folder.availableContexts.first()
             }
             val rec = openRecognizer(folder, host, ctx)
-            return TajweedModel(rec.model, host, rec)
+            // Gate C (SDK 4.0.1): the engine is open in the Core; it is the Model's, or it is closed, never dropped
+            return try {
+                TajweedModel(rec.model, host, rec)
+            } catch (t: Throwable) {
+                try { rec.close() } catch (_: Exception) {}
+                throw t
+            }
         }
 
         private fun openRecognizer(folder: ModelFolder, host: ModelHost, context: String): Recognizer =

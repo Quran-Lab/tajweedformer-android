@@ -103,6 +103,13 @@ internal fun <T : TajweedError> T.at(stage: String, reason: String, status: Int?
     return this
 }
 
+/** SDK 4.0.1: the cause named is a request to the hosts of [role], asked of more than one host when
+ *  [fallback]. A cause that names its role already keeps it; call it after [at]. */
+internal fun <T : TajweedError> T.via(role: String, fallback: Boolean): T {
+    cause40?.let { c -> if (c.hostRole == null) cause40 = c.copy(hostRole = role, fallback = fallback) }
+    return this
+}
+
 /** [at] with a cause made elsewhere (a request's, [ai.quranlab.tajweedformer.cloud.ErrorCause.ofCloud]). */
 internal fun <T : TajweedError> T.at(cause: ai.quranlab.tajweedformer.cloud.ErrorCause): T {
     if (cause40 == null) cause40 = cause

@@ -55,6 +55,9 @@ internal class ClientPlatform(
     /** The cloud side's environment: storage, app identity, device, keys, scheduler, HTTP, clock. */
     val cloud: CloudEnvironment,
     val apiUrl: String = QuranLabApi.DEFAULT_API,
+    /** SDK 4.0.1: the hosts of each role and their failover order. Null: the built-in sets, or the
+     *  one stand-in of a test [apiUrl]; tests of the failover pass their stand-ins. */
+    val endpoints: ai.quranlab.tajweedformer.cloud.Endpoints? = null,
     /** The Ed25519 keys the signed config and the model manifests may be signed with. */
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
     /** The transport of model downloads. */

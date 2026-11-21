@@ -15,7 +15,7 @@ on, are published only encrypted, for SDK 4.0: an app on 3.x never gets them.
 | `TajweedClientOptions(analytics = Analytics.OFF)` turned the anonymous analytics off. | Removed, with `TajweedClientOptions.Analytics`, so code that sets it no longer compiles: delete the argument. Anonymous analytics are always on, because they are daily counts and durations only, never audio, text, names or device identifiers. Only Quran Lab can switch them off, from its signed config. |
 | `TajweedClientOptions(audience = Audience.CHILDREN)` chose another sharing sheet. | Removed, with `TajweedClientOptions.Audience`, so code that sets it no longer compiles: delete the argument. Every app shows the same sharing sheet. Complying with children's privacy law is the app's and the app store's, through the app's privacy policy and its store declarations. |
 | The model folder held plain files (`.tflite`, `.bin`) an app could read. | The files are encrypted for this install. Only `calibration.json` and the sample clips are plain. Nothing in the SDK hands out a model file or its path. The first start after the upgrade downloads the model once more, so it needs a connection once. |
-| `client.model()` worked offline once downloaded, forever. | It works offline while the lease is valid: 7 days for an attested install, 24 hours otherwise, renewed in the background whenever the phone is online. See section 2. A Model already open keeps running. |
+| `client.model()` worked offline once downloaded. | The first run needs a connection; after that it works offline, and the SDK keeps itself up to date in the background when the phone is online. `needs_connection` means the SDK needs to reach Quran Lab to continue. See section 2. A Model already open keeps running. |
 | The first `client.model()` downloaded and opened. | It also makes the install's keys in the Android Keystore and attests them, which takes longer on the first call only (how long on a given phone: `InstallKeyDeviceTest` logs it). |
 | The NPU took over after its test on supported phones. | At 4.0's launch every phone runs the Core's CPU engine: Quran Lab serves no NPU program until one is faster than the CPU engine, so an app needs no dispatch library for now. NPU support returns when a faster build ships; the README's "The engines, in the Core" says how it is used then. |
 | `reference.fetch()` downloaded the reference units. | They come with the model (about 1 MB, encrypted) and the Core reads them; `fetch()` is a no-op. |
@@ -29,30 +29,27 @@ emulator and development keys only: with a production key an emulator gets `serv
 
 - **Encrypted end to end.** The model downloads encrypted, the Core installs it encrypted again for this install, and
   it is decrypted only in the Core's memory when it opens. No plaintext model file is ever written.
-- **A lease per install.** The model opens under a lease Quran Lab signs for this install: 7 days when the phone's
-  hardware attests the install for your app (or Play Integrity does, on a phone without usable hardware attestation),
-  24 hours otherwise. The SDK renews it in the background when it is due, and a valid lease never waits for a renewal.
-  A phone with neither, or a Play outage, gets 24-hour leases: never a lock-out. In an emergency Quran Lab may give
-  longer leases; the SDK holds every lease to its own end.
+- **A lease per install.** The model opens under a lease Quran Lab signs for this install. The first run needs a
+  connection; after that the model works offline, and the SDK keeps itself up to date in the background when the
+  phone is online. An open never waits for that. An install the
+  phone's hardware attests for your app (or Play Integrity does, on a phone without usable hardware attestation) is
+  hardware-verified: the class that may use the phone's accelerator. A phone with neither, or a Play outage, still
+  gets leases: never a lock-out.
 - **Add your signing certificates.** On your Android key's page at sdk.quranlab.ai, under "Signing certificates
   (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App
-  integrity, App signing). Until you do, your installs get 24-hour leases. Once Google Play
+  integrity, App signing). Until you do, your installs are not hardware-verified for your app (they run on the CPU,
+  and a re-signed copy of your app is not told apart from yours). Once Google Play
   recognizes your app, its app signing certificate counts as declared, and builds signed with your upload key
   (internal testing, sideloaded builds) are then refused unless you add the upload key certificate too.
 - **Testing on cloud device labs.** Some labs re-sign your APK, so its signing digest differs from yours. Add the
   lab's signing digest to a development key, never to the production one.
 - **Phones with an unlocked bootloader** are refused a lease, by design. The error says which check failed.
-- **When Quran Lab cannot be reached.** If the lease has ended and Quran Lab cannot be reached (no answer, a server
-  error, or "too many requests"), the model keeps opening under that lease for up to 24 hours more: at most 8 days
-  after a 7-day lease was given, 48 hours after a 24-hour one. A refusal from Quran Lab ends this at once. When Quran
-  Lab answers that its lease service is briefly unavailable (503 with a `Retry-After`), the SDK asks again after that
-  time; such an answer is never a refusal. A model open
-  past the end of the lease first asks Quran Lab for a new one and waits at most 10 seconds, and not at all when the
-  phone is offline. Each such open is reported to Quran Lab; your app gets no error. After the 24 hours the model opens
-  only with a new lease: until then `client.model()` is `needs_connection` when Quran Lab gave no answer, and
-  `download_failed` when it answered with a server error.
-- **A Model already open keeps running** until the app closes it, past the end of its lease and of those 24 hours too.
-- **The clock is the Core's.** A changed device clock never lengthens a lease, and never locks a learner out for long.
+- **When the SDK needs Quran Lab.** When the SDK needs to reach Quran Lab to continue, `client.model()` is
+  `needs_connection` if Quran Lab gave no answer, and `download_failed` if it answered with a server error. A refusal
+  from Quran Lab is final. When Quran Lab answers that its lease service is briefly unavailable (503 with a
+  `Retry-After`), the SDK asks again after that time; such an answer is never a refusal.
+- **A Model already open keeps running** until the app closes it.
+- **The clock is the Core's.** Changing the device clock has no effect on the lease.
 - **Refusals.** When Quran Lab stops a key or an app, its answer on the lease route is signed. Only when the Core
   verifies it are the lease and the model's files removed, as in 3.x. Any other refusal there removes nothing and is
   `server_rejected`.
@@ -68,7 +65,7 @@ gets: an answer from a server is never `needs_connection`.
 | What happened | Code |
 | --- | --- |
 | A request the call needs got no answer at all (offline, DNS, a refused connection) and nothing of the model is on the phone yet | `needs_connection` |
-| The lease and its 24 hours above have ended, and Quran Lab gave no answer | `needs_connection` |
+| The SDK needs to reach Quran Lab to continue, and Quran Lab gave no answer | `needs_connection` |
 | Quran Lab answered with a failure: a server error, a 429, a redirect, a config that does not verify with none stored, a read that timed out | `download_failed`; the message names what answered ("the server answered 503"). Call again later |
 | The connection went while part of the model was already downloaded | `download_failed`; the download resumes at the next call |
 | A downloaded file does not match the signed manifest | `checksum_mismatch` |
@@ -77,7 +74,7 @@ gets: an answer from a server is never `needs_connection`.
 
 **Error reports** are new in 4.0. Every `TajweedError` your app gets, except the codes that only say the API was used
 wrongly (`invalid_argument`, `client_exists`, `session_open`, `session_closed`, `cancelled`), and every failure the SDK
-goes on from without telling your app (for example a renewal of the lease that failed), is sent to Quran Lab as one
+goes on from without telling your app (for example a background update that failed), is sent to Quran Lab as one
 small report: where it failed, why, the HTTP status, the exception's class, how often that day, and the phone's model
 code, memory tier, free-space bucket and ABI. Never a message, a path, a URL or an identifier. One report per kind of
 failure per day, with its count; at most 16 a day and 32 waiting, kept 7 days. Your app's page at sdk.quranlab.ai

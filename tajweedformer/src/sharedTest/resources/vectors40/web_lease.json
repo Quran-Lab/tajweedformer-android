@@ -3,6 +3,14 @@
  "note": "Test keys only, made by protected40.py from fixed labels (stream(label, n): SHA-256 of the label and a 32-bit little-endian counter, concatenated). No SDK trusts them.",
  "rule": "cdata = base64url(SHA-256(UTF-8 of install hash hex || '\\n' || challenge)), no padding, 43 characters; action 'lease'; siteverify's hostname is the frame's",
  "frame_host": "web.quranlab.ai",
+ "frame_hosts": [
+  "web.quranlab.ai",
+  "web2.quranlab.ai",
+  "web-b.tajweedformer.com",
+  "web-g.tajweedformer.com",
+  "web-a.tajweedformer.com"
+ ],
+ "frame_hosts_are": "siteverify's hostname must be one of these (the web_frame role, ENDPOINTS_40.md 28.6; until SDK 4.0.1 the first two); frame_host is the first",
  "cdata": [
   {
    "install_hash_hex": "e373ee0ebc4b40b39381653813df4e2c3276f488c59b3d525d50a24a3aea3f29",
@@ -147,6 +155,114 @@
     "name": "no answer within 3 seconds: an outage",
     "siteverify": null,
     "expect": "outage"
+   },
+   {
+    "name": "an error code the server does not know: a doubt",
+    "siteverify": {
+     "body": {
+      "success": false,
+      "error-codes": [
+       "new-code-2027"
+      ]
+     }
+    },
+    "expect": "doubt"
+   },
+   {
+    "name": "a failure that names no code: a doubt (only a token proven bad is refused)",
+    "siteverify": {
+     "body": {
+      "success": false,
+      "error-codes": []
+     }
+    },
+    "expect": "doubt"
+   },
+   {
+    "name": "bad-request: our own request, an outage",
+    "siteverify": {
+     "body": {
+      "success": false,
+      "error-codes": [
+       "bad-request"
+      ]
+     }
+    },
+    "expect": "outage"
+   },
+   {
+    "name": "missing-input-secret: our own setup, an outage",
+    "siteverify": {
+     "body": {
+      "success": false,
+      "error-codes": [
+       "missing-input-secret"
+      ]
+     }
+    },
+    "expect": "outage"
+   },
+   {
+    "name": "a pass on the fallback frame host web2.quranlab.ai",
+    "siteverify": {
+     "body": {
+      "success": true,
+      "action": "lease",
+      "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+      "hostname": "web2.quranlab.ai"
+     }
+    },
+    "expect": "pass"
+   },
+   {
+    "name": "a pass on the standby's frame host web-b.tajweedformer.com (SDK 4.0.1)",
+    "siteverify": {
+     "body": {
+      "success": true,
+      "action": "lease",
+      "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+      "hostname": "web-b.tajweedformer.com"
+     }
+    },
+    "expect": "pass"
+   },
+   {
+    "name": "a pass on the reserved frame host web-g.tajweedformer.com (SDK 4.0.1)",
+    "siteverify": {
+     "body": {
+      "success": true,
+      "action": "lease",
+      "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+      "hostname": "web-g.tajweedformer.com"
+     }
+    },
+    "expect": "pass"
+   },
+   {
+    "name": "a pass on a lookalike of a frame host: not our widget's",
+    "siteverify": {
+     "body": {
+      "success": true,
+      "action": "lease",
+      "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+      "hostname": "web-b.tajweedformer.com.example.net"
+     }
+    },
+    "expect": {
+     "failed": "hostname"
+    }
+   },
+   {
+    "name": "a pass on the frame host web-a.tajweedformer.com (SDK 4.0.1)",
+    "siteverify": {
+     "body": {
+      "success": true,
+      "action": "lease",
+      "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+      "hostname": "web-a.tajweedformer.com"
+     }
+    },
+    "expect": "pass"
    }
   ]
  },

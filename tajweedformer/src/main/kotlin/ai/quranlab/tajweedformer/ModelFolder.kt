@@ -78,14 +78,19 @@ internal class ModelFolder private constructor(
             Regex("^c(\\d+)_l\\d+$").find(context)?.groupValues?.get(1)?.toInt()?.times(20) ?: 0
 
         /**
-         * An encrypted build (SDK 4.0): the manifest verified, the calibration read from its plain file (verified by its
-         * SHA-256), a first vocabulary (the one the SDK carries for the build's signed `tokens_sha256`, else ids alone),
-         * which the open model's own replaces (R4: the Core reads the build's tokens.txt container,
-         * [ModelFolder.withVocabulary]), and the contexts whose files the Core has installed.
+         * An encrypted build (SDK 4.0): the calibration read from its plain file (verified by its SHA-256), a first
+         * vocabulary (the one the SDK carries for the build's signed `tokens_sha256`, else ids alone), which the open
+         * model's own replaces (R4: the Core reads the build's tokens.txt container, [ModelFolder.withVocabulary]), and
+         * the contexts whose files the Core has installed.
+         *
+         * The manifest is not checked again here (4.0.1). It is the one the store accepted in the same call
+         * ([ModelManifest.accept]: the config's build, the signature, the version), the check that decides what is
+         * downloaded and installed, and the Core checks its signature with its pinned keys at `qlc_install` and again at
+         * `qlc_model_open`, where the model is read. A second Ed25519 check in Kotlin here cost 314 ms of the Alcatel 1's
+         * 974 ms open (perf plan, row 2) and refused nothing the Core lets through.
          */
-        internal fun protected(build: ai.quranlab.tajweedformer.core.ProtectedBuild, verifier: ManifestVerifier): ModelFolder {
+        internal fun protected(build: ai.quranlab.tajweedformer.core.ProtectedBuild): ModelFolder {
             val m = build.manifest
-            verifier.verify(m)
             val stamps = VerifiedStamps(File(build.dir, VerifiedStamps.FILE_NAME))
             val calEntry = m.files.firstOrNull { it.role == "calibration" && it.encoding != ModelManifest.Encoding.QLE1 }
             val calFile = calEntry?.let { File(build.dir, it.localPath) }

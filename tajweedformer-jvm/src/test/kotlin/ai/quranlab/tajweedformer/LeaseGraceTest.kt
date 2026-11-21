@@ -95,13 +95,56 @@ class LeaseGraceTest : OpenChecked() {
             else -> null
         }
 
+        /**
+         * SDK 4.0.1 (endpoints_40.json `attempts`): the requests of one attempt on the `api` hosts, each with every host's
+         * answer. A request to a host of the list is answered from the scripted request of its route (the next one of
+         * that route), [asked] records each (route, host) in order and [bodies] the body each scripted request was sent
+         * with on each host (28.3 item 2: every host is asked the same).
+         */
+        var hostScript: List<Map<String, Any?>>? = null
+        private var qi = 0
+        val asked = ArrayList<Pair<String, String>>()
+        val bodies = HashMap<Int, MutableList<String>>()
+        /** The places in [asked] of requests the script has no answer for (answered as usual). */
+        val extra = ArrayList<Int>()
+
         val transport = { r: HttpRequest ->
-            val path = r.url.substringAfter("http://stub").substringBefore('?')
+            val u = java.net.URI(r.url)
+            val path = u.path
             val body = r.body?.let { Json.parse(String(it)) as Map<String, Any?> }
             val rt = route(path, body)
             seen += rt ?: path
+            val hs = hostScript
+            if (hs != null && u.host != "stub") hosted(hs, u.host, path, rt, body, r.body, r.headers.containsKey("x-qlab-key")) else stubbed(path, rt, body)
+        }
+
+        private fun hosted(hs: List<Map<String, Any?>>, host: String, path: String, rt: String?, body: Map<String, Any?>?, raw: ByteArray?,
+                           keyed: Boolean): HttpResponse {
+            // the challenge an attest asks with the key (18.4.3: the Key Attestation carries it) is part of the attest,
+            // which the vectors count as one request: recorded apart, answered as usual
+            if (keyed && rt == "challenge") {
+                asked += "attest-challenge" to host
+                extra += asked.size - 1
+                return override?.invoke(path, body) ?: default(path, body)
+            }
+            asked += (rt ?: path) to host
+            var j = qi
+            while (j < hs.size && hs[j]["route"] != rt) j++
+            val a = hs.getOrNull(j)?.let { (it["answers"] as Map<String, Any?>)[host] as Map<String, Any?>? }
+            if (a == null) {
+                extra += asked.size - 1
+                return override?.invoke(path, body) ?: default(path, body)
+            }
+            qi = j
+            bodies.getOrPut(qi) { ArrayList() } += String(raw ?: ByteArray(0))
+            val r = scripted(path, body, a)
+            val ra = (a["retry_after"] as? Number)?.toInt() ?: return r
+            return HttpResponse(r.status, r.headers + ("retry-after" to "$ra"), r.body)
+        }
+
+        private fun stubbed(path: String, rt: String?, body: Map<String, Any?>?): HttpResponse {
             val a = script.getOrNull(at)
-            if (a != null && rt == a["route"]) {
+            return if (a != null && rt == a["route"]) {
                 at++
                 scripted(path, body, a)
             } else {
@@ -177,9 +220,11 @@ class LeaseGraceTest : OpenChecked() {
 
     private inner class Setup(val api: Api, val clock: Clock, val l: LeaseClient, val pb: ProtectedBuild, val reports: MutableList<ErrorCause>)
 
-    /** A fresh install leased at the clock's time, then the clock 2 hours past that lease's exp. */
+    /** A fresh install leased at the clock's time, then the clock 2 hours past that lease's exp. With [hosts] (SDK 4.0.1,
+     *  section 28) every later request goes through that `api` list, the app token's renewal too: the fake answers the
+     *  stand-in host `stub` for the first lease, and each listed host by [Api.hostScript]. */
     @Suppress("UNCHECKED_CAST")
-    private fun install(waitMs: Long = 10_000, reuseMs: Long = 60_000, past: Boolean = true): Setup {
+    private fun install(waitMs: Long = 10_000, reuseMs: Long = 60_000, past: Boolean = true, hosts: List<String>? = null): Setup {
         val dir = temp()
         val v = ProtectedKit.vector("manifest_40.json")
         val bytes = Json.write(v["manifest"]).toByteArray()
@@ -188,14 +233,30 @@ class LeaseGraceTest : OpenChecked() {
         val clock = Clock()
         val api = Api(clock, bytes)
         val reports = ArrayList<ErrorCause>()
+        // the first lease from the stand-in alone; then, with [hosts], the hosts of the list (a config's list, 28.2)
+        var first = true
+        val endpoints = hosts?.let { h ->
+            ai.quranlab.tajweedformer.cloud.Endpoints.mapped(listOf("stub") + h, ai.quranlab.tajweedformer.cloud.HostNames.MODELS,
+                (h.map { it to "http://$it" } + ("stub" to "http://stub")).toMap()) { clock.wallMs }
+                .also { e -> e.configured = { if (first) mapOf("api" to listOf("stub")) else mapOf("api" to h) } }
+        }
+        val qapi = if (endpoints == null) QuranLabApi("http://stub", api.transport) else QuranLabApi("http://stub", api.transport, endpoints)
+        val token: () -> String = if (endpoints == null) ({ api.token() }) else ({
+            if (api.needToken) {
+                qapi.attest(key, app)
+                api.needToken = false
+            }
+            "qlt_v1.e30.s"
+        })
         val l = LeaseClient(File(dir, "core"), SoftwareIdentity(File(dir, "core/keys")), FileStateVault(File(dir, "core/vault")),
-            QuranLabApi("http://stub", api.transport), key, app, token = { api.token() }, invalidateToken = { api.needToken = true }, adoptToken = {},
+            qapi, key, app, token = token, invalidateToken = { api.needToken = true }, adoptToken = {},
             integrity = null, projectNumber = { null }, removeModels = { true }, clock = { clock.wallMs },
             hostClock = ({ clock.wallMs }) to ({ clock.bootMs }), onGrace = { reports += it }, graceWaitMs = waitMs, graceReuseMs = reuseMs)
             .also { clients += it }
         val pb = ProtectedBuild(dir, m, bytes, l)
         val c = pb.core()
         assertTrue(c.tick().valid)
+        first = false
         if (past) clock.pass((86_400L + 2 * 3600) * 1000)
         return Setup(api, clock, l, pb, reports)
     }
@@ -237,6 +298,81 @@ class LeaseGraceTest : OpenChecked() {
         assertEquals(outcomes.size, good)
     }
 
+    /**
+     * Contract section 28 (SDK 4.0.1), endpoints_40.json `attempts` on the real Core: an install whose lease expired two
+     * hours before asks for one through the four `api` hosts, each request answered by host as the case says. The
+     * outcome is the case's (a lease from the standby, a refusal or a signed stop from it, unreachable and the grace only
+     * when every host was or a 429 ended it), each request asks the case's hosts in order, and every host of one request
+     * is sent the same body (a lease the Core refuses goes to the next host with the same challenge, 28.5). The requests
+     * alone, without the Core: EndpointsVectorsTest.theRequestsOfEveryAttempt.
+     */
+    @Suppress("UNCHECKED_CAST")
+    @Test
+    fun endpointsAttempts() {
+        val v = ProtectedKit.vector("endpoints_40.json")
+        val hosts = ((v["roles"] as Map<String, Any?>)["api"] as List<String>)
+        val cases = v["attempts"] as List<Map<String, Any?>>
+        assertEquals(10, cases.size)
+        for (o in cases) {
+            val name = o["name"]
+            val s = install(waitMs = 1_000, hosts = hosts)
+            val requests = o["requests"] as List<Map<String, Any?>>
+            s.api.hostScript = requests
+            val got = try {
+                val c = s.open()
+                val st = c.tick()
+                when {
+                    st.valid -> "lease"
+                    c.grace().first -> "unreachable"
+                    else -> "an open with neither a lease nor a grace"
+                }
+            } catch (f: LeaseFailure) {
+                val c = s.l.core()
+                when {
+                    f.stopped || c?.tick()?.stopped == true -> "stop"
+                    c != null && c.grace().first -> "a failure in grace"
+                    else -> "refused"
+                }
+            }
+            assertEquals("$name: the outcome (asked ${s.api.asked})", o["outcome"], got)
+            val want = requests.flatMap { q -> (q["asked"] as List<String>).map { q["route"] as String to it } }
+            // the requests Android makes that the case does not count apart (4.0.0's, 28.3 item 7: retries inside a route stay
+            // as they are), each of the host the request around it went to: a fresh challenge after renewing the token,
+            // and the attest's own challenge (asked with the key) right before the attest
+            val asked = s.api.asked
+            for (i in s.api.extra) {
+                val afterToken = i > 0 && asked[i].first == "challenge" && asked[i - 1].first == "token" && asked[i].second == asked[i - 1].second
+                val attests = asked[i].first == "attest-challenge" && asked.getOrNull(i + 1)?.let { it.first == "attest" && it.second == asked[i].second } == true
+                assertTrue("$name: a request the case does not have: ${asked[i]} (asked $asked)", afterToken || attests)
+            }
+            assertEquals("$name: the hosts each request asked, in order", want, asked.filterIndexed { i, _ -> i !in s.api.extra })
+            for ((i, b) in s.api.bodies) assertEquals("$name, request $i: every host is sent the same body", 1, b.toSet().size)
+            if (got == "unreachable") {
+                assertTrue("$name: the open in grace is reported", s.reports.any { it.stage == "lease" && it.reason == "grace" && it.hostRole == "api" })
+            }
+        }
+    }
+
+    /** 28.7: every host unreachable, the first host's answer a lease the Core refuses (the emulator's E8 run, 11-20): the
+     *  open in its grace is reported with fallback true, since more than one host was asked, and the first host's 200. */
+    @Suppress("UNCHECKED_CAST")
+    @Test
+    fun aGraceAfterEveryHostIsReportedWithItsFallback() {
+        val hosts = (ProtectedKit.vector("endpoints_40.json")["roles"] as Map<String, Any?>)["api"] as List<String>
+        val s = install(waitMs = 1_000, hosts = hosts)
+        val none = mapOf("answer" to "none")
+        s.api.hostScript = listOf(
+            mapOf("route" to "challenge", "answers" to mapOf(hosts[0] to mapOf("status" to 200.0, "body" to "json"))),
+            mapOf("route" to "model-key", "answers" to mapOf(hosts[0] to mapOf("status" to 200.0, "body" to "json", "core" to "refused"),
+                hosts[1] to none, hosts[2] to none, hosts[3] to none)),
+        )
+        assertTrue(s.open().grace().first)
+        assertEquals(listOf("model-key" to hosts[0], "model-key" to hosts[1], "model-key" to hosts[2], "model-key" to hosts[3]),
+            s.api.asked.filter { it.first == "model-key" })
+        val rep = s.reports.single { it.stage == "lease" && it.reason == "grace" }
+        assertEquals(listOf<Any?>("api", true, 200), listOf(rep.hostRole, rep.fallback, rep.httpStatus))
+    }
+
     @Test
     fun leaseUnavailableOpensInGraceAndTheRefreshWaitsItsRetryAfter() {
         val s = install()
@@ -249,7 +385,8 @@ class LeaseGraceTest : OpenChecked() {
         assertTrue(g)
         assertEquals(c.tick().exp + 86_400, until)
         val rep = s.reports.single()
-        assertEquals(ErrorCause("lease", "grace", 503, null, "lease_unavailable"), rep)
+        // 4.0.1: the lease route's role, one host asked (the test's one stand-in)
+        assertEquals(ErrorCause("lease", "grace", 503, null, "lease_unavailable", hostRole = "api", fallback = false), rep)
         // a second open within the minute asks nothing
         val asked = s.api.seen.count { it == "model-key" }
         s.open()
@@ -309,8 +446,9 @@ class LeaseGraceTest : OpenChecked() {
 
     /**
      * diagnose()'s `protected` object from the real Core: valid with its exp,
-     * refresh time and class; in grace with its end; the class from the lease's flags (bit 3: the 7-day class), never
-     * from exp - iat (an emergency capped_7d lease of the 24-hour class lasts 7 days and stays `24h`).
+     * refresh time and class; in grace with its end; the class from the lease's flags (bit 3: the attested class),
+     * never from exp - iat (a lease of the standard class may last days, by the server's lease_days or its emergency
+     * capped_7d, and stays `standard`).
      */
     @Test
     fun theDiagnosisNamesTheLeaseItsClassAndItsGrace() {
@@ -321,7 +459,7 @@ class LeaseGraceTest : OpenChecked() {
         val st = s.l.core()!!.tick()
         assertEquals(st.exp, d["leaseExpires"])
         assertEquals(st.refreshAfter, d["refreshAfter"])
-        assertEquals("24h", d["leaseClass"])
+        assertEquals("standard", d["leaseClass"])
         assertNull(d["graceUntil"])
         assertTrue(d["core"].toString(), (d["core"] as String).isNotEmpty())
         // past its exp and Quran Lab unreachable: the grace, and its end
@@ -339,14 +477,14 @@ class LeaseGraceTest : OpenChecked() {
         s.api.leaseFlags = 8
         s.clock.pass(2 * 60_000L)
         assertTrue(s.open().tick().valid)
-        assertEquals("7d", s.l.diagnosis()["leaseClass"])
+        assertEquals("attested", s.l.diagnosis()["leaseClass"])
         s.clock.pass(2L * 86_400 * 1000)
         s.api.leaseFlags = 0
         s.api.leaseDays = 7
         assertTrue(s.open().tick().valid)
         d = s.l.diagnosis()
         assertEquals("valid", d["lease"])
-        assertEquals("24h", d["leaseClass"])
+        assertEquals("standard", d["leaseClass"])
         assertTrue((d["leaseExpires"] as Long) - s.clock.wallMs / 1000 > 6 * 86_400L)
     }
 
@@ -396,5 +534,37 @@ class LeaseGraceTest : OpenChecked() {
         val st = s.open().tick()
         assertTrue("3 days on, the 7-day lease is valid", st.valid)
         assertEquals("no request while it is valid", asked, s.api.seen.count { it == "model-key" })
+    }
+
+    @Test
+    fun aLongLeaseOfTheServersLeaseDaysIsHeldWholeOpensOfflineAndEndsWithItsGrace() {
+        // qlab-api lease_days (owner, 2026-11-19): every install's lease as long as the server makes it, here 10 days for
+        // an unattested install. Nothing in the SDK shortens it or reads its class from exp - iat.
+        val s = install(past = false)
+        s.api.leaseDays = 10
+        s.clock.pass(86_400L * 1000 + 60_000)
+        val c = s.open() // lease 1 is over: a new one, of 10 days
+        val exp = c.tick().exp
+        assertEquals(10L * 86_400, exp - (s.api.now() - 60))
+        assertEquals("standard", s.l.diagnosis()["leaseClass"])
+        // day 9, offline: valid, no request
+        s.clock.pass(9L * 86_400 * 1000)
+        val asked = s.api.seen.count { it == "model-key" }
+        s.api.override = { path, _ -> if (path == "/v1/model-key") throw IOException("offline") else null }
+        assertTrue("day 9 of a 10-day lease is valid", s.open().tick().valid)
+        assertEquals("no request while it is valid", asked, s.api.seen.count { it == "model-key" })
+        // two hours past its exp, still offline: its grace
+        s.clock.pass((exp - s.l.core()!!.tick().now + 2 * 3600) * 1000)
+        val (g, until) = s.open().grace()
+        assertTrue("in the grace after exp", g)
+        assertEquals(exp + 86_400, until)
+        // past exp and the grace: needs_connection
+        s.clock.pass((86_400L - 2 * 3600 + 60) * 1000 + 2 * 60_000)
+        try {
+            s.open()
+            fail("a lease outlived its exp and its grace")
+        } catch (f: LeaseFailure) {
+            assertEquals("needs_connection", f.error.code)
+        }
     }
 }

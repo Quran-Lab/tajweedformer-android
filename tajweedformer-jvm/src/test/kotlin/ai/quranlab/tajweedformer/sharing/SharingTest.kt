@@ -23,7 +23,7 @@ import java.security.MessageDigest
 
 /**
  * The Swift SDK's SharingTests on the JVM: whole sessions through the observer hooks the recognizer
- * calls, the outbox against [StubQlab] (qlab-api and R2 on 127.0.0.1), plus the consent state machine,
+ * calls, the outbox against [StubQlab] (qlab-api and the upload storage on 127.0.0.1), plus the consent state machine,
  * the device-key deletion, and since 2.0.1 the adaptive bitrate, the app's own wording and own UI.
  */
 class SharingTest : OpenChecked() {

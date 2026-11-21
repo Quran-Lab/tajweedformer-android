@@ -153,7 +153,7 @@ internal object AndroidPlatform {
     /**
      * Why this phone cannot run the NPU program of [soc], when that is certain. Google Tensor: LiteRT's NPU path needs
      * Android 12 (API 31) or later and the system's `libedgetpu_litert.so`, which some Pixel system images lack
-     * (Firebase's Pixel 8 and 8a images on Android 15, Pixel 9 builds BP2A.250605): with the vendor library folder
+     * (a device lab's Pixel 8 and 8a images on Android 15, Pixel 9 builds BP2A.250605): with the vendor library folder
      * readable and that library not in it, nothing is downloaded. An unreadable folder proves nothing.
      */
     internal fun npuRuntimeMissing(soc: String): String? {
@@ -182,7 +182,11 @@ internal object AndroidPlatform {
         val pm = context.packageManager
         val info = try { pm.getPackageInfo(context.packageName, 0) } catch (_: Exception) { null }
         val label = try { context.applicationInfo.loadLabel(pm).toString() } catch (_: Exception) { null }
-        val app = AppIdentity(options.appId ?: context.packageName, AppIdentity.cleanVersion(options.appVersion ?: info?.versionName), label?.take(80))
+        // SDK 4.0.1: the build in decimal, the app's own option first
+        @Suppress("DEPRECATION")
+        val build = options.appBuild ?: info?.let { if (Build.VERSION.SDK_INT >= 28) it.longVersionCode.toString() else it.versionCode.toString() }
+        val app = AppIdentity(options.appId ?: context.packageName, AppIdentity.cleanVersion(options.appVersion ?: info?.versionName), label?.take(80),
+            build = build)
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val mem = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
         val soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL.takeIf { it != Build.UNKNOWN } else Build.HARDWARE
@@ -236,7 +240,7 @@ internal object AndroidPlatform {
             val f = File(storage(context), "cloud/options.json")
             f.parentFile?.mkdirs()
             f.writeText(Json.write(linkedMapOf("key" to key,
-                "app_id" to o.appId, "app_version" to o.appVersion, "storage" to o.storage?.path)))
+                "app_id" to o.appId, "app_version" to o.appVersion, "app_build" to o.appBuild, "storage" to o.storage?.path)))
         } catch (_: Exception) {
         }
     }
@@ -253,6 +257,7 @@ internal object AndroidPlatform {
         return try {
             client(context, key, TajweedClientOptions(
                 appId = o["app_id"] as? String, appVersion = o["app_version"] as? String, storage = (o["storage"] as? String)?.let(::File),
+                appBuild = o["app_build"] as? String,
             ))
         } catch (_: Exception) {
             TajweedClient.current

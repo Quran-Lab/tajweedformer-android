@@ -2,6 +2,7 @@ package ai.quranlab.tajweedformer.core
 
 import ai.quranlab.tajweedformer.RecognizerException
 import ai.quranlab.tajweedformer.TajweedError
+import ai.quranlab.tajweedformer.at
 import java.io.File
 
 /** A Core call that failed: the Core's status ([status], negative) and its refusal code ([detail]). */
@@ -23,6 +24,35 @@ internal class CoreException(val status: Int, val detail: Int, val call: String)
         Core.E_KEYSTORE -> RecognizerException.StorageFailed("the install key store: $message")
         Core.E_ENGINE, Core.E_NOMEM -> RecognizerException.EngineFailed(message ?: "")
         else -> RecognizerException.EngineFailed(message ?: "")
+    }
+
+    /**
+     * The SDK's error for a failed `qlc_model_open`: a status answered
+     * `engine_failed` ([openCause]: QLC_E_NOMEM, QLC_E_BUSY, QLC_E_ENGINE, QLC_E_ARG) names itself in the report's
+     * `error_code`, its reason `memory` for QLC_E_NOMEM and `engine` for the others, and the app's error keeps this
+     * failure as its cause; the code stays `engine_failed`. Any other status is [toError]'s (the open tags it).
+     */
+    fun toOpenError(): TajweedError {
+        val (reason, code) = openCause(status) ?: return toError()
+        return RecognizerException.EngineFailed(message ?: "", this)
+            .at(ai.quranlab.tajweedformer.cloud.ErrorCause("model_open", reason, errorName = REPORT_NAME, errorCode = code))
+    }
+
+    companion object {
+        /** The report's `error_name` of a Core failure (24.2: the Kotlin exception's class; a constant, so an app's code
+         *  shrinker that renames the class changes nothing in the report). */
+        const val REPORT_NAME = "ai.quranlab.tajweedformer.core.CoreException"
+
+        /** 24.3 (`errors_40.json` `core_open`): the reason and `error_code` of a Core status that fails the model's open
+         *  with `engine_failed`, or null for a status that is another error. */
+        @JvmStatic
+        fun openCause(status: Int): Pair<String, String>? = when (status) {
+            Core.E_NOMEM -> "memory" to "nomem"
+            Core.E_BUSY -> "engine" to "busy"
+            Core.E_ENGINE -> "engine" to "engine"
+            Core.E_ARG -> "engine" to "arg"
+            else -> null
+        }
     }
 }
 
@@ -160,7 +190,7 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
      *  without a lease, E_STOPPED after a verified stop). */
     fun leaseAttempt(refused: Boolean): Int = CoreNative.leaseAttempt(handle(), if (refused) ATTEMPT_REFUSED else ATTEMPT_UNREACHABLE)
 
-    /** 18.4.7.1: whether the expired lease is in its grace now, and its end (exp + 86400; 0 without a lease). */
+    /** 18.4.7.1: whether the Core opens the lease now while Quran Lab cannot be reached, and until when (0 without a lease). */
     fun grace(): Pair<Boolean, Long> {
         val out = LongArray(1)
         return (CoreNative.leaseGrace(handle(), out) == 1) to out[0]

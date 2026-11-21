@@ -1,5 +1,7 @@
 package ai.quranlab.tajweedformer
 
+import ai.quranlab.tajweedformer.cloud.AnswerClass
+import ai.quranlab.tajweedformer.cloud.HostAnswer
 import ai.quranlab.tajweedformer.core.ProtectedBuild
 import java.io.File
 import java.io.IOException
@@ -33,6 +35,10 @@ internal class ModelStore @JvmOverloads constructor(
     private val ranges: RangePlan = RangePlan.DEFAULT,
     /** How a request that the network cut is made again inside the call (SDK 3.1.3). */
     private val retry: RetryPlan = RetryPlan.DEFAULT,
+    /** SDK 4.0.1: the model hosts the folder's path is asked of; null: the folder's URL only. */
+    private val endpoints: ai.quranlab.tajweedformer.cloud.Endpoints? = null,
+    /** The verdicts of the manifest's check, remembered for the exact bytes that passed it (4.0.1); null: always in full. */
+    private val verdicts: ManifestVerdicts? = null,
 ) {
     /** The folder the build's manifest and files come from: the lease answer's `base` (18.4.5); [baseUrl] at first. */
     @Volatile var filesBase: String = baseUrl
@@ -48,7 +54,7 @@ internal class ModelStore @JvmOverloads constructor(
 
     val downloader: ModelDownloader
         get() = current ?: synchronized(this) {
-            current ?: ModelDownloader(root, filesBase, transport, headers, ranges, retry).also { current = it }
+            current ?: ModelDownloader(root, filesBase, transport, headers, ranges, retry, ModelHosts.of(filesBase, endpoints)).also { current = it }
         }
 
     @Volatile private var cached: ModelManifest? = null
@@ -70,12 +76,18 @@ internal class ModelStore @JvmOverloads constructor(
         }
         if ((refresh || !local.isFile) && filesBase.isNotEmpty()) {
             try {
-                val bytes = fetchBytes(ModelManifest.FILE_NAME)
-                val m = try { ModelManifest.accept(bytes, verifier, expectBuild, expectVersion) } catch (x: TajweedError) { throw x.ofManifest("manifest") }
+                // 28.3: a manifest that does not verify is no answer of its host, and the next model host is asked
+                var got: Pair<ModelManifest, String>? = null
+                val bytes = fetchBytes(ModelManifest.FILE_NAME) { b ->
+                    got = try { accept(b) } catch (x: TajweedError) { throw x.ofManifest("manifest") }
+                }
+                val (m, sha) = got!!
                 root.mkdirs()
                 val tmp = File(root, ModelManifest.FILE_NAME + ".tmp")
                 tmp.writeBytes(bytes)
                 Files.move(tmp.toPath(), local.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                // the verdict sealed beside the bytes now on the device (the folder exists now)
+                verdicts?.passed(root, sha, verifier, ManifestVerdicts.Flags(m.toleranceSigned, m.rawToleranceSigned))
                 cached = m
                 return m
             } catch (e: TajweedError) {
@@ -86,9 +98,23 @@ internal class ModelStore @JvmOverloads constructor(
             }
         }
         if (!local.isFile) throw RecognizerException.ModelMissing("no ${ModelManifest.FILE_NAME} in ${root.path}").at("verify", "missing")
-        val m = try { ModelManifest.accept(local.readBytes(), verifier, expectBuild, expectVersion) } catch (x: TajweedError) { throw x.ofManifest("verify") }
+        val m = try { accept(local.readBytes()).first } catch (x: TajweedError) { throw x.ofManifest("verify") }
         cached = m
         return m
+    }
+
+    /**
+     * [ModelManifest.accept] of [bytes], with the verdict remembered for these exact bytes ([verdicts], 4.0.1): bytes
+     * identical to ones that passed this verifier skip the signature's check (the config's build and version are
+     * checked every time); any other bytes are checked in full, and remembered when they pass. Returns the manifest and
+     * the SHA-256 of the bytes.
+     */
+    private fun accept(bytes: ByteArray): Pair<ModelManifest, String> {
+        val sha = ModelManifest.hex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes))
+        val known = verdicts?.known(root, sha, verifier)
+        val m = ModelManifest.accept(bytes, verifier, expectBuild, expectVersion, known)
+        if (known == null) verdicts?.passed(root, sha, verifier, ManifestVerdicts.Flags(m.toleranceSigned, m.rawToleranceSigned))
+        return m to sha
     }
 
     /**
@@ -108,12 +134,50 @@ internal class ModelStore @JvmOverloads constructor(
         return manifestBytes()
     }
 
-    /** A small file whole (the manifest). It is asked once (SPEC 16.2): the retry rule is for the files it lists. */
-    private fun fetchBytes(path: String): ByteArray {
+    /**
+     * A small file whole (the manifest), which [accept] takes or throws for. It is asked once (SPEC 16.2): the retry rule
+     * is for the files it lists. SDK 4.0.1: one request through the `models` hosts, the base's own
+     * host first when it is not one of them; a host that does not answer, fails (5xx), redirects, answers a page that is not
+     * its own or a file [accept] refuses was unreachable, and the next is asked at once. A refusal or a 429 ends it there.
+     */
+    private fun fetchBytes(path: String, accept: (ByteArray) -> Unit): ByteArray {
+        val hosts = ModelHosts.of(filesBase, endpoints)
+        val e = endpoints
+        if (hosts.fixed || e == null) return fetchOnce(filesBase + path, path).also(accept)
+        val got = e.request<Any>(e.models, fileStage(path), first = hosts.baseHost) { _, origin ->
+            try {
+                val bytes = fetchOnce(origin + hosts.path + path, path)
+                try {
+                    accept(bytes)
+                    HostAnswer.ends(AnswerClass.TAKEN, bytes)
+                } catch (x: TajweedError) {
+                    HostAnswer.unreachable(null, x, "invalid_answer", 200)
+                }
+            } catch (x: RecognizerException.DownloadFailed) {
+                // the system's refusal of the network is the same on every host
+                if (x.cause is NetworkNotPermitted) throw x
+                val c = x.cause40
+                if (RetryPlan.resumable(x, true)) HostAnswer.unreachable(null, x, c?.reason ?: "network", c?.httpStatus)
+                else HostAnswer.ends(if (c?.reason == "rate_limited") AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x)
+            } catch (x: TajweedError) {
+                // a refusal the Client read from the answer (a stop, the key, the daily limit)
+                HostAnswer.ends(if (x is RecognizerException.ModelLimit) AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x)
+            }
+        }
+        val v = got.answer.value
+        if (v is ByteArray) return v
+        val x = (v as? TajweedError) ?: (got.answer.failure as TajweedError)
+        throw x.via("models", got.fallback)
+    }
+
+    /** One request for a small file at [url]. */
+    private fun fetchOnce(url: String, path: String): ByteArray {
         try {
-            modelRequest(transport, filesBase + path, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
+            modelRequest(transport, url, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
                 val bytes = r.body.readBytes()
-                if (bytes.size > MAX_MANIFEST_BYTES) throw RecognizerException.DownloadFailed(path, "too large").at("manifest", "invalid_answer", r.code)
+                if (bytes.size > MAX_MANIFEST_BYTES) {
+                    throw RecognizerException.DownloadFailed(path, "too large", WrongAnswer("too large")).at("manifest", "invalid_answer", r.code)
+                }
                 return bytes
             }
         } catch (e: IOException) {
@@ -173,29 +237,197 @@ internal class ModelStore @JvmOverloads constructor(
         val files = ModelProfile.cpu(m, c)
         fetchAll(files.filter { !present(it, build) }, cancel, onProgress, m.build)
         if (install) build.install(files, { downloader.isInPlace(it) }, { downloader.local(it) })
-        return ModelFolder.protected(build, verifier)
+        return ModelFolder.protected(build)
     }
 
     /** Downloads [files] (the sample clips, a file the app asked for) that are not on the device yet. */
     fun fetch(files: List<ModelManifest.FileEntry>, cancel: Cancellation? = null) =
         fetchAll(files.filter { !downloader.isInPlace(it) }, cancel, null, manifest().build)
 
+    /**
+     * Downloads [files], up to [FILES_AT_ONCE] at a time (4.0.1; until 4.0.0 one after another, the small ones first):
+     * the largest first, so the weights (about 54 MB, itself in ranges) start at once and the small files come beside
+     * them. See [FilesAtOnce]. Progress is the bytes of all of them together, never lower than a report before it.
+     */
     private fun fetchAll(files: List<ModelManifest.FileEntry>, cancel: Cancellation?, onProgress: ((ProfileProgress) -> Unit)?, revision: String) {
         if (files.isEmpty()) return
         // every file of the build comes only from the folder a lease answer named (18.4.5); none named: none is fetched
         if (filesBase.isEmpty()) throw RecognizerException.DownloadFailed(files.first().path, "no lease answer has named a valid folder for the build")
-        val total = ModelProfile.bytes(files)
-        var done = 0L
-        // small files first, so a model is quickly known to be usable or not
-        for (e in files.sortedBy { it.size }) {
-            downloader.fetch(e, cancel, { p -> onProgress?.invoke(ProfileProgress(p.path, done + p.bytes, total)) }, revision)
-            done += e.size
-            onProgress?.invoke(ProfileProgress(e.path, done, total))
-        }
+        FilesAtOnce(downloader, files.sortedByDescending { it.size }, FILES_AT_ONCE, cancel, onProgress, revision).run()
     }
 
     companion object {
         const val MAX_MANIFEST_BYTES = 1 shl 20
+
+        /** Files downloaded at the same time (4.0.1): the weights and three small files, or four small ones. */
+        const val FILES_AT_ONCE = 4
+    }
+}
+
+/**
+ * Several files of one call at the same time (4.0.1, perf plan row 5: the CPU set is about 14 files, and each small one
+ * waited for the one before it).
+ *
+ * - **At most [streams] files at once**, on threads of their own, taken from [files] in their order; one file alone
+ *   is downloaded on the calling thread. Each file is downloaded as [ModelDownloader.fetch] downloads one (its resumes,
+ *   its ranges, its checks); the Core's installs come after, on the caller's thread, as before.
+ * - **The first failure ends the call**: no new file starts, the other files' requests are ended (their parts and
+ *   maps stay for the next call, as a cut download's do), and the call fails with that first failure, never with the
+ *   end it caused in the others (those are not reported as downloads of their own: [Cancellation.bySibling]). A
+ *   refusal (the Client's error for an answer: a stop, the daily limit, a key the CDN does not take) is the call's
+ *   error whatever failed first, as within one file in ranges.
+ * - **A refusal's work** (a stop remembered, the model's files removed: [ModelAuth.refuse]) is done only once every
+ *   other file has stopped writing: the file that read it ends the others first and waits for them, so nothing of the
+ *   model is written after it was removed. Two files refused at once each wait only for the files not refused.
+ * - **The token is renewed at most once** for all the files (401 `invalid_token` on several files at once): the others
+ *   repeat with the new token.
+ * - **A cancel** of the call (the Client closed, the caller's thread interrupted) ends every file.
+ */
+internal class FilesAtOnce(
+    private val downloader: ModelDownloader,
+    private val files: List<ModelManifest.FileEntry>,
+    streams: Int,
+    private val cancel: Cancellation?,
+    private val onProgress: ((ProfileProgress) -> Unit)?,
+    private val revision: String,
+) {
+    private val streams = maxOf(1, minOf(streams, files.size))
+    private val total = ModelProfile.bytes(files)
+    /** The files' own cancel: the caller's, and the first failure's. */
+    private val own = Cancellation()
+    private val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+    private val queue = java.util.concurrent.ConcurrentLinkedQueue(files)
+    /** Per stream: whether it is inside a file's download now (its requests may still write). */
+    private val busy = BooleanArray(this.streams)
+    /** Per stream: whether it read a refusal and waits to do its work. */
+    private val refusing = BooleanArray(this.streams)
+    private val state = Object()
+    private var renewed = false
+    /** Bytes of each file so far, as reported; the sum is what the call reports. */
+    private val bytes = HashMap<String, Long>()
+    private var reported = -1L
+
+    fun run() {
+        val linked = cancel?.whenCancelled { own.cancel() }
+        try {
+            if (streams == 1) {
+                stream(0)
+            } else {
+                val ended = java.util.concurrent.CountDownLatch(streams)
+                for (w in 0 until streams) {
+                    Thread({
+                        try {
+                            stream(w)
+                        } finally {
+                            ended.countDown()
+                        }
+                    }, "tajweedformer-file-$w").apply { isDaemon = true }.start()
+                }
+                try {
+                    ended.await()
+                } catch (x: InterruptedException) {
+                    // the caller's thread was interrupted (a cancelled coroutine): every file ends, their parts stay
+                    own.cancel()
+                    try { ended.await(HALT_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+                    Thread.currentThread().interrupt()
+                    throw RecognizerException.DownloadFailed(files.first().path, "cancelled").tagged(files.first().path, "cancelled", null)
+                }
+            }
+        } finally {
+            linked?.close()
+        }
+        failure.get()?.let { throw it }
+        // a call cancelled before a file failed (or before any started) is still a cancelled download
+        queue.peek()?.let { e -> throw RecognizerException.DownloadFailed(e.path, "cancelled").tagged(e.path, "cancelled", null) }
+    }
+
+    /** One stream: files from the queue until it is empty or the call has failed. */
+    private fun stream(w: Int) {
+        val auth = downloader.headers?.let { inner -> if (inner is ModelAuth) StreamAuth(inner, w) else inner }
+        // a cancelled call goes on taking files until one fails as cancelled (a file in place is not downloaded at all)
+        while (failure.get() == null) {
+            val e = queue.poll() ?: break
+            synchronized(state) { busy[w] = true }
+            try {
+                downloader.fetch(e, own, { p -> progress(p.path, p.bytes) }, revision, auth)
+                progress(e.path, e.size)
+            } catch (x: Throwable) {
+                failed(x)
+            } finally {
+                synchronized(state) {
+                    busy[w] = false
+                    state.notifyAll()
+                }
+            }
+        }
+    }
+
+    /** The first failure is the call's, and ends the other files; a refusal is the call's whatever failed first. */
+    private fun failed(x: Throwable) {
+        val refusal = x is TajweedError && x !is RecognizerException.DownloadFailed
+        // the others' ends that this failure (or the caller's cancel) caused are not failures of their own
+        val first = if (refusal) { failure.set(x); true } else failure.compareAndSet(null, x)
+        if (first || refusal) {
+            if (!(cancel?.isCancelled ?: false)) own.bySibling = true
+            own.cancel()
+        }
+    }
+
+    /** A file's bytes so far: the sum over the files, reported in order and never lower than a report before it. */
+    private fun progress(path: String, n: Long) {
+        val cb = onProgress ?: return
+        synchronized(bytes) {
+            if (n > (bytes[path] ?: 0L)) bytes[path] = n
+            val sum = bytes.values.sum()
+            if (sum < reported) return
+            reported = sum
+            try { cb(ProfileProgress(path, sum, total)) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * The Client's model-request rules for one stream of this call: the token renewed once for every file, and a
+     * refusal that first ends every other file and then waits for them before its work on the device.
+     */
+    private inner class StreamAuth(private val inner: ModelAuth, private val w: Int) : ModelAuth {
+        override fun headers(url: String): Map<String, String> = inner.headers(url)
+        override fun renewal(status: Int, body: ByteArray): Boolean = inner.renewal(status, body)
+
+        /** Inside the lock: a file refused at the same time waits here until the token is renewed, then repeats with it. */
+        override fun renew() {
+            synchronized(this@FilesAtOnce) {
+                if (renewed) return
+                renewed = true
+                inner.renew()
+            }
+        }
+
+        override fun refused(status: Int, body: ByteArray): TajweedError? {
+            val error = inner.refused(status, body) ?: return null
+            // recorded before anything is ended, so the call fails with it however the other files end
+            failed(error)
+            return error
+        }
+
+        /** Every other file has stopped writing (each that is not itself refused), then the refusal's work. */
+        override fun refuse(status: Int, body: ByteArray) {
+            synchronized(state) {
+                refusing[w] = true
+                try {
+                    while ((0 until streams).any { it != w && busy[it] && !refusing[it] }) state.wait()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            synchronized(this@FilesAtOnce) { inner.refuse(status, body) }
+        }
+
+        override fun served() = inner.served()
+    }
+
+    private companion object {
+        /** How long a cancelled call waits for its files' streams. */
+        const val HALT_WAIT_MS = 5_000L
     }
 }
 

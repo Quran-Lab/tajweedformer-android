@@ -8,7 +8,7 @@ import kotlin.random.Random
 
 /**
  * How a shared session is cut into segments: 10, 20, 40, then 60 s each (the last entry repeats),
- * cut at Ogg page boundaries. Short first segments reach R2 within seconds; a long session makes
+ * cut at Ogg page boundaries. Short first segments reach the storage within seconds; a long session makes
  * one upload a minute.
  */
 internal object SegmentPlan {

@@ -4,12 +4,15 @@ import ai.quranlab.tajweedformer.Json
 import ai.quranlab.tajweedformer.RecognizerException
 import ai.quranlab.tajweedformer.TajweedError
 import ai.quranlab.tajweedformer.at
+import ai.quranlab.tajweedformer.via
 import ai.quranlab.tajweedformer.cloud.AppIdentity
 import ai.quranlab.tajweedformer.cloud.AppToken
 import ai.quranlab.tajweedformer.cloud.CloudException
 import ai.quranlab.tajweedformer.cloud.HttpResponse
 import ai.quranlab.tajweedformer.cloud.IntegrityProvider
+import ai.quranlab.tajweedformer.cloud.HostNames
 import ai.quranlab.tajweedformer.cloud.ModelGate
+import ai.quranlab.tajweedformer.cloud.NotTaken
 import ai.quranlab.tajweedformer.cloud.QuranLabApi
 import ai.quranlab.tajweedformer.cloud.QuranLabKey
 import ai.quranlab.tajweedformer.cloud.b64url
@@ -188,9 +191,9 @@ internal class LeaseClient(
      * `diagnose()`'s `protected` object: which key store
      * holds the install's agreement key (`strongbox`, `tee`, `software`; null before the install has one), the lease
      * as the Core holds it (`valid`, `grace`, `expired`, `stopped`, `none`), its `leaseExpires` and `refreshAfter`
-     * (unix seconds), its `leaseClass` (`7d` when the lease's flags allow accelerator programs, which 18.4.6 gives only
-     * the 7-day class, else `24h`; never from exp - iat, 18.4.7.2), `graceUntil` (exp + 86400, only in the grace of
-     * 18.4.7.1) and the Core's release and target. No key, path or identifier.
+     * (unix seconds), its `leaseClass` (`attested` when the lease's flags allow accelerator programs, which 18.4.6 gives
+     * only the attested class, else `standard`; never from the lease's times, which are the server's), `graceUntil`
+     * (only while `lease` is `grace`, 18.4.7.1) and the Core's release and target. No key, path or identifier.
      */
     fun diagnosis(): Map<String, Any?> {
         val k = try { identity.current() } catch (_: Exception) { null }
@@ -207,7 +210,7 @@ internal class LeaseClient(
             else -> "none"
         }
         val held = st != null && st.hasLease && lease != "stopped" && lease != "none"
-        val cls = if (!held) null else try { if (c!!.accelAllowed()) "7d" else "24h" } catch (_: Exception) { null }
+        val cls = if (!held) null else try { if (c!!.accelAllowed()) "attested" else "standard" } catch (_: Exception) { null }
         return linkedMapOf(
             "keyStore" to keyStore,
             "lease" to lease,
@@ -390,8 +393,8 @@ internal class LeaseClient(
     }
 
     /**
-     * A refresh in the background (18.4.7): at the first app start or model open after `refresh_after`. A failure
-     * waits 1, 5 and 30 minutes, then 2 hours, then at most 6 hours between tries. A valid lease is never in question
+     * A refresh in the background (18.4.7): at the first app start or model open after `refresh_after`. After a
+     * failure the next try waits [BACKOFF_MS] (or the server's `Retry-After`). A valid lease is never in question
      * while it waits.
      */
     fun refreshIfDue(t: LeaseTarget, roots: (Core) -> Unit, failed: (LeaseFailure) -> Unit = {}) {
@@ -460,27 +463,36 @@ internal class LeaseClient(
             if (cert.recheck && integrity != null && project != null) {
                 try { body["integrity_token"] = integrity.token(requestHash(challenge, sha256(c.key.spki).hex()), project) } catch (_: Exception) {}
             }
-            val r = try { api.modelKey(tok, body) } catch (e: CloudException) { answered(e); throw failure(e, "offline").also { leaseEvent(it.kind) } }
-            answered(r.status, r.status != 200 && r.error.apiRefusal, r.retryAfter ?: 0)
-            if (r.status == 200) {
-                try {
-                    accept(c, t, r)
-                } catch (f: LeaseFailure) {
-                    leaseEvent(f.kind)
-                    throw f
-                } catch (e: TajweedError) {
-                    // the manifest of the answer's folder could not be had (the network, a manifest that is not this build)
-                    throw LeaseFailure(if (e is RecognizerException.NeedsConnection || e is RecognizerException.NetworkNotPermitted) "offline" else "other", e)
-                        .also { leaseEvent(it.kind) }
-                } catch (e: CoreException) {
-                    // the key store could not open the outer wrap (a key the store lost): a new key, once
-                    if (e.status == Core.E_KEYSTORE && !keystoreRetry) {
-                        keystoreRetry = true
-                        dropCert()
-                        continue
-                    }
-                    throw LeaseFailure("other", e.toError()).also { leaseEvent(it.kind) }
+            // 28.3, 28.5 (SDK 4.0.1): the request goes through the api hosts, and a 200 is taken only as a lease the Core
+            // accepts ([accept]); one that is no lease answer of 18.4.5 (no lease, a base off the allow-list) or whose lease
+            // the Core refuses makes that host unreachable, and the next host is asked with the same challenge
+            val r = try {
+                api.modelKey(tok, body) { a -> accept(c, t, a) }
+            } catch (e: CloudException) {
+                answered(e)
+                throw failure(e, "offline").also { leaseEvent(it.kind) }
+            } catch (f: LeaseFailure) {
+                // 28.7: an answer every host gave that was no lease (the first host's failure), after more than one host
+                answered(200, false, 0, api.lastRequestFallback())
+                leaseEvent(f.kind)
+                throw f
+            } catch (e: TajweedError) {
+                answered(200, false, 0, api.lastRequestFallback())
+                // the manifest of the answer's folder could not be had (the network, a manifest that is not this build)
+                throw LeaseFailure(if (e is RecognizerException.NeedsConnection || e is RecognizerException.NetworkNotPermitted) "offline" else "other", e)
+                    .also { leaseEvent(it.kind) }
+            } catch (e: CoreException) {
+                answered(200, false, 0, api.lastRequestFallback())
+                // the key store could not open the outer wrap (a key the store lost): a new key, once
+                if (e.status == Core.E_KEYSTORE && !keystoreRetry) {
+                    keystoreRetry = true
+                    dropCert()
+                    continue
                 }
+                throw LeaseFailure("other", e.toError()).also { leaseEvent(it.kind) }
+            }
+            answered(r.status, r.status != 200 && r.error.apiRefusal, r.retryAfter ?: 0, r.fallback)
+            if (r.status == 200) {
                 leaseEvent(null)
                 return c
             }
@@ -501,8 +513,9 @@ internal class LeaseClient(
                     leaseEvent("refused")
                     val why = e.reason ?: e.code
                     val rules = ai.quranlab.tajweedformer.cloud.ErrorRules
-                    throw LeaseFailure("refused", if (verified) ModelGate.error(why, app.bundleId).at("lease", "stopped", r.status, why)
-                        else RecognizerException.ServerRejected(why, app.bundleId).at("lease", "refused", r.status, rules.serverCode(e)), stopped = verified)
+                    throw LeaseFailure("refused", (if (verified) ModelGate.error(why, app.bundleId).at("lease", "stopped", r.status, why)
+                        else RecognizerException.ServerRejected(why, app.bundleId).at("lease", "refused", r.status, rules.serverCode(e)))
+                        .via(QuranLabApi.ROLE, r.fallback), stopped = verified)
                 }
                 r.status == 401 && e.code == "invalid_token" && !renewedToken -> { renewedToken = true; invalidateToken() }
                 r.status == 401 && e.code == "install_cert_invalid" && !attested -> {
@@ -526,12 +539,15 @@ internal class LeaseClient(
 
     /** The answer the last request of this thread's lease attempt got: its status (0: none at all), whether it is the
      *  API's own refusal (a 4xx other than 429 with a JSON `error` string), and its Retry-After. */
-    private class Answer(val status: Int, val apiRefusal: Boolean, val retryAfterS: Int)
+    private class Answer(val status: Int, val apiRefusal: Boolean, val retryAfterS: Int, val fallback: Boolean)
     private val lastAnswer = ThreadLocal<Answer?>()
-    private fun answered(status: Int, apiRefusal: Boolean, retryAfterS: Int) = lastAnswer.set(Answer(status, apiRefusal, retryAfterS))
+    private fun answered(status: Int, apiRefusal: Boolean, retryAfterS: Int, fallback: Boolean = false) =
+        lastAnswer.set(Answer(status, apiRefusal, retryAfterS, fallback))
+    /** 28.5: an answer that every host was unreachable for carries the first host's status and the largest Retry-After. */
     private fun answered(e: CloudException) {
         val a = e.api
-        if (a == null) answered(0, false, 0) else answered(a.status, a.apiRefusal, a.retryAfter ?: 0)
+        if (a == null) answered(0, false, e.retryAfterMax ?: 0, e.fallback == true)
+        else answered(a.status, a.apiRefusal, a.retryAfter ?: 0, e.fallback == true)
     }
 
     private val graceLock = Object()
@@ -542,6 +558,7 @@ internal class LeaseClient(
     private var attStatus = 0
     private var attReason = "network"
     private var attRetryAfterS = 0
+    private var attFallback = false
     private val executor = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "tajweedformer-lease").apply { isDaemon = true } }
 
     /**
@@ -578,6 +595,7 @@ internal class LeaseClient(
             attStatus = a.status
             attReason = graceReason(f, a.status)
             attRetryAfterS = a.retryAfterS
+            attFallback = a.fallback
         }
     }
 
@@ -628,8 +646,8 @@ internal class LeaseClient(
      *  attempt); null when the Core gives none. */
     private fun inGrace(c: Core): Core? {
         if (!(try { c.grace().first } catch (_: Exception) { false })) return null
-        val (st, why) = synchronized(graceLock) { attStatus to attReason }
-        try { onGrace(ai.quranlab.tajweedformer.cloud.ErrorCause("lease", "grace", st.takeIf { it > 0 }, null, why)) } catch (_: Exception) {}
+        val (st, why, fb) = synchronized(graceLock) { Triple(attStatus, attReason, attFallback) }
+        try { onGrace(ai.quranlab.tajweedformer.cloud.ErrorCause("lease", "grace", st.takeIf { it > 0 }, null, why, hostRole = QuranLabApi.ROLE, fallback = fb)) } catch (_: Exception) {}
         return c
     }
 
@@ -648,14 +666,22 @@ internal class LeaseClient(
      * proof was made under as the good one). A piece that does not verify changes nothing.
      */
     private fun accept(c: Core, t: LeaseTarget, r: HttpResponse) {
-        val o = r.json() ?: throw LeaseFailure("other", RecognizerException.DownloadFailed("model-key", "the answer is not JSON"))
-        val lease = (o["lease"] as? String)?.let { try { b64urlDecode(it) } catch (_: Exception) { null } }
-            ?: throw LeaseFailure("other", RecognizerException.DownloadFailed("model-key", "the answer carries no lease"))
-        // the build's folder: only one of Quran Lab's own (18.4.5, [baseOk]), never another host. Without one the build's
-        // manifest and files cannot be had (an invalid answer, unless the device has them all), and no file is fetched
-        val base = (o["base"] as? String)?.takeIf { baseOk(it) }
+        // no lease answer of 18.4.5: that host was unreachable (28.3); when every host was, the first one's failure
+        fun notALease(why: String): Nothing = throw NotTaken(LeaseFailure("other", RecognizerException.DownloadFailed("model-key", why)))
+        val o = r.json() ?: notALease("the answer is not JSON")
+        val lease = (o["lease"] as? String)?.let { try { b64urlDecode(it) } catch (_: Exception) { null } } ?: notALease("the answer carries no lease")
+        // the build's folder: only on a host of the allow-list (28.4, [baseOk]); an answer that names none is no lease
+        // answer, and no file is fetched
+        val base = (o["base"] as? String)?.takeIf { baseOk(it) } ?: notALease("the lease answer names no valid folder for the build")
         val manifest = t.manifest(base)
-        c.leaseAccept(lease, manifest, t.build)
+        try {
+            c.leaseAccept(lease, manifest, t.build)
+        } catch (e: CoreException) {
+            // a lease the Core refuses is no lease (28.3: unreachable, the next host); a key store that lost the key is the
+            // request's own failure
+            if (e.status == Core.E_KEYSTORE) throw e
+            throw NotTaken(e)
+        }
         (o["piece"] as? String)?.takeIf { it.length in 1..8192 }?.let { p -> try { c.leasePiece(b64urlDecode(p)) } catch (_: Exception) {} }
         (o["install_cert"] as? String)?.let { s -> InstallCert.parse(s)?.let { synchronized(lock) { write(certFile, it.encoded) } } }
         val exp = (o["exp"] as? Double)?.toLong() ?: 0
@@ -713,7 +739,7 @@ internal class LeaseClient(
             // the reason integrity_failed already says lease_integrity_failed; error_code says which check (24.2)
             integrity -> integrityErrorCode(why, body?.get("check") as? String) ?: rules.serverCode(e)
             else -> rules.serverCode(e)
-        })
+        }).via(QuranLabApi.ROLE, r.fallback)
         return LeaseFailure(if (r.status == 429 || r.status >= 500) "offline" else kind, err)
     }
 
@@ -727,22 +753,18 @@ internal class LeaseClient(
 
     companion object {
         /**
-         * Whether a lease answer's `base` may be used as the build's folder (as the Apple and C SDKs take it): https,
-         * the host quranlab.ai or a subdomain of it, a path that ends in `/`, and no port, user, query, fragment,
-         * backslash, space or `..`. Every file of a build comes only from that folder; there is no other host.
+         * Whether a lease answer's `base` may be used as the build's folder: https, a host of
+         * the allow-list (`quranlab.ai`, `tajweedformer.com`, `quran-lab.com` or a subdomain; 4.0.0 took `*.quranlab.ai`
+         * only), a path that starts and ends with `/`, and no port, user, query, fragment, backslash, space or `..`. Its
+         * path is fetched through the `models` hosts; no other host is ever asked.
          */
         @JvmStatic
-        fun baseOk(b: String): Boolean {
-            if (b.length < 9 || b.length >= 512 || !b.startsWith("https://") || !b.endsWith("/") || ".." in b || b.any { it in "?#@\\ " }) return false
-            val host = b.substring(8, b.indexOf('/', 8)).lowercase()
-            if (host.isEmpty() || ':' in host) return false
-            return host == "quranlab.ai" || (host.length > 12 && host.endsWith(".quranlab.ai"))
-        }
+        fun baseOk(b: String): Boolean = HostNames.base(b) != null
 
         /** 18.4.7.1: the reasons a report of an open in grace names (24.3). */
         val GRACE_REASONS = setOf("network", "timeout", "http", "rate_limited", "redirect", "invalid_answer", "invalid", "lease_unavailable")
 
-        /** 18.4.7: a failed refresh waits 1, 5 and 30 minutes, then 2 hours, then at most 6 hours. */
+        /** 18.4.7: how long a failed refresh waits before its next try, by the number of failures in a row. */
         @JvmField val BACKOFF_MS = longArrayOf(60_000, 300_000, 1_800_000, 7_200_000, 7_200_000, 14_400_000, 21_600_000)
 
         /** A token of the server's `why` or `check` (never free text in a message or a report). */

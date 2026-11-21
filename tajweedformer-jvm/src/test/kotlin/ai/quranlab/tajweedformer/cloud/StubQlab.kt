@@ -24,7 +24,7 @@ import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
- * A local stand-in for qlab-api and R2 on 127.0.0.1 (never a production host), following qlab-api's
+ * A local stand-in for qlab-api and the upload storage on 127.0.0.1 (never a production host), following qlab-api's
  * closed schemas (an unknown field is 400 `invalid_body` naming it), its config signing (Ed25519 over
  * the exact body, key id, ETag), its tokens, presigned segment URLs, the device-key deletion and the
  * telemetry v2 schema. Records every request; any request with an `Origin` header is refused as an
@@ -242,13 +242,16 @@ internal class StubQlab : AutoCloseable {
     @Volatile var issueAnswer: ((Seen) -> Reply?)? = null
 
     /** An error report: the top level of section 7 with
-     *  `error` and without `message`, `frames`, `detail`; the closed `error` object. */
+     *  `error` and without `message`, `frames`, `detail`; the closed `error` object, with 4.0.1's `host_role` (`api`,
+     *  `models`, `web_frame`) and `fallback` (a bool) of section 28.7, which qlab-api takes before 4.0.1 ships. */
     private fun errorReport(s: Seen): Reply {
         closed(s, setOf("day", "platform", "sdk_version", "app_version", "os_version", "device_class", "backend", "revision", "kind", "code", "error"))?.let { return it }
         val e = s.json?.get("error") as? Map<*, *> ?: return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error: required"))
         val allowed = setOf("stage", "reason", "http_status", "error_name", "error_code", "count", "retries", "first_launch", "first_report", "build",
-            "device_model", "ram_tier", "storage_free", "abi", "web")
+            "device_model", "ram_tier", "storage_free", "abi", "web", "host_role", "fallback")
         e.keys.firstOrNull { it !in allowed }?.let { return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.$it: unknown field")) }
+        if (e.containsKey("host_role") && e["host_role"] !in ErrorRules.HOST_ROLES) return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.host_role"))
+        if (e.containsKey("fallback") && e["fallback"] !is Boolean) return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.fallback"))
         if (e["stage"] !in ErrorRules.STAGES || (e["reason"] as? String)?.let { ErrorRules.TOKEN.matches(it) } != true) {
             return Reply.json(400, mapOf("error" to "invalid_body", "message" to "error.stage or error.reason"))
         }
@@ -278,7 +281,7 @@ internal class StubQlab : AutoCloseable {
         return Reply.json(400, mapOf("error" to "invalid_body", "message" to "json.$bad: unknown field"))
     }
 
-    private fun token(attested: Boolean): String {
+    internal fun token(attested: Boolean): String {
         val payload = linkedMapOf<String, Any?>("app" to "android:org.example.recite", "att" to attested, "exp" to System.currentTimeMillis() / 1000 + 86_400, "k" to "testkey01")
         if (attested) payload["via"] = "pi"
         val t = "qlt_v1." + Base64.getUrlEncoder().withoutPadding().encodeToString(Json.write(payload).toByteArray()) + ".sig${++tokenN}"

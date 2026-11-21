@@ -174,6 +174,9 @@ internal data class DownloadResult(
     val protocols: Map<String, Long> = emptyMap(),
     /** A failed download's telemetry reason: `network`, `http`, `hash_mismatch`, `signature`, `storage`, `other`. */
     val failureReason: String? = null,
+    /** Bytes of the file its SHA-256 held when the last byte was in (4.0.1: hashed while written; the rest was read
+     *  after); -1 when it was in place already or failed. */
+    val hashedInFlight: Long = -1,
 ) {
     /** The protocol that carried most of the bytes (also when none came), or null when no answer came. */
     val protocol: String? get() = protocols.entries.maxByOrNull { it.value }?.key

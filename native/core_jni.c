@@ -904,7 +904,7 @@ static jint n_lease_attempt(JNIEnv *env, jclass c, jlong hp, jint outcome) {
   return h ? Q.lease_attempt(h->core, (int)outcome) : QLC_E_ARG;
 }
 
-/* 18.4.7.1: 1 while the expired lease is in its grace, else 0; out[0]: until (exp + 86400 while a lease is held) */
+/* 18.4.7.1: 1 while the Core opens the lease although Quran Lab cannot be reached, else 0; out[0]: until (the Core's) */
 static jint n_lease_grace(JNIEnv *env, jclass c, jlong hp, jlongArray out) {
   (void)c;
   Host *h = host_of(env, hp);

@@ -51,7 +51,8 @@ class OneSheetApiTest : OpenChecked() {
         val c = TajweedClientOptions::class.java
         val names = c.declaredFields.map { it.name } + c.methods.map { it.name } + c.declaredClasses.map { it.simpleName }
         assertEquals(emptyList<String>(), names.filter { ruledOut.containsMatchIn(it.removePrefix("get")) })
-        assertEquals(setOf("appId", "appVersion", "storage", "unmeteredOnly"),
+        // 4.0.1 adds appBuild
+        assertEquals(setOf("appId", "appVersion", "storage", "unmeteredOnly", "appBuild"),
             c.declaredFields.filter { !java.lang.reflect.Modifier.isStatic(it.modifiers) }.map { it.name }.toSet())
         // the public sharing API: no member for a variant of the sheet
         for (k in listOf(TajweedClient::class.java, TajweedSharing::class.java)) {

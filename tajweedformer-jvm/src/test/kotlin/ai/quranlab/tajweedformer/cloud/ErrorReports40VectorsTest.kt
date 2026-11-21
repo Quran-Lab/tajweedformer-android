@@ -1,7 +1,12 @@
 package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.core.Core
+import ai.quranlab.tajweedformer.core.CoreException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -34,11 +39,12 @@ class ErrorReports40VectorsTest : ai.quranlab.tajweedformer.OpenChecked() {
     }
 
     /** Every `codes` case (f209443: 61, the 12 after the 49 for the token and the lease; 1c971ab: 66, the grace's 3 and
-     *  the 2 of 503 lease_unavailable). */
+     *  the 2 of 503 lease_unavailable; 564c144: 73, the 3 silent failovers of 28.7 and the 4 Core statuses at the model's
+     *  open of Gate C). */
     @Test
     fun everyCodeCase() {
         val cases = list("codes")
-        assertEquals(66, cases.size)
+        assertEquals(73, cases.size)
         for (c in cases) {
             val stage = c["stage"] as String
             val reason = c["reason"] as String
@@ -148,6 +154,67 @@ class ErrorReports40VectorsTest : ai.quranlab.tajweedformer.OpenChecked() {
         // never a message, frames or detail on kind error, and no value of an identifier, a path or a URL
         for (k in listOf("message", "frames", "detail")) assertTrue(k, k !in got)
         assertTrue(Json.write(got).let { !it.contains("://") && !it.contains("\\/") })
+    }
+
+    /**
+     * 24.3, Gate C: each Core status that fails `qlc_model_open` with `engine_failed` (`core_open`),
+     * through the SDK's own reading of the Core's failure at the open ([CoreException.toOpenError]): the code the app gets,
+     * the report's stage, reason and error_code, and the Core's failure kept as the error's cause. 4.0.0 answered all four
+     * `engine_failed`, reason `engine`, with no status.
+     */
+    @Test
+    fun everyCoreStatusAtTheModelOpen() {
+        val cases = list("core_open")
+        assertEquals(4, cases.size)
+        val byName = mapOf("QLC_E_ARG" to Core.E_ARG, "QLC_E_NOMEM" to Core.E_NOMEM, "QLC_E_ENGINE" to Core.E_ENGINE, "QLC_E_BUSY" to Core.E_BUSY)
+        for (c in cases) {
+            val status = int(c["status"])!!
+            assertEquals("${c["name"]}", byName[c["name"]], status)
+            val x = CoreException(status, 0, "qlc_model_open")
+            val e = x.toOpenError()
+            assertEquals("$c", c["code"], e.code)
+            assertSame("$c: the Core's failure is the cause", x, e.cause)
+            val cause = ErrorCause.of(e)
+            assertEquals("$c", listOf(c["stage"], c["reason"], c["error_code"]), listOf(cause.stage, cause.reason, cause.errorCode))
+            assertEquals(CoreException.REPORT_NAME, cause.errorName)
+            assertEquals("$c", c["code"], ErrorRules.codeFor(cause.stage, cause.reason, null, "complete", cause.errorCode))
+            assertTrue("$c is reported", ErrorRules.reported(cause.stage, cause.reason, e.code))
+            assertTrue(ErrorRules.ERROR_CODE.matches(cause.errorCode!!))
+        }
+        // the class name the report gives is the class's own (a constant, so a shrunk app reports the same)
+        assertEquals(CoreException::class.java.name, CoreException.REPORT_NAME)
+        // every other status at the open is its own error, as in 4.0.0, and the open names it
+        for (st in listOf(Core.E_NEEDS_CONNECTION, Core.E_STORAGE, Core.E_MANIFEST, Core.E_FILE, Core.E_LEASE, Core.E_KEYSTORE, Core.E_STOPPED)) {
+            val x = CoreException(st, 0, "qlc_model_open")
+            assertNull(CoreException.openCause(st))
+            val e = x.toOpenError()
+            assertEquals(x.toError().code, e.code)
+            assertNull("${Core.statusName(st)}: tagged where the Client opens the model", e.cause40)
+        }
+    }
+
+    /** The report of a Core failure at the open, built by the SDK's own cloud side: the accepted Android body of `bodies`
+     *  ("Android: the Core busy at the model open"), with its count and first_report, and no host role (no request). */
+    @Test
+    fun theCoreBusyAtTheOpenIsTheAndroidBodyOfTheVectors() {
+        val body = list("bodies").first { it["name"] == "Android: the Core busy at the model open" }
+        assertEquals(true, body["accepted"])
+        val want = (body["body"] as Map<String, Any?>)["error"] as Map<String, Any?>
+        val dir = Files.createTempDirectory("tj-coreopen-").toFile()
+        StubQlab().use { stub ->
+            try {
+                val cloud = QuranLabCloud(CloudOptions(stub.key, apiUrl = stub.base, trustedKeys = listOf(stub.publicKey)),
+                    stub.environment(dir, device = DeviceProfile("Pixel8", "tensor_g3", 17, "17", "8_16", abi = "arm64-v8a")))
+                cloud.errorReachedApp(CoreException(Core.E_BUSY, 0, "qlc_model_open").toOpenError())
+                val q = cloud.errors.queued().single()
+                val got = cloud.errors.body(q, cloud.env.app, cloud.env.device, "4.0.1")["error"] as Map<String, Any?>
+                for ((k, x) in want) assertEquals("error.$k", x, got[k])
+                assertEquals("engine_failed", q.code)
+                for (k in listOf("host_role", "fallback", "http_status")) assertFalse(k, k in got)
+            } finally {
+                dir.deleteRecursively()
+            }
+        }
     }
 
     /** A value that is not a token is left out, never cut into one (24.2). */

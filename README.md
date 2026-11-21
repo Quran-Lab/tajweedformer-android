@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Android, JVM" src="https://img.shields.io/badge/platform-Android%20%7C%20JVM-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 4.0.0" src="https://img.shields.io/badge/version-4.0.0-2a3b8f?style=flat-square">
+  <img alt="version: 4.0.1" src="https://img.shields.io/badge/version-4.0.1-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -77,7 +77,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:4.0.0") }
 ```
 
-
+Maven Central serves 4.0.0 today. 4.0.1 follows there once it is released; the quick start below is the same for both.
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
@@ -88,11 +88,11 @@ every phone runs the Core's CPU engine. Then add your app's signing certificates
 | | |
 | - | - |
 | **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajweedformer-android), for your app's package name. |
-| **Signing certificates** | On your Android key's page, under "Signing certificates (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App integrity, App signing). Until you do, your installs get 24-hour leases. |
+| **Signing certificates** | On your Android key's page, under "Signing certificates (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App integrity, App signing). Until you do, your installs are not hardware-verified for your app. |
 | **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. It needs a development key: Quran Lab leases the `x86_64` Core to development keys only. On another ABI the SDK fails with `runtime_unsupported`. |
 | **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
 | **Download** | The first `client.model()` or `client.prefetch()` downloads the model, encrypted: 55.5 MB, once (68.4 MB on disk), on any network, and needs a connection. At 4.0's launch every phone runs the Core's CPU engine: Quran Lab serves no NPU build until one is faster than the CPU engine. |
-| **Offline** | The model opens under a lease Quran Lab signs for this install: 7 days when the phone's hardware attests the install for your app (Play Integrity where a phone has no usable attestation), 24 hours otherwise. The SDK renews it in the background whenever the phone is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A Model that is open keeps running. |
+| **Offline** | The first run needs a connection; after that the model works offline, and the SDK keeps itself up to date in the background when the phone is online. `needs_connection` means the SDK needs to reach Quran Lab to continue. A Model that is open keeps running. |
 | **Model** | The model runs only inside the Quran Lab Core, in the AAR: its files are encrypted from Quran Lab's server to the device, and no plain model file is ever written. When Quran Lab refuses the key or the app, the model's files are removed. |
 | **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |

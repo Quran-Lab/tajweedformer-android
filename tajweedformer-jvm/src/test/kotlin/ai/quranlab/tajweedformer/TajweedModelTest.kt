@@ -146,7 +146,7 @@ class TajweedModelTest : OpenChecked() {
 
     @Test
     fun socIdsFromWhatDevicesReport() {
-        // seen on Firebase devices 11-07 (Build.SOC_MANUFACTURER, Build.SOC_MODEL, HARDWARE)
+        // seen on lab devices 11-07 (Build.SOC_MANUFACTURER, Build.SOC_MODEL, HARDWARE)
         assertEquals("tensor_g3", SocIds.from("Google", "Tensor G3", hardware = "shiba"))
         assertEquals("tensor_g4", SocIds.from("Google", "Tensor G4", hardware = "tokay"))
         assertEquals("tensor_g5", SocIds.from("Google", "Tensor G5", hardware = "frankel"))

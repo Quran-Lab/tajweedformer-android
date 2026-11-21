@@ -1,5 +1,6 @@
 package ai.quranlab.tajweedformer
 
+import ai.quranlab.tajweedformer.cloud.connectWithin
 import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
@@ -7,8 +8,11 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -186,8 +190,16 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
         // a success that is not the answer asked for (a 204, say): a failed attempt ([AnswerRule])
         if (r.code in 200..299) throw AnswerRule.failed(path, "HTTP ${r.code}", r.code)
         // a redirect is never followed, and it is a failed request whatever its body says (SPEC 15.4): no renewal and
-        // no refusal is read from it, so nothing is remembered and nothing is removed; asked once
-        if (r.code in 300..399) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}").at(fileStage(path), "redirect", r.code)
+        // no refusal is read from it, so nothing is remembered and nothing is removed; asked once of this host (28.3:
+        // unreachable, another model host may be asked)
+        if (r.code in 300..399) throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", NotTheHost(r.code)).at(fileStage(path), "redirect", r.code)
+        // 28.3: a 4xx that is not the server's own (no JSON `error` string: a proxy, a firewall, a captive portal) is no
+        // answer of the model host, whatever its status; never a refusal and never a renewal. Not a 429: a slow down
+        val o = try { Json.parse(String(body, Charsets.UTF_8)) as? Map<*, *> } catch (_: Exception) { null }
+        val error = o?.get("error") as? String
+        if (r.code in 400..499 && r.code != 429 && error == null) {
+            throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", NotTheHost(r.code)).at(fileStage(path), "http", r.code)
+        }
         if (auth != null && !renewed && auth.renewal(r.code, body)) {
             auth.renew()
             renewed = true
@@ -200,8 +212,6 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
             throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", ServerFailed(r.code)).at(fileStage(path), "http", r.code)
         }
         // contract 24.3: the answer's error (and reason) name it in an error report
-        val o = try { Json.parse(String(body, Charsets.UTF_8)) as? Map<*, *> } catch (_: Exception) { null }
-        val error = o?.get("error") as? String
         val reason = o?.get("reason") as? String
         val why = ai.quranlab.tajweedformer.cloud.ErrorRules.reasonOf(r.code, error, reason)
         // a refusal: read first (a download in ranges records it as the call's error at once), then its work on the device
@@ -209,7 +219,10 @@ internal fun modelRequest(transport: HttpTransport, url: String, path: String, e
             auth?.refuse(r.code, body)
             throw refusal.at(fileStage(path), if (r.code == 401 || r.code == 403) "refused" else why, r.code, reason ?: error)
         }
-        throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}").at(fileStage(path), why, r.code, error)
+        // 503 network_blocked: this host does not serve the network the request came from (asked once of it, SPEC 16.2);
+        // another model host may (28.3: any 5xx is unreachable)
+        val cause = if (r.code >= 500) NotTheHost(r.code) else null
+        throw RecognizerException.DownloadFailed(path, "HTTP ${r.code}", cause).at(fileStage(path), why, r.code, error)
     }
 }
 
@@ -300,6 +313,15 @@ internal class WrongAnswer(what: String) : RuntimeException(what) {
     override fun fillInStackTrace(): Throwable = this
 }
 
+/**
+ * The cause of a `download_failed` whose answer was not the model host's own: a redirect, a
+ * 4xx without a JSON `error` string, a 503 `network_blocked`. That host was unreachable: asked once of it (SPEC 16.2), and
+ * a resume goes to another model host when the build has one ([RetryPlan.resumable]).
+ */
+internal class NotTheHost(val status: Int) : RuntimeException("HTTP $status") {
+    override fun fillInStackTrace(): Throwable = this
+}
+
 /** The cause of a `download_failed` whose answer was a server failure (5xx) without a stop reason: asked for again by the
  *  retry rule, and not a missing connection. */
 internal class ServerFailed(val status: Int) : RuntimeException("HTTP $status") {
@@ -322,8 +344,8 @@ internal class ServerFailed(val status: Int) : RuntimeException("HTTP $status") 
  *   the one renewal of the token on 401 `invalid_token` (SPEC 15.4), a 503 `network_blocked`, a redirect, and any
  *   other status. The manifest is asked once: the rule is for the files it lists.
  *
- * The rule is SPEC section 16. What Android does in its own way: the limit on connecting is 15 s
- * (the contract names 30), resolving a name has no limit of the SDK's own, and every request has a connection of its
+ * The rule is SPEC section 16. What Android does in its own way: the limit on connecting is 5 s
+ *, resolving a name has no limit of the SDK's own, and every request has a connection of its
  * own over HTTP/1.1 ([UrlConnectionTransport]).
  */
 internal class RetryPlan(val pausesMs: LongArray) {
@@ -340,8 +362,10 @@ internal class RetryPlan(val pausesMs: LongArray) {
         /** Whether a failed model request is one the rule asks for again: no answer, a connection that ended, a stall
          *  (all three an IOException of the transport), a server failure, or a success that was not the file
          *  ([AnswerRule]). Not the system's refusal of the network. */
-        fun resumable(x: Throwable): Boolean = x is RecognizerException.DownloadFailed && x.cause40?.reason !in STORE &&
-            ((x.cause is IOException && x.cause !is NetworkNotPermitted) || x.cause is ServerFailed || x.cause is WrongAnswer)
+        fun resumable(x: Throwable, otherHosts: Boolean = false): Boolean = x is RecognizerException.DownloadFailed && x.cause40?.reason !in STORE &&
+            ((x.cause is IOException && x.cause !is NetworkNotPermitted) || x.cause is ServerFailed || x.cause is WrongAnswer ||
+                // 28.3: an answer that is not the model host's own, asked again only of another host
+                (otherHosts && x.cause is NotTheHost))
 
         /** The reasons of a write that failed on the device: never asked for again. */
         private val STORE = setOf("storage", "quota")
@@ -414,12 +438,12 @@ internal fun interface NetworkPolicy {
 
 /** `HttpURLConnection`, never following a redirect (a model request never leaves the host it was made to, SPEC 15.4),
  *  never through a response cache an app may have installed (`HttpResponseCache`: no byte of a model may be kept in a
- *  second place, SPEC 15). A connection that is not made within 15 s fails; [readTimeoutMs] is the stall limit of the
+ *  second place, SPEC 15). A connection that is not made within 5 s, TCP and TLS, fails; [readTimeoutMs] is the stall limit of the
  *  retry rule ([RetryPlan.STALL_MS]): the socket's wait for the next bytes, of the answer's head and of its body, so
  *  no byte for 30 s ends the request (`SocketTimeoutException`) and a slow link that keeps delivering is never cut.
  *  Each request at a time has its own connection. */
 internal class UrlConnectionTransport @JvmOverloads constructor(
-    private val connectTimeoutMs: Int = 15_000,
+    private val connectTimeoutMs: Int = ai.quranlab.tajweedformer.cloud.UrlConnectionTransport.CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = RetryPlan.STALL_MS,
 ) : HttpTransport {
     override fun get(url: String, headers: Map<String, String>): HttpResponse = get(url, headers, null)
@@ -437,6 +461,8 @@ internal class UrlConnectionTransport @JvmOverloads constructor(
             val code = (cancel?.whenCancelled { try { c.disconnect() } catch (_: Exception) {} }).let { waiting ->
                 try {
                     if (cancel?.isCancelled == true) throw IOException("the request was ended")
+                    // 28.3 item 6: TCP and TLS within the host's time, then the answer's head within the read timeout
+                    c.connectWithin(connectTimeoutMs)
                     c.responseCode
                 } finally {
                     waiting?.close()
@@ -478,11 +504,131 @@ internal class UrlConnectionTransport @JvmOverloads constructor(
     }
 }
 
+/**
+ * The SHA-256 of a file's part, made while its bytes are written (4.0.1), so that the check after the last byte reads
+ * nothing again but what was not hashed yet (perf plan, row 5: on the Android emulator 2.1 s passed between the last
+ * byte of the 53.65 MB weights and the file's acceptance, most of it this hash).
+ *
+ * The digest always covers the part's first [covered] bytes as they are on the device:
+ * - one stream: each buffer is added as it is written ([add]); a resume first adds what the part already holds
+ *   ([upTo]: the bytes an earlier call left are read once, then the stream goes on); a whole answer written into a new
+ *   part starts over ([reset]); one written beside the part has its own digest, which takes over with the file
+ *   ([adopt]);
+ * - ranges: they arrive out of order, so the digest follows the complete ranges from the file's first byte ([follow]),
+ *   reading them back from the part (forced to the storage, and still in the page cache) on one stream's thread at a
+ *   time while the other streams go on.
+ * Anything that removes or replaces the part calls [reset]. The size and SHA-256 compared with the manifest are those
+ * of the part on the device ([finish]: what is not covered yet is read then), and the comparison decides as before.
+ */
+internal class PartHash(private val part: File) {
+    private val lock = Any()
+    private var md: MessageDigest = MessageDigest.getInstance("SHA-256")
+    private var covered = 0L
+    private val target = java.util.concurrent.atomic.AtomicLong(0)
+    private val busy = AtomicBoolean(false)
+
+    /** Bytes of the part, from its first, that the digest holds. */
+    val bytes: Long get() = synchronized(lock) { covered }
+
+    /** The part was removed or is replaced: nothing of it is in the digest. */
+    fun reset() = synchronized(lock) {
+        md.reset()
+        covered = 0
+        target.set(0)
+    }
+
+    /** Before bytes are appended at [n]: the digest holds exactly the part's first [n] bytes (what it lacks is read). */
+    fun upTo(n: Long) = synchronized(lock) {
+        if (covered > n) {
+            md.reset()
+            covered = 0
+        }
+        if (covered < n) read(covered, n)
+    }
+
+    /** [n] bytes of [buf] written at the end of what the digest holds. */
+    fun add(buf: ByteArray, n: Int) = synchronized(lock) {
+        md.update(buf, 0, n)
+        covered += n
+    }
+
+    /** A whole file written beside the part took its place: its digest ([other]) is the part's now. */
+    fun adopt(other: PartHash) {
+        val (d, n) = synchronized(other.lock) { (other.md.clone() as MessageDigest) to other.covered }
+        synchronized(lock) {
+            md = d
+            covered = n
+            target.set(n)
+        }
+    }
+
+    /**
+     * Ranges: the part's first [to] bytes are complete. One caller at a time reads them into the digest; a caller that
+     * finds another one at it leaves the new end to it and returns at once.
+     */
+    fun follow(to: Long) {
+        target.accumulateAndGet(to) { a, b -> maxOf(a, b) }
+        while (busy.compareAndSet(false, true)) {
+            try {
+                synchronized(lock) {
+                    val t = target.get()
+                    if (covered < t) read(covered, t)
+                }
+            } catch (_: IOException) {
+                // not read now: [finish] reads what the digest lacks, and its failure is the download's
+                return
+            } finally {
+                busy.set(false)
+            }
+            if (synchronized(lock) { covered } >= target.get()) return
+        }
+    }
+
+    /** The part's size and SHA-256 (lower case hex) as it is on the device: what was hashed, and the rest read now. */
+    fun finish(): Pair<Long, String> = synchronized(lock) {
+        val n = part.length()
+        if (covered > n) {
+            md.reset()
+            covered = 0
+        }
+        if (covered < n) read(covered, n)
+        val sha = ModelManifest.hex(md.digest())
+        covered = 0
+        target.set(0)
+        n to sha
+    }
+
+    /** Bytes [from] to [to] of the part into the digest (the caller holds the lock). */
+    private fun read(from: Long, to: Long) {
+        FileChannel.open(part.toPath(), StandardOpenOption.READ).use { ch ->
+            val buf = ByteBuffer.allocate(1 shl 16)
+            var at = from
+            while (at < to) {
+                buf.clear()
+                buf.limit(minOf(buf.capacity().toLong(), to - at).toInt())
+                val k = ch.read(buf, at)
+                if (k < 0) throw IOException("the part ended at byte $at, before byte $to")
+                md.update(buf.array(), 0, k)
+                at += k
+                // the digest and the count move together: a read that fails leaves them agreeing
+                covered = at
+            }
+        }
+    }
+}
+
 /** Stops a download from another thread. */
 internal class Cancellation {
     private val flag = AtomicBoolean(false)
     private val actions = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
     val isCancelled: Boolean get() = flag.get()
+
+    /**
+     * Set before [cancel] when the call ended this file's download because another file of the same call failed
+     * ([ModelStore]'s files at once, 4.0.1): that file did not fail on its own, so its end is not reported as a download
+     * of its own ([SdkObserver.onDownloadFinished]); the call fails with the other file's error.
+     */
+    @Volatile var bySibling: Boolean = false
 
     fun cancel() {
         flag.set(true)
@@ -599,7 +745,8 @@ internal class FileProgress(private val e: ModelManifest.FileEntry, private val 
  *    place only when it is whole.
  *    A request that the network cut (no answer, a connection that ended, no byte for 30 s) or that the server failed
  *    (5xx) is made again inside the call from what the device holds, at most five times per file ([RetryPlan]).
- * 3. The part's size and SHA-256 are checked against the entry; a gzip entry is inflated
+ * 3. The part's size and SHA-256 are checked against the entry (the SHA-256 made while the bytes were written, 4.0.1:
+ *    [PartHash]; only what it does not hold yet is read after the last byte); a gzip entry is inflated
  *    (java.util.zip) to `<decoded>.tmp` and its size and SHA-256 checked against `decoded`; then the
  *    file is moved into place atomically and the part deleted. Any mismatch deletes the part, the
  *    validator, the map and the inflated file, and fails with [RecognizerException.DownloadFailed].
@@ -613,13 +760,17 @@ internal class ModelDownloader @JvmOverloads constructor(
     /** The folder URL the manifest's paths are relative to, ending in `/`. */
     val baseUrl: String,
     private val transport: HttpTransport = UrlConnectionTransport(),
-    private val headers: HeaderProvider? = null,
+    /** Headers added to every request (the Client's: the key, the token, the refusal rules). */
+    val headers: HeaderProvider? = null,
     /** How a large file is fetched. */
     val ranges: RangePlan = RangePlan.DEFAULT,
     /** How a download that the network cut goes on inside the call. */
     private val retry: RetryPlan = RetryPlan.DEFAULT,
+    /** SDK 4.0.1: the model hosts [baseUrl]'s path is asked of; null: [baseUrl] only. */
+    hosts: ModelHosts? = null,
 ) {
     private val stamps = VerifiedStamps(File(root, VerifiedStamps.FILE_NAME))
+    private val hosts: ModelHosts = hosts ?: ModelHosts.of(baseUrl, null)
 
     init {
         require(baseUrl.endsWith("/")) { "baseUrl must end in /" }
@@ -660,6 +811,9 @@ internal class ModelDownloader @JvmOverloads constructor(
         cancel: Cancellation? = null,
         onProgress: ((DownloadProgress) -> Unit)? = null,
         revision: String = "",
+        /** The headers and refusal rules of this file's requests: the downloader's own, or one file's of several at once
+         *  ([ModelStore]). */
+        auth: HeaderProvider? = headers,
     ): DownloadResult {
         if (!ManifestVerifier.safePath(e.path) || !ManifestVerifier.safePath(e.localPath)) {
             throw RecognizerException.ManifestInvalid("bad path ${e.path}")
@@ -670,12 +824,24 @@ internal class ModelDownloader @JvmOverloads constructor(
             val t0 = System.nanoTime()
             if (isInPlace(e)) return DownloadResult(e.path, e.role, 0, e.size, 0, true, revision = revision)
             val stats = FetchStats()
+            // 28.4: the file's hosts, from the host that answered last
+            val plan = hosts.plan()
             val result = try {
-                download(e, cancel, onProgress, t0, stats).copy(revision = revision)
+                download(e, cancel, onProgress, t0, stats, plan, auth).copy(revision = revision).also { plan.ended(stats.retries, "download") }
             } catch (x: TajweedError) {
+                // ended because another file of the same call failed: that file's error is the call's, and this one is
+                // not a download that failed on its own
+                if (cancel?.bySibling == true && cancel.isCancelled) throw x
                 val why = (x as? RecognizerException.DownloadFailed)?.reason ?: x.code
-                // contract 24.2: the resumes made inside the call; 24.8: the failure's telemetry name
+                // contract 24.2: the resumes made inside the call; 24.8: the failure's telemetry name; 28.7: the role, and
+                // whether more than one host was asked
                 x.cause40?.let { c -> if (c.retries == null && stats.retries > 0) x.cause40 = c.copy(retries = stats.retries) }
+                x.cause40?.let { c -> if (c.hostRole == null && ai.quranlab.tajweedformer.cloud.ErrorRules.roleOfStage(c.stage, c.reason) == "models") x.cause40 = c.copy(hostRole = "models", fallback = plan.fallback(stats.retries)) }
+                // 28.3: a refusal or a slow down ended the file on its host; a failure of the network on every attempt did not
+                when {
+                    RetryPlan.resumable(x, plan.many) -> plan.unanswered("download")
+                    x.cause40?.reason in ENDED_BY_HOST -> plan.ended(stats.retries, "download")
+                }
                 val cause = ai.quranlab.tajweedformer.cloud.ErrorCause.of(x)
                 val r = DownloadResult(e.path, e.role, stats.network.get(), e.size, stats.resumedFrom, false, why,
                     (System.nanoTime() - t0) / 1_000_000, revision, stats.ranged, stats.protocols(),
@@ -692,7 +858,7 @@ internal class ModelDownloader @JvmOverloads constructor(
         throw RecognizerException.DownloadFailed(e.path, why, cause).tagged(e.path, why, cause)
 
     private fun download(e: ModelManifest.FileEntry, cancel: Cancellation?, onProgress: ((DownloadProgress) -> Unit)?, t0: Long,
-                         stats: FetchStats): DownloadResult {
+                         stats: FetchStats, plan: FilePlan, auth: HeaderProvider?): DownloadResult {
         val part = File(root, prefix(e) + e.path + ".part")
         val validator = File(root, prefix(e) + e.path + ".part.v")
         val map = File(root, prefix(e) + e.path + RangedFetch.MAP_SUFFIX)
@@ -700,25 +866,33 @@ internal class ModelDownloader @JvmOverloads constructor(
         val progress = FileProgress(e, onProgress)
         // the file's resumes in this call ([RetryPlan]): the ranges and the one request count on the same five
         val resumes = Resumes(retry)
+        // the part's SHA-256, made as its bytes are written (4.0.1)
+        val hash = PartHash(part)
+        val io = Io(e, part, validator, cancel, progress, stats, resumes, hash, auth, plan)
         try {
         if (e.size > ranges.threshold) {
             val parallel = if (transport.separateConnections) ranges.parallel else 1
-            RangedFetch(e, part, validator, map, transport, headers, baseUrl + e.path, ranges, parallel, cancel, progress, stats, resumes) { given, whole ->
+            RangedFetch(e, part, validator, map, transport, auth, plan, ranges, parallel, cancel, progress, stats, resumes, hash) { given, whole ->
                 // one stream instead of ranges. [whole]: the whole file, and what the device holds stays until it is
                 // there; else the device holds one stream's prefix without a validator, and the stream goes on from it
-                single(e, part, validator, cancel, progress, stats, given, resumes, whole = whole)
+                single(io, given, whole = whole)
             }.run()
         } else {
             // a part written in ranges (another plan, another SDK) is not continued as one stream
-            if (map.exists()) RangedFetch.wipe(part, validator, map)
-            single(e, part, validator, cancel, progress, stats, null, resumes, whole = false)
+            if (map.exists()) {
+                RangedFetch.wipe(part, validator, map)
+                hash.reset()
+            }
+            single(io, null, whole = false)
         }
         } finally {
             stats.retries = resumes.generation
         }
         progress.end(part.length())
         if (part.length() < e.size) fail(e, "the connection ended at ${part.length()} of ${e.size} bytes (the part is kept for a resume)")
-        val (size, sha) = ModelManifest.digest(part)
+        // the size and SHA-256 of the part on the device: hashed while it was written, the rest (if any) read now
+        val inFlight = hash.bytes
+        val (size, sha) = hash.finish()
         if (size != e.size || sha != e.sha256.lowercase()) {
             RangedFetch.wipe(part, validator, map)
             throw RecognizerException.ChecksumMismatch(e.path).at("download", "hash")
@@ -763,7 +937,7 @@ internal class ModelDownloader @JvmOverloads constructor(
         map.delete()
         stamps.record(dst, e.localSize, e.localSha256)
         return DownloadResult(e.path, e.role, stats.network.get(), e.size, stats.resumedFrom, true, null,
-            (System.nanoTime() - t0) / 1_000_000, ranged = stats.ranged, protocols = stats.protocols())
+            (System.nanoTime() - t0) / 1_000_000, ranged = stats.ranged, protocols = stats.protocols(), hashedInFlight = inFlight)
     }
 
     /**
@@ -777,17 +951,22 @@ internal class ModelDownloader @JvmOverloads constructor(
      * validator, or the file there is another one now); [given]: the answer of a range request that the server
      * answered with the whole file (200), used instead of asking again.
      */
-    private fun single(e: ModelManifest.FileEntry, part: File, validator: File, cancel: Cancellation?, progress: FileProgress,
-                       stats: FetchStats, given: HttpResponse?, resumes: Resumes, whole: Boolean) {
+    private fun single(io: Io, given: HttpResponse?, whole: Boolean) {
+        val e = io.e
+        val part = io.part
+        val cancel = io.cancel
+        val resumes = io.resumes
+        val plan = io.plan
         var answer = given
         var first = true
         var anew = whole
         while (true) {
+            // 28.4: each resume asks the next model host (the g-th failure, the g-th host after the first, cycling)
             val g = resumes.generation
             // a whole answer with nothing on the device goes into the part itself: what it leaves is continued by Range
             val fresh = !part.exists()
             val failure = try {
-                once(e, part, validator, cancel, progress, stats, answer, first, anew)
+                once(io, answer, first, anew, g)
                 if (part.isFile && part.length() == e.size) return
                 // the answer ended before the file did, without an error of the transport
                 RecognizerException.DownloadFailed(e.path, "network: the connection ended at ${part.length()} of ${e.size} bytes (the part is kept for a resume)",
@@ -795,11 +974,12 @@ internal class ModelDownloader @JvmOverloads constructor(
             } catch (x: RecognizerException.DownloadFailed) {
                 // a request that the cancel ended failed like a connection that dropped: it is the cancel, not the network
                 if (cancel?.isCancelled == true) fail(e, "cancelled")
-                if (!RetryPlan.resumable(x)) throw x
+                if (!RetryPlan.resumable(x, plan.many)) throw x
                 x
             } finally {
                 answer?.close()
             }
+            plan.failed(g, failure)
             answer = null
             first = false
             if (fresh) anew = false
@@ -829,8 +1009,13 @@ internal class ModelDownloader @JvmOverloads constructor(
      *
      * [first]: the call's first request for the file (what the part holds then is what an earlier call left).
      */
-    private fun once(e: ModelManifest.FileEntry, part: File, validator: File, cancel: Cancellation?, progress: FileProgress,
-                     stats: FetchStats, given: HttpResponse?, first: Boolean, whole: Boolean) {
+    private fun once(io: Io, given: HttpResponse?, first: Boolean, whole: Boolean, g: Int) {
+        val e = io.e
+        val part = io.part
+        val validator = io.validator
+        val cancel = io.cancel
+        val stats = io.stats
+        val plan = io.plan
         val anew = whole || given != null
         var start = 0L
         if (!anew) {
@@ -839,15 +1024,17 @@ internal class ModelDownloader @JvmOverloads constructor(
                 // more bytes than the file has: it cannot be a prefix of the file (SPEC 16.1), and goes before the request
                 part.delete()
                 validator.delete()
+                io.hash.reset()
                 start = 0
             }
             if (start == 0L) validator.delete()
             if (first) stats.resumedFrom = start
-            progress.start(start)
+            io.progress.start(start)
             if (start >= e.size) return
         }
-        // the strong ETag of the answer that started the part; a part without one is resumed with the Range alone
-        val stored = if (start > 0) try { validator.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() } } catch (_: IOException) { null } else null
+        // the strong ETag of the answer that started the part, sent only to the host that gave it (28.4); a part without
+        // one, or on another host, is resumed with the Range alone, and the size and SHA-256 decide
+        val stored = if (start > 0) plan.readValidator(validator)?.takeIf { it.second == plan.host(g) }?.first else null
         val r = given ?: run {
             val h = HashMap<String, String>()
             h["Accept-Encoding"] = "identity"
@@ -855,21 +1042,24 @@ internal class ModelDownloader @JvmOverloads constructor(
                 h["Range"] = "bytes=$start-"
                 stored?.let { h["If-Range"] = it }
             }
-            modelRequest(transport, baseUrl + e.path, e.path, h, headers, if (start > 0) setOf(200, 206, 416) else setOf(200), cancel)
+            modelRequest(transport, plan.url(g, e.path), e.path, h, io.auth, if (start > 0) setOf(200, 206, 416) else setOf(200), cancel)
         }
         stats.answer(r)
         // while the body is read, a cancel ends the answer: the read fails at once
         val reading = cancel?.whenCancelled { r.abort() }
         try {
-            answered(e, part, validator, cancel, progress, stats, r, start, stored)
+            answered(io, r, start, stored, g)
         } finally {
             reading?.close()
         }
     }
 
     /** What [once] does with the answer [r] to its request (a resume from [start] under the validator [stored]). */
-    private fun answered(e: ModelManifest.FileEntry, part: File, validator: File, cancel: Cancellation?, progress: FileProgress,
-                         stats: FetchStats, r: HttpResponse, start: Long, stored: String?) {
+    private fun answered(io: Io, r: HttpResponse, start: Long, stored: String?, g: Int) {
+        val e = io.e
+        val part = io.part
+        val validator = io.validator
+        val plan = io.plan
         r.use { resp ->
             fun wrong(what: String): Nothing = throw AnswerRule.failed(e.path, what)
             val v = AnswerRule.validator(resp)
@@ -879,13 +1069,17 @@ internal class ModelDownloader @JvmOverloads constructor(
                     // the one that an answer gives. The call ends; the next one starts the file again
                     part.delete()
                     validator.delete()
+                    io.hash.reset()
                     fail(e, "HTTP 416 for a resume at byte $start of ${e.size}: the partial file was removed")
                 }
                 206 -> {
                     AnswerRule.range(resp, start, e.size - 1, e.size)?.let { wrong(it) }
                     if (v != null && stored != null && v != stored) wrong("a range of another version of the file")
                     try {
-                        storeOut(part, true).use { out -> copy(e, resp, out, e.size - start, cancel, progress, stats) }
+                        // the digest holds the part's bytes up to here (an earlier call's are read once), then each
+                        // buffer as it is written
+                        io.hash.upTo(start)
+                        storeOut(part, true).use { out -> copy(io, resp, out, e.size - start, io.hash) }
                     } catch (x: IOException) {
                         // what arrived is the file's: the part stays for a resume
                         fail(e, "network: ${x.message}", x)
@@ -897,13 +1091,15 @@ internal class ModelDownloader @JvmOverloads constructor(
                     val beside = part.exists()
                     val target = if (beside) File(part.path + NEW_SUFFIX) else part
                     if (!beside) {
-                        if (v != null) validator.writeText(v) else validator.delete()
+                        if (v != null) plan.writeValidator(validator, v, g) else validator.delete()
                     }
-                    progress.start(0)
+                    io.progress.start(0)
+                    // a new part starts its digest over; a file beside the part has its own until it takes the place
+                    val sink = if (beside) PartHash(target) else io.hash.also { it.reset() }
                     var more = false
                     val got = try {
                         storeOut(target, false).use { out ->
-                            val n = copy(e, resp, out, e.size, cancel, progress, stats)
+                            val n = copy(io, resp, out, e.size, sink)
                             // a body that runs past the file's size is cut off, and the attempt failed
                             if (n == e.size) more = try { resp.body.read() >= 0 } catch (_: IOException) { false }
                             n
@@ -927,9 +1123,10 @@ internal class ModelDownloader @JvmOverloads constructor(
                         }
                         // whole: it takes the part's place, then its validator; the old part's map (ranges) goes last
                         move(target, part)
-                        if (v != null) validator.writeText(v) else validator.delete()
+                        io.hash.adopt(sink)
+                        if (v != null) plan.writeValidator(validator, v, g) else validator.delete()
                         File(part.path + ".ranges").delete()
-                        stats.resumedFrom = 0
+                        io.stats.resumedFrom = 0
                     }
                 }
                 else -> wrong("HTTP ${resp.code}")
@@ -942,22 +1139,38 @@ internal class ModelDownloader @JvmOverloads constructor(
      * Copies at most [most] bytes of the answer's body to [out], counting them; returns how many came. Throws
      * IOException when the transport fails, `download_failed` "cancelled" when the call was cancelled.
      */
-    private fun copy(e: ModelManifest.FileEntry, resp: HttpResponse, out: FileOutputStream, most: Long, cancel: Cancellation?,
-                     progress: FileProgress, stats: FetchStats): Long {
+    private fun copy(io: Io, resp: HttpResponse, out: FileOutputStream, most: Long, sink: PartHash): Long {
         val buf = ByteArray(BUFFER)
         var have = 0L
         while (have < most) {
-            if (cancel?.isCancelled == true || Thread.currentThread().isInterrupted) fail(e, "cancelled")
+            if (io.cancel?.isCancelled == true || Thread.currentThread().isInterrupted) fail(io.e, "cancelled")
             val n = resp.body.read(buf, 0, minOf(buf.size.toLong(), most - have).toInt())
             if (n < 0) break
             // a write that fails is the device's store, not the network
             try { out.write(buf, 0, n) } catch (x: IOException) { throw StoreWriteFailed(x) }
+            // the bytes just written, into the file's digest (4.0.1: no second read after the last byte)
+            sink.add(buf, n)
             have += n
-            stats.bytes(resp, n)
-            progress.add(n.toLong())
+            io.stats.bytes(resp, n)
+            io.progress.add(n.toLong())
         }
         return have
     }
+
+    /** One file's download in this call: where it goes, its counts and resumes, its digest, its request headers. */
+    private class Io(
+        val e: ModelManifest.FileEntry,
+        val part: File,
+        val validator: File,
+        val cancel: Cancellation?,
+        val progress: FileProgress,
+        val stats: FetchStats,
+        val resumes: Resumes,
+        val hash: PartHash,
+        val auth: HeaderProvider?,
+        /** SDK 4.0.1: the file's model hosts; the g-th resume asks the g-th. */
+        val plan: FilePlan,
+    )
 
     /** A file of the store opened for writing; a failure to open it is the store's ([StoreWriteFailed]). */
     private fun storeOut(f: File, append: Boolean): FileOutputStream = try {
@@ -988,6 +1201,9 @@ internal class ModelDownloader @JvmOverloads constructor(
 
         /** Where the CDN forms of qle1 files wait for the Core's install (SDK 4.0). */
         const val CDN_DIR = "cdn/"
+
+        /** The reasons of a failure a model host gave as its answer (a refusal, a slow down), not its absence. */
+        private val ENDED_BY_HOST = setOf("refused", "rate_limited")
     }
 }
 

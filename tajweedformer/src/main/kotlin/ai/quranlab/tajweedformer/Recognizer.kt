@@ -473,14 +473,21 @@ internal class Recognizer private constructor(
             }
             val t0 = System.nanoTime()
             val cpu = options.engine.open(model, context, options)
-            // the vocabulary the open model gives (R4: its build's tokens.txt, from the Core), where the folder's differs
-            val folder = (cpu as? ai.quranlab.tajweedformer.core.CoreTajweedEngine)?.coreModel?.let { m ->
-                try { model.withVocabulary(Vocabulary(m.tokenNames().toTypedArray(), ModelFolder.BLANK)) } catch (_: Exception) { null }
-            } ?: model
-            val reason = if (options.backend == BackendPreference.CPU) "cpu_requested" else "no_accelerator"
-            val c = BackendChoice(Backend.CPU, reason, "", options.soc, context, folder.manifest.build)
-            SdkEvents.emit { it.onBackendSelected(c) }
-            val rec = Recognizer(folder, context, options, cpu, c)
+            // Gate C (SDK 4.0.1): the engine holds the Core's one open model; a failure before the Recognizer owns it
+            // closes it, never drops it
+            val rec = try {
+                // the vocabulary the open model gives (R4: its build's tokens.txt, from the Core), where the folder's differs
+                val folder = (cpu as? ai.quranlab.tajweedformer.core.CoreTajweedEngine)?.coreModel?.let { m ->
+                    try { model.withVocabulary(Vocabulary(m.tokenNames().toTypedArray(), ModelFolder.BLANK)) } catch (_: Exception) { null }
+                } ?: model
+                val reason = if (options.backend == BackendPreference.CPU) "cpu_requested" else "no_accelerator"
+                val c = BackendChoice(Backend.CPU, reason, "", options.soc, context, folder.manifest.build)
+                SdkEvents.emit { it.onBackendSelected(c) }
+                Recognizer(folder, context, options, cpu, c)
+            } catch (t: Throwable) {
+                try { cpu.close() } catch (_: Exception) {}
+                throw t
+            }
             val load = ModelLoadInfo(model.manifest.build, context, rec.backend, (System.nanoTime() - t0) / 1e6,
                 loads.getAndIncrement() == 0, options.soc)
             SdkEvents.emit { it.onModelLoad(load) }

@@ -121,17 +121,29 @@ class TajweedClientTest : OpenChecked() {
         @Suppress("UNCHECKED_CAST")
         val full = Json.parse(d.toJson()) as Map<String, Any?>
         // SDK 4.0: the optional `protected` object comes after the fields of the 3.0
-        // schema and downloadProtocol; the 3.0 schema checks the rest, and the object is checked by section 25's table
-        val report = LinkedHashMap(full).apply { remove("protected") }
+        // schema and downloadProtocol; the 3.0 schema checks the rest, and the object is checked by section 25's table.
+        // SDK 4.0.1 (25.3): the optional `endpoints` after it, checked by 28.7's table
+        val report = LinkedHashMap(full).apply { remove("protected"); remove("endpoints") }
         assertNull("diagnose() does not fit the schema: ${d.toJson()}", wrong(report, schema))
         // the optional fields come after the eleven, and which they are is the contract's list (names.json), not this test's
         assertEquals("the eleven fields in their order, then the optional ones", (schema["required"] as List<*>) + optionalFields, report.keys.toList())
+        (full["endpoints"] as? Map<*, *>)?.let { e ->
+            assertEquals("endpoints is last", "endpoints", full.keys.last())
+            // Android: api, models and lastFailover (webFrame is the web's); host names only, never a URL
+            assertEquals(listOf("api", "models", "lastFailover"), e.keys.toList())
+            for (k in listOf("api", "models")) assertTrue("$k: ${e[k]}", (e[k] as String).let { "/" !in it && "?" !in it })
+            (e["lastFailover"] as? Map<*, *>)?.let { f ->
+                assertEquals(listOf("role", "from", "to", "reason", "status", "at"), f.keys.toList())
+                assertTrue(f["role"] in setOf("api", "models"))
+                assertTrue(f["reason"] in setOf("network", "timeout", "http", "redirect", "invalid_answer"))
+            }
+        }
         (full["protected"] as? Map<*, *>)?.let { p ->
-            assertEquals("protected is last", "protected", full.keys.last())
+            assertEquals("protected is last but for 4.0.1's endpoints", "protected", full.keys.filter { it != "endpoints" }.last())
             assertEquals(listOf("keyStore", "lease", "leaseExpires", "leaseClass", "refreshAfter", "graceUntil", "core"), p.keys.toList())
             assertTrue(p["keyStore"] == null || p["keyStore"] in setOf("strongbox", "tee", "software"))
             assertTrue(p["lease"] in setOf("valid", "grace", "expired", "stopped", "none"))
-            assertTrue(p["leaseClass"] == null || p["leaseClass"] in setOf("7d", "24h"))
+            assertTrue(p["leaseClass"] == null || p["leaseClass"] in setOf("attested", "standard"))
             if (p["lease"] != "grace") assertNull(p["graceUntil"])
             if (p["lease"] == "none") assertNull(p["leaseExpires"])
         }

@@ -18,6 +18,10 @@ internal data class ErrorCause(
     val errorName: String? = null,
     val errorCode: String? = null,
     val retries: Int? = null,
+    /** SDK 4.0.1: the role of the request the cause is (`api`, `models`), and whether it asked more than
+     *  one host; null where the cause is no request to a host of section 28. */
+    val hostRole: String? = null,
+    val fallback: Boolean? = null,
 ) {
     companion object {
         /** The cause of [e]: the one tagged where it (or an error it wraps) was made, else what its code and chain say. */
@@ -68,9 +72,10 @@ internal data class ErrorCause(
         /** A request of the API that did not succeed, as a cause at [stage]: no answer (`network`, `timeout`), or its answer. */
         fun ofCloud(e: CloudException, stage: String, retries: Int? = null): ErrorCause {
             val name = ErrorRules.platformName(e)
-            val a = e.api ?: return ErrorCause(stage, if (ErrorRules.timedOut(e)) "timeout" else "network", null, name, retries = retries)
+            val a = e.api ?: return ErrorCause(stage, if (ErrorRules.timedOut(e)) "timeout" else "network", null, name, retries = retries,
+                hostRole = e.hostRole, fallback = e.fallback)
             return ErrorCause(stage, ErrorRules.reasonOf(a.status, a.code, a.reason), a.status.takeIf { it in 100..599 }, name,
-                ErrorRules.serverCode(a), retries)
+                ErrorRules.serverCode(a), retries, e.hostRole, e.fallback)
         }
 
         private fun chain(e: Throwable): Sequence<Throwable> = generateSequence(e) { it.cause }.take(8)
@@ -105,6 +110,20 @@ internal object ErrorRules {
     val ABIS = setOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86", "arm64", "x86_64_mac")
     val RAM_TIERS = setOf("lt2", "2_4", "4_8", "8_16", "ge16")
 
+    /** 28.7 `host_role`: the roles of the hosts a report's request went to (`web_frame` is the web's). */
+    val HOST_ROLES = setOf("api", "models", "web_frame")
+
+    /** The role of the request a cause at [stage] is (28.7), or null: a stage of no such request, or a cause that is the
+     *  device's own (a write that failed, the volume full: [reason] `storage` or `quota`), not a request's. */
+    fun roleOfStage(stage: String, reason: String? = null): String? = if (reason in ON_DEVICE) null else when (stage) {
+        "config", "register", "attest", "lease", "events" -> "api"
+        "manifest", "download" -> "models"
+        else -> null
+    }
+
+    /** The reasons of a request's stage that are the device's, not the request's (24.3). */
+    private val ON_DEVICE = setOf("storage", "quota")
+
     /** 24.5: `error\n<stage>\n<reason>\n<code>\n<http_status, or 0>`. */
     fun signature(stage: String, reason: String, code: String, httpStatus: Int?): String = "error\n$stage\n$reason\n$code\n${httpStatus ?: 0}"
 
@@ -118,6 +137,8 @@ internal object ErrorRules {
      * `none` (nothing of the build), `partial` (part of a download), `complete` (a build that opens).
      */
     fun codeFor(stage: String, reason: String, status: Int? = null, onDevice: String = "none", errorCode: String? = null): String {
+        // 28.7: a request answered on another host after its first host was unreachable is silent
+        if (reason == "failover") return "none"
         // rule 3a: the token gates the config; with a build on the device, or unattested, the SDK goes on
         if (stage == "attest" && (onDevice == "complete" || reason in ATTESTATION)) return "none"
         when (stage) {
@@ -392,6 +413,9 @@ internal class ErrorReporter(private val dir: File?) {
         s("ram_tier")?.takeIf { it in ErrorRules.RAM_TIERS }?.let { e["ram_tier"] = it }
         s("storage_free")?.let { e["storage_free"] = it }
         s("abi")?.takeIf { it in ErrorRules.ABIS }?.let { e["abi"] = it }
+        // 28.7: the role of the request and whether it asked more than one host, never a host name
+        s("host_role")?.takeIf { it in ErrorRules.HOST_ROLES }?.let { e["host_role"] = it }
+        (d["fallback"] as? Boolean)?.let { if (e.containsKey("host_role")) e["fallback"] = it }
         val b = LinkedHashMap<String, Any?>()
         b["day"] = r.day
         b["platform"] = app.platform

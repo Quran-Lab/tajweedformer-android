@@ -99,15 +99,11 @@ From 4.0 the model is usable only through the SDK. What changes, and what an app
   answers with an install certificate. Play Integrity is asked only where a phone has no usable attestation and
   Quran Lab's signed config names its project number. The private keys never leave the Keystore.
 - **The lease.** The model opens under a lease Quran Lab signs for this install, this build and this release of the
-  Core: 7 days for an attested install, 24 hours otherwise. The SDK renews it in the background once it is due (with
-  a random spread, so a fleet never renews at one hour), and a valid lease never waits for a renewal: the app works
-  offline until the lease ends. Past its end an open first asks for a new one (waiting at most 10 seconds, not at all
-  offline); while Quran Lab cannot be reached (no answer, a server error, "too many requests", a page that is not
-  Quran Lab's) the model keeps opening for 24 hours more, and each such open is reported silently; a refusal ends that
-  at once. After it, `client.model()` is `needs_connection` (no answer) or `download_failed` (a server's error). A
-  `503 lease_unavailable` is never a refusal: the SDK asks again after its `Retry-After`. Every lease is held to its
-  own end (in an emergency Quran Lab may give an unattested install a 7-day one). A Model that is open keeps running
-  until the app closes it. A changed device clock neither ends a lease early nor lengthens it. The signed config names the
+  Core. The first run needs a connection; after that the model works offline, and the SDK keeps itself up to date in
+  the background when the phone is online. `needs_connection` from `client.model()` means the SDK needs to reach Quran
+  Lab to continue; a server's error is `download_failed`. A refusal from Quran Lab is final; a `503 lease_unavailable`
+  is never a refusal: the SDK asks again after its `Retry-After`. A Model that is open keeps running until the app
+  closes it. Changing the device clock has no effect on the lease. The signed config names the
   build and its key id; the lease answer names the folder its files come from, and no file comes from anywhere else
   (Quran Lab's own hosts over https only). A lease answer may also carry a small
   signed data piece for the Core (data, never code). The SDK hands it to the Core right after the lease; the Core
@@ -139,9 +135,10 @@ hands out its weights or keys. The SDKs around it are open source.
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.0` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.4"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.0"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.0 |
+| [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
 `cdn.quranlab.ai/models` to app keys from [sdk.quranlab.ai](https://sdk.quranlab.ai).
@@ -158,7 +155,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:4.0.0") }
 ```
 
-
+Maven Central serves 4.0.0 today. 4.0.1 follows there once it is released; the quick start below is the same for both.
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
@@ -169,11 +166,11 @@ every phone runs the Core's CPU engine. Then add your app's signing certificates
 | | |
 | - | - |
 | **Key** | An Android key from [sdk.quranlab.ai](https://sdk.quranlab.ai), for your app's package name. |
-| **Signing certificates** | On your Android key's page, under "Signing certificates (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App integrity, App signing). Until you do, your installs get 24-hour leases. |
+| **Signing certificates** | On your Android key's page, under "Signing certificates (SHA-256)", add the app signing key certificate and the upload key certificate (Play Console: Test and release, App integrity, App signing). Until you do, your installs are not hardware-verified for your app. |
 | **Devices** | Android 8.0 (API 26) or later. Phones and tablets are `arm64-v8a` and `armeabi-v7a`. `x86_64` is for the Android emulator on an Intel or AMD PC and for x86 Chromebooks: there the SDK runs its CPU engine only, never an accelerator. It needs a development key: Quran Lab leases the `x86_64` Core to development keys only. On another ABI the SDK fails with `runtime_unsupported`. |
 | **Permissions** | `RECORD_AUDIO`: the SDK's manifest declares it and `model.listen()` asks for it at run time. The SDK's manifest also brings `INTERNET` and `ACCESS_NETWORK_STATE`; WorkManager, which it uses for background work, brings `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`. |
 | **Download** | The first `client.model()` or `client.prefetch()` downloads the model, encrypted: 55.5 MB, once (68.4 MB on disk), on any network, and needs a connection. At 4.0's launch every phone runs the Core's CPU engine: Quran Lab serves no NPU build until one is faster than the CPU engine. |
-| **Offline** | The model opens under a lease Quran Lab signs for this install: 7 days when the phone's hardware attests the install for your app (Play Integrity where a phone has no usable attestation), 24 hours otherwise. The SDK renews it in the background whenever the phone is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A Model that is open keeps running. |
+| **Offline** | The first run needs a connection; after that the model works offline, and the SDK keeps itself up to date in the background when the phone is online. `needs_connection` means the SDK needs to reach Quran Lab to continue. A Model that is open keeps running. |
 | **Model** | The model runs only inside the Quran Lab Core, in the AAR: its files are encrypted from Quran Lab's server to the device, and no plain model file is ever written. When Quran Lab refuses the key or the app, the model's files are removed. |
 | **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Build** | Built and tested with JDK 17, Android Gradle Plugin 8.2 and Kotlin 1.9. |
@@ -289,7 +286,7 @@ alignment and the LLR are the app's: [docs/migrating-to-3.md](docs/migrating-to-
 
 `TajweedClient(context, key)` makes the one Client of the process (a second one while the first is not closed is the
 error `client_exists`). Options are always last and optional:
-`TajweedClientOptions(appId, appVersion, storage, unmeteredOnly)`. There is no `analytics` option in 4.0: the
+`TajweedClientOptions(appId, appVersion, storage, unmeteredOnly, appBuild)`. There is no `analytics` option in 4.0: the
 anonymous analytics are always on. There is no `audience` option either: every app shows the same sharing sheet.
 
 `storage` is the folder where the SDK keeps its files (default: `noBackupFilesDir/quranlab`). **Use sharing in one
@@ -316,7 +313,8 @@ process needs the model, give it its own `storage` folder.
   device and whether it verified, the context, the backend and its stage, the microphone permission, storage, the
   last error, the chunks dropped for a collector that did not read, the connection (`unmetered`, `metered`,
   `none`, or `unknown` on the desktop JVM), and the protocol of the last model request of the process
-  (`downloadProtocol`: `http/1.1` or null). It never throws and works offline.
+  (`downloadProtocol`: `http/1.1` or null). From 4.0.1, `endpoints`: which of Quran Lab's servers the SDK is using.
+  It never throws and works offline.
 - A model comes only from Quran Lab's server, through the Client (`client.model()`, `client.prefetch()`). There is
   no call that opens a model folder the app ships or keeps itself: the model is Quran Lab's to deliver, verify and
   update, and an app that carries its own copy cannot be told of a newer or a withdrawn build.
@@ -367,6 +365,8 @@ the model (SDK 4.0, about 1 MB). Downloads resume
 then moved into place atomically; any mismatch deletes it. Models are kept by build under
 `<storage>/models/<model id>/<build>/`, so a new version never overwrites the one in use, and an app that goes
 offline keeps working with the last verified build.
+
+**Backup servers (4.0.1).** If Quran Lab's main servers can't be reached, the SDK uses backup servers automatically.
 
 **A download that breaks goes on by itself (3.1.3).** When the transfer of a file stops (no answer, a connection
 that ends, a server error, or no byte for 30 seconds), the call waits and goes on from the bytes already on the
