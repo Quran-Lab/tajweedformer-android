@@ -88,8 +88,9 @@ class ErrorReportStagesTest : OpenChecked() {
         assertEquals(listOf("none", "download_failed"), sent.map { it["code"] })
         val b = sent.last()
         checkBody(b)
+        // 4.0.1: a report of a request to Quran Lab's hosts names its role, and that one host was asked
         assertEquals(mapOf("stage" to "config", "reason" to "http", "http_status" to 503.0, "count" to 1.0, "first_launch" to false,
-            "first_report" to true, "ram_tier" to "8_16", "storage_free" to error(b)["storage_free"]), error(b))
+            "first_report" to true, "ram_tier" to "8_16", "storage_free" to error(b)["storage_free"], "host_role" to "api", "fallback" to false), error(b))
         assertTrue(c.cloud.errors.queued().isEmpty())
         assertEquals(2, c.cloud.errorsSent)
     }

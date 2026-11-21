@@ -183,8 +183,12 @@ class Sharing40VectorsTest : OpenChecked() {
                 want["contributor"] as String, null, null, want["day"] as String, deviceClass, osMajor, rate, "built_in", flac = flac, deviceModel = model)
             return Json.parse(String(b, Charsets.UTF_8)) as Map<String, Any?>
         }
-        // the vectors' SDK version is this one
-        assertEquals("4.0.0", SdkInfo.VERSION)
+        // the vectors were made by SDK 4.0.0; this SDK sends its own version in their place, nothing else differs
+        fun asThisSdk(want: Map<String, Any?>): Map<String, Any?> {
+            val decode = want["decode"] as Map<String, Any?>
+            assertEquals("4.0.0", decode["sdk_version"])
+            return LinkedHashMap(want).also { it["decode"] = LinkedHashMap(decode).also { d -> d["sdk_version"] = SdkInfo.VERSION } }
+        }
         val cases = listOf(
             listOf("flac 16 kHz from iOS 4.0", 16_000, true, "A17", 26, "iPhone16,1"),
             listOf("flac 44.1 kHz from Android 4.0", 44_100, true, "sm8650", 15, "samsung SM-S921B"),
@@ -193,7 +197,7 @@ class Sharing40VectorsTest : OpenChecked() {
         )
         for (c in cases) {
             val name = c[0] as String
-            assertEquals(name, accepted.getValue(name), body(name, c[1] as Int, c[2] as Boolean, c[3] as String, c[4] as Int, c[5] as String?))
+            assertEquals(name, asThisSdk(accepted.getValue(name)), body(name, c[1] as Int, c[2] as Boolean, c[3] as String, c[4] as Int, c[5] as String?))
         }
     }
 

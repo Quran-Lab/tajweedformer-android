@@ -207,7 +207,19 @@ class CoreLeaseTest : ai.quranlab.tajweedformer.OpenChecked() {
             fail("a build without a layout opened")
         } catch (e: TajweedError) {
             assertTrue(e.code, e.code in setOf("model_invalid", "engine_failed"))
+            // Gate C (SDK 4.0.1, contract 24.3): a status answered engine_failed names itself, and the Core's failure is
+            // the error's cause; another status is its own error, tagged where the Client opens the model
+            val x = e.cause as? ai.quranlab.tajweedformer.core.CoreException
+            if (e.code == "engine_failed") {
+                assertTrue("the Core's failure is kept: ${e.cause}", x != null)
+                val (reason, code) = ai.quranlab.tajweedformer.core.CoreException.openCause(x!!.status)!!
+                val c = ai.quranlab.tajweedformer.cloud.ErrorCause.of(e)
+                assertEquals(listOf("model_open", reason, code), listOf(c.stage, c.reason, c.errorCode))
+            }
+            println("the Core's open of the vectors' build: ${e.code}, ${x?.let { Core.statusName(it.status) }}")
         }
+        // (the Core refuses this build model_invalid before any engine status, at 0 Hz too: CI run 44728134717, so the
+        // statuses of 24.3 are replayed on constructed failures, ErrorReports40VectorsTest.everyCoreStatusAtTheModelOpen)
     }
 
     @Test
@@ -292,16 +304,19 @@ class CoreLeaseTest : ai.quranlab.tajweedformer.OpenChecked() {
 
     @Test
     fun theBuildsFolderIsOnlyQuranLabsOwn() {
-        // 18.4.5, as the Apple and C SDKs take it: https, quranlab.ai or a subdomain, a path ending in /, no port, user,
-        // query, fragment or ..
+        // 18.4.5 and 28.4 (SDK 4.0.1): https, a host of the allow-list (quranlab.ai, tajweedformer.com, quran-lab.com or a
+        // subdomain on a label boundary; 4.0.0 took quranlab.ai only), a path that starts and ends with /, no port, user,
+        // query, fragment or .. (endpoints_40.json `bases` has the rest, EndpointsVectorsTest)
         for (ok in listOf("https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/${"a".repeat(40)}/sdk/v4.0/", "https://quranlab.ai/m/",
-            "https://CDN.QuranLab.ai/x/")) assertTrue(ok, LeaseClient.baseOk(ok))
+            "https://CDN.QuranLab.ai/x/", "https://cdn-b.tajweedformer.com/models/x/", "https://eu.cdn.quran-lab.com/m/")) assertTrue(ok, LeaseClient.baseOk(ok))
+        for (bad in listOf("https://eviltajweedformer.com/m/", "https://192.0.2.10/m/")) assertFalse(bad, LeaseClient.baseOk(bad))
         for (bad in listOf("http://cdn.quranlab.ai/m/", "https://cdn.quranlab.ai/m", "https://evil.example/m/", "https://quranlab.ai.evil.example/m/",
             "https://evilquranlab.ai/m/", "https://cdn.quranlab.ai:8443/m/", "https://u@cdn.quranlab.ai/m/", "https://cdn.quranlab.ai/m/?x=1/",
             "https://cdn.quranlab.ai/m/#f/", "https://cdn.quranlab.ai/a/../b/", "https://cdn.quranlab.ai\\@evil.example/", "https:///m/", "https://.quranlab.ai/"))
             assertFalse(bad, LeaseClient.baseOk(bad))
-        // a lease answer whose folder is not Quran Lab's: the build's manifest is asked for with no folder, and with none
-        // on the device the request fails as an invalid answer; no file is fetched from another host
+        // 28.4: a lease answer whose folder is not Quran Lab's is no lease answer of 18.4.5; that host was unreachable,
+        // and with no other host the request fails as that answer did. The manifest is never asked for it, and no file
+        // is fetched from another host
         val dir = temp()
         val b = build(dir)
         val api = Api().also { it.bytes = b.bytes }
@@ -321,9 +336,10 @@ class CoreLeaseTest : ai.quranlab.tajweedformer.OpenChecked() {
         } catch (f: LeaseFailure) {
             assertEquals("download_failed", f.error.code)
         }
+        assertEquals("the manifest was not asked for an answer that is no lease", emptyList<String?>(), seen)
         api.leaseBase = { build -> "https://cdn.quranlab.ai/models/x/y/$build/sdk/v4.0/" }
         l.request(t, pb::roots)
-        assertEquals(listOf(null, "https://cdn.quranlab.ai/models/x/y/${b.manifest.build}/sdk/v4.0/"), seen)
+        assertEquals(listOf<String?>("https://cdn.quranlab.ai/models/x/y/${b.manifest.build}/sdk/v4.0/"), seen)
         assertEquals("https://cdn.quranlab.ai/models/x/y/${b.manifest.build}/sdk/v4.0/", l.record!!.base)
     }
 

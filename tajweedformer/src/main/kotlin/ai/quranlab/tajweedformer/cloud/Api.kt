@@ -26,53 +26,108 @@ internal sealed class Credential {
 internal class QuranLabApi(
     val apiUrl: String = DEFAULT_API,
     transport: HttpTransport = UrlConnectionTransport(),
+    /** SDK 4.0.1: the `api` hosts every request goes through, in their failover order. */
+    val endpoints: Endpoints = Endpoints.of(apiUrl),
     /** Sees every answer of every route (the refusals that stop a model, SPEC 15.3, are remembered there). */
     private val observe: (HttpResponse) -> Unit = {},
 ) {
-    private val base = apiUrl.trimEnd('/')
-
     /** Every request goes through here: the system's refusal of the network is an IOException like no connection. */
     private val http = HttpTransport { r ->
         ai.quranlab.tajweedformer.permitted { transport.send(r) }.also { a -> try { observe(a) } catch (_: Exception) {} }
     }
 
     private fun call(method: String, path: String, cred: Credential?, body: Map<String, Any?>? = null,
-                     extra: Map<String, String> = emptyMap(), expectOk: Boolean = true): HttpResponse {
+                     extra: Map<String, String> = emptyMap(), expectOk: Boolean = true, stage: String? = ErrorRules.stageOfPath(path),
+                     check: (HttpResponse) -> Unit = JSON): HttpResponse {
         val h = LinkedHashMap<String, String>()
         cred?.apply(h)
         h.putAll(extra)
         val bytes = body?.let { Json.write(it).toByteArray(Charsets.UTF_8) }
         if (bytes != null) h["content-type"] = "application/json"
-        val r = try {
-            http.send(HttpRequest(method, base + path, h, bytes))
-        } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}", e, path)
-        }
+        val r = send(method, path, h, bytes, stage = stage, check = check)
         if (expectOk && !r.ok) throw CloudException(r.error, "$method $path: ${r.error}", path = path)
         return r
+    }
+
+    /**
+     * One request through the `api` hosts (28.3): each host is asked with the same method, path, headers and body until
+     * one answers with what the route asks for ([check], on a 2xx), a refusal (a 4xx other than 429 with a JSON `error`
+     * string) or a slow down (a 429, never taken to another host). No answer, a 5xx, a redirect, a page that is not the
+     * API's, or a 2xx [check] refuses ([NotTaken]) is unreachable, and the next host is asked at once. When every host
+     * was unreachable the first host's answer is the request's (an [IOException] as a [CloudException]).
+     */
+    private fun send(method: String, path: String, h: Map<String, String>, bytes: ByteArray?, bodyFile: java.io.File? = null,
+                     stage: String? = ErrorRules.stageOfPath(path), check: (HttpResponse) -> Unit = JSON): HttpResponse {
+        lastFallback.set(false)
+        val got = endpoints.request(endpoints.api, stage) { _, origin ->
+            val r = try {
+                http.send(HttpRequest(method, origin + path, h, bytes, bodyFile))
+            } catch (e: IOException) {
+                // the system's refusal of the network, or a request the app's thread ended, is the same on every host
+                val ended = e is ai.quranlab.tajweedformer.NetworkNotPermitted || HttpAbort.current()?.aborted == true
+                if (ended) throw CloudException(null, "$method $path: ${e.message}", e, path).also { it.hostRole = ROLE; it.fallback = false }
+                return@request HostAnswer.unreachable(null, e, if (ErrorRules.timedOut(e)) "timeout" else "network", null)
+            }
+            classify(r, check)
+        }
+        lastFallback.set(got.fallback)
+        val a = got.answer
+        a.value?.let { r ->
+            r.hostRole = ROLE
+            r.fallback = got.fallback
+            if (got.by == null) r.retryAfterMax = got.retryAfterMax
+            return r
+        }
+        val e = a.failure!!
+        if (e is NotTaken) throw e.failure ?: e
+        throw CloudException(null, "$method $path: ${e.message}", e, path).also {
+            it.hostRole = ROLE
+            it.fallback = got.fallback
+            it.retryAfterMax = got.retryAfterMax
+        }
+    }
+
+    /** Whether the last request of this thread asked more than one host (28.7 `fallback`), also when it ended in a
+     *  failure that is no request's (a lease the Core refused on every host it was asked of). */
+    private val lastFallback = ThreadLocal<Boolean>()
+
+    fun lastRequestFallback(): Boolean = lastFallback.get() == true
+
+    /** One host's answer read by 28.3's table (18.4.7.1's). */
+    private fun classify(r: HttpResponse, check: (HttpResponse) -> Unit): HostAnswer<HttpResponse> = when {
+        r.status == 429 -> HostAnswer.ends(AnswerClass.SLOW_DOWN, r)
+        r.status in 200..299 || r.status == 304 -> try {
+            check(r)
+            HostAnswer.ends(AnswerClass.TAKEN, r)
+        } catch (x: NotTaken) {
+            HostAnswer.unreachable(if (x.failure == null) r else null, x.failure?.let { x }, if (r.status == 304) "http" else "invalid_answer", r.status)
+        }
+        r.status in 300..399 -> HostAnswer.unreachable(r, null, "redirect", r.status)
+        r.status in 400..499 && r.error.apiRefusal -> HostAnswer.ends(AnswerClass.REFUSED, r)
+        else -> HostAnswer.unreachable(r, null, "http", r.status, r.retryAfter)
     }
 
     // section 2
 
     /** `GET /v1/attest/challenge` with the key: the challenge string. */
     fun challenge(key: QuranLabKey): String =
-        call("GET", "/v1/attest/challenge", Credential.Key(key)).json()?.get("challenge") as? String
+        call("GET", "/v1/attest/challenge", Credential.Key(key), check = has("challenge")).json()?.get("challenge") as? String
             ?: throw CloudException(ApiError(200, "no_challenge"), "no challenge in the answer")
 
     /** `POST /v1/attest` unattested: `{"platform","bundle_id"}`. */
     fun attest(key: QuranLabKey, app: AppIdentity): AppToken =
-        AppToken.from(call("POST", "/v1/attest", Credential.Key(key), linkedMapOf("platform" to app.platform, "bundle_id" to app.bundleId)))
+        AppToken.from(call("POST", "/v1/attest", Credential.Key(key), linkedMapOf("platform" to app.platform, "bundle_id" to app.bundleId), check = has("token")))
 
     /** `POST /v1/attest` with a Play Integrity token: `{"platform":"android","bundle_id","challenge","integrity_token"}`. */
     fun attestPlayIntegrity(key: QuranLabKey, app: AppIdentity, challenge: String, integrityToken: String): AppToken =
         AppToken.from(call("POST", "/v1/attest", Credential.Key(key), linkedMapOf(
-            "platform" to app.platform, "bundle_id" to app.bundleId, "challenge" to challenge, "integrity_token" to integrityToken)))
+            "platform" to app.platform, "bundle_id" to app.bundleId, "challenge" to challenge, "integrity_token" to integrityToken), check = has("token")))
 
     // SDK 4.0: the protected model
 
     /** `GET /v1/attest/challenge` with the app token: a challenge bound to the token's key (the lease's, 18.4.1). */
     fun challenge(token: String): String =
-        call("GET", "/v1/attest/challenge", Credential.Token(token)).json()?.get("challenge") as? String
+        call("GET", "/v1/attest/challenge", Credential.Token(token), stage = "lease", check = has("challenge")).json()?.get("challenge") as? String
             ?: throw CloudException(ApiError(200, "no_challenge"), "no challenge in the answer")
 
     /**
@@ -81,11 +136,14 @@ internal class QuranLabApi(
      * `integrity_token` when given. The raw answer: 200 carries `token` and `install_cert`.
      */
     fun attestInstall(key: QuranLabKey, body: Map<String, Any?>): HttpResponse =
-        call("POST", "/v1/attest", Credential.Key(key), body, expectOk = false)
+        call("POST", "/v1/attest", Credential.Key(key), body, expectOk = false, check = has("token"))
 
-    /** `POST /v1/model-key` (18.4.4): the raw answer, a lease (200) or a refusal of 18.4.10. */
-    fun modelKey(token: String, body: Map<String, Any?>): HttpResponse =
-        call("POST", "/v1/model-key", Credential.Token(token), body, expectOk = false)
+    /**
+     * `POST /v1/model-key` (18.4.4): the raw answer, a lease (200) or a refusal of 18.4.10. [accept] takes a 200 (a lease
+     * the Core accepts, 28.3) or throws [NotTaken] for one that is not, which makes that host unreachable.
+     */
+    fun modelKey(token: String, body: Map<String, Any?>, accept: (HttpResponse) -> Unit = JSON): HttpResponse =
+        call("POST", "/v1/model-key", Credential.Token(token), body, expectOk = false, check = { r -> if (r.status != 200) throw NotTaken() else accept(r) })
 
     // section 3
 
@@ -96,12 +154,19 @@ internal class QuranLabApi(
      * [ConfigStore] to verify.
      */
     @JvmOverloads
-    fun config(cred: Credential, bucket: Int, app: AppIdentity, etag: String?, modelVersion: String? = null): HttpResponse {
+    fun config(cred: Credential, bucket: Int, app: AppIdentity, etag: String?, modelVersion: String? = null,
+               verify: (HttpResponse) -> Unit = JSON): HttpResponse {
         val q = StringBuilder("?bucket=$bucket&sdk=${enc(SdkInfo.VERSION)}")
         if (cred is Credential.Key) q.append("&platform=${enc(app.platform)}&bundle_id=${enc(app.bundleId)}")
         if (modelVersion != null) q.append("&model_version=${enc(modelVersion)}")
+        // SDK 4.0.1: the app's version and build, read once per Client, left out when unknown
+        app.configVersion?.let { q.append("&app_version=${enc(it)}") }
+        app.configBuild?.let { q.append("&app_build=${enc(it)}") }
         val extra = if (etag != null) mapOf("if-none-match" to etag) else emptyMap()
-        val r = call("GET", "/v1/config$q", cred, extra = extra, expectOk = false)
+        // taken (28.3): a 200 config that verifies ([verify] throws NotTaken for one that does not), or a 304 to a request
+        // with If-None-Match
+        val r = call("GET", "/v1/config$q", cred, extra = extra, expectOk = false,
+            check = { a -> if (a.status == 304) { if (etag == null) throw NotTaken() } else if (a.status != 200) throw NotTaken() else verify(a) })
         if (r.status != 200 && r.status != 304) throw CloudException(r.error, "GET /v1/config: ${r.error}", path = "/v1/config")
         return r
     }
@@ -134,9 +199,7 @@ internal class QuranLabApi(
         val h = LinkedHashMap<String, String>()
         cred.apply(h)
         h["content-type"] = "application/json"
-        return try { http.send(HttpRequest(method, base + path, h, body)) } catch (e: IOException) {
-            throw CloudException(null, "$method $path: ${e.message}", e, path)
-        }
+        return send(method, path, h, body)
     }
 
     // section 10
@@ -144,17 +207,13 @@ internal class QuranLabApi(
     /** `POST /v1/uploads` with the session JSON; the answer's URLs. */
     fun uploadStart(token: String, id: String, session: ByteArray): HttpResponse {
         val h = linkedMapOf("authorization" to "Bearer $token", "content-type" to "application/json", "x-qlab-id" to id)
-        return try { http.send(HttpRequest("POST", "$base/v1/uploads", h, session)) } catch (e: IOException) {
-            throw CloudException(null, "POST /v1/uploads: ${e.message}")
-        }
+        return send("POST", "/v1/uploads", h, session)
     }
 
     /** `POST /v1/uploads/{id}/urls?from=n` with `x-qlab-contributor`. */
     fun uploadUrls(token: String, id: String, from: Int, contributor: String): HttpResponse {
         val h = linkedMapOf("authorization" to "Bearer $token", "x-qlab-contributor" to contributor)
-        return try { http.send(HttpRequest("POST", "$base/v1/uploads/$id/urls?from=$from", h)) } catch (e: IOException) {
-            throw CloudException(null, "POST /v1/uploads/$id/urls: ${e.message}")
-        }
+        return send("POST", "/v1/uploads/$id/urls?from=$from", h, null)
     }
 
     /**
@@ -163,12 +222,11 @@ internal class QuranLabApi(
      */
     fun uploadTakes(token: String, id: String, contributor: String, body: ByteArray): HttpResponse {
         val h = linkedMapOf("authorization" to "Bearer $token", "content-type" to "application/json", "x-qlab-contributor" to contributor)
-        return try { http.send(HttpRequest("POST", "$base/v1/uploads/$id/takes", h, body)) } catch (e: IOException) {
-            throw CloudException(null, "POST /v1/uploads/$id/takes: ${e.message}")
-        }
+        return send("POST", "/v1/uploads/$id/takes", h, body)
     }
 
-    /** A plain PUT of one segment to its presigned URL: `content-type: audio/ogg` and nothing else to sign. */
+    /** A plain PUT of one segment to its presigned URL: `content-type: audio/ogg` and nothing else to sign. The URL is the
+     *  storage's, no host of section 28: asked there only. */
     fun putSegment(url: String, file: java.io.File): HttpResponse = try {
         http.send(HttpRequest("PUT", url, mapOf("content-type" to "audio/ogg"), bodyFile = file))
     } catch (e: IOException) {
@@ -191,8 +249,17 @@ internal class QuranLabApi(
         call("POST", "/v1/contributions/delete", null, body)
 
     companion object {
+        /** The first `api` host's origin (28.1); a test build passes a stand-in's URL instead. */
         const val DEFAULT_API = "https://api.quranlab.ai"
-        const val DEFAULT_CDN = "https://cdn.quranlab.ai"
+
+        /** The role of every request of this class (28.7 `host_role`). */
+        const val ROLE = "api"
+
+        /** Taken (28.3): a 2xx whose body is a JSON object, or empty; a 304 answers no request of these routes. */
+        val JSON: (HttpResponse) -> Unit = { r -> if (r.status == 304 || (r.body.isNotEmpty() && r.json() == null)) throw NotTaken() }
+
+        /** Taken: a 2xx whose JSON object carries the string [field] (a challenge, a token). */
+        fun has(field: String): (HttpResponse) -> Unit = { r -> if (r.status == 304 || r.json()?.get(field) !is String) throw NotTaken() }
 
         private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
     }

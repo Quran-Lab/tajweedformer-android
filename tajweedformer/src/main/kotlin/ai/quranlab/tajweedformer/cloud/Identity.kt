@@ -13,15 +13,29 @@ internal data class AppIdentity(
     val name: String? = null,
     /** `android` for this SDK. */
     val platform: String = "android",
+    /** SDK 4.0.1: the app's build number as it came (`longVersionCode` in decimal, or the app's
+     *  `appBuild`), or null when unknown. */
+    val build: String? = null,
 ) {
     /** qlab-api's app id, `android:<applicationId>` (the deletion message names it). */
     val appId: String get() = "$platform:$bundleId"
 
+    /** 27.1: `app_version` of a config request: [version] as register sends it, or null when unknown (register's `"0"`). */
+    val configVersion: String? get() = version.takeIf { it.isNotEmpty() && it != "0" }
+
+    /** 27.1: `app_build` of a config request: [build] cleaned as register cleans the version, or null when unknown, or
+     *  when it cleans down to nothing or to `"0"`. */
+    val configBuild: String? get() = build?.let { cleanVersion(it) }?.takeIf { it != "0" }
+
     companion object {
-        /** A version string the server's schema takes. */
+        /**
+         * A version string the server's schema takes (`^[0-9A-Za-z][0-9A-Za-z.+-]*$`, at most 32): contract 27.1's one
+         * cleaning (SDK 4.0.1), in its order: keep only ASCII `0-9 A-Z a-z . + -`, drop the leading `. + -`, keep the
+         * first 32; `"0"` when nothing is left (register's placeholder). 4.0.0 cut to 32 before dropping the leading signs.
+         */
         @JvmStatic
         fun cleanVersion(raw: String?): String {
-            val v = (raw ?: "").filter { it.isLetterOrDigit() && it.code < 128 || it in ".+-" }.take(32).trimStart('.', '+', '-')
+            val v = (raw ?: "").filter { (it in '0'..'9') || (it in 'A'..'Z') || (it in 'a'..'z') || it in ".+-" }.trimStart('.', '+', '-').take(32)
             return v.ifEmpty { "0" }
         }
     }

@@ -25,6 +25,12 @@ public class TajweedClientOptions @JvmOverloads constructor(
      * app, or roaming). `client.model()` and `prefetch()` are not affected: they keep their own argument.
      */
     public val unmeteredOnly: Boolean = false,
+    /**
+     * SDK 4.0.1: the app's build number, sent with the app's version on every config request so that the developer's
+     * model version rules at sdk.quranlab.ai can match it. Null: the app's own (Android: `longVersionCode`, `versionCode`
+     * below API 28).
+     */
+    public val appBuild: String? = null,
 )
 
 /**

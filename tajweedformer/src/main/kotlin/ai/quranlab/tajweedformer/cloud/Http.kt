@@ -69,6 +69,14 @@ internal class HttpRequest(
 internal class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray) {
     val ok: Boolean get() = status in 200..299
 
+    /** SDK 4.0.1: the role of the host that gave it (`api`), and whether the request asked more than one
+     *  host; set by the request across the hosts ([Endpoints.request]). */
+    @Volatile var hostRole: String? = null
+    @Volatile var fallback: Boolean = false
+
+    /** 28.5: the largest Retry-After of the hosts, when every host was unreachable and this is the first host's answer. */
+    @Volatile var retryAfterMax: Int? = null
+
     fun header(name: String): String? = headers[name.lowercase()]
 
     /** The body as a JSON object, or null. */
@@ -82,13 +90,56 @@ internal class HttpResponse(val status: Int, val headers: Map<String, String>, v
     /** qlab-api's `{"error","message"}`, or `http_<status>`. A redirect (3xx) is `http_<status>` whatever its body
      *  says: it is a failed request, never a refusal and never a stop of a model (SPEC 15.4). */
     val error: ApiError get() {
-        if (status in 300..399) return ApiError(status, "http_$status", retryAfter = retryAfter)
-        val o = json()
+        val o = if (status in 300..399) null else json()
+        // a redirect (3xx) is `http_<status>` whatever its body says
         return ApiError(status, o?.get("error") as? String ?: "http_$status", o?.get("min_sdk") as? String, o?.get("reason") as? String, retryAfter)
+            .also { it.hostRole = hostRole; it.fallback = fallback }
     }
 
-    /** The answer's Retry-After in seconds (its delay form, read as 1 to 21600, 18.4.7), or null. */
-    val retryAfter: Int? get() = header("retry-after")?.trim()?.toLongOrNull()?.coerceIn(1, 21_600)?.toInt()
+    /** The answer's Retry-After in seconds (its delay form, read as 1 to 21600, 18.4.7), or null; when every host was
+     *  unreachable, the largest any host gave (28.5). */
+    val retryAfter: Int? get() = retryAfterMax ?: header("retry-after")?.trim()?.toLongOrNull()?.coerceIn(1, 21_600)?.toInt()
+}
+
+/**
+ * Contract 28.3 item 6 (SDK 4.0.1): a host has [ms] to connect, TCP and TLS together. `HttpURLConnection`'s
+ * `connectTimeout` bounds the TCP connect alone: a host that takes the connection and then stalls the TLS handshake would
+ * hold the request until the read timeout (60 s on the API, 30 s on a model file) before the next host is asked. So
+ * `connect()` (TCP, then TLS on https) is ended at [ms] by closing the connection from a watch thread, and the request
+ * fails as one that got no answer at all (`network`, 24.3).
+ */
+internal fun HttpURLConnection.connectWithin(ms: Int) {
+    val done = java.util.concurrent.atomic.AtomicBoolean(false)
+    val late = java.util.concurrent.atomic.AtomicBoolean(false)
+    val watch = ConnectWatch.at(ms) {
+        if (!done.get()) {
+            late.set(true)
+            try { disconnect() } catch (_: Exception) {}
+        }
+    }
+    val tooLate = { why: Throwable? -> IOException("no connection within $ms ms (TCP and TLS)", why) }
+    try {
+        connect()
+    } catch (e: IOException) {
+        throw if (late.get()) tooLate(e) else e
+    } catch (e: RuntimeException) {
+        // a connection closed from another thread can fail with an exception that is no IOException
+        throw if (late.get()) tooLate(e) else e
+    } finally {
+        done.set(true)
+        watch.cancel(false)
+    }
+    if (late.get()) throw tooLate(null)
+}
+
+/** The one thread that ends a connect past its time ([connectWithin]). */
+internal object ConnectWatch {
+    private val timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "tajweedformer-connect").apply { isDaemon = true }
+    }
+
+    fun at(ms: Int, f: () -> Unit): java.util.concurrent.ScheduledFuture<*> =
+        timer.schedule(f, ms.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
 }
 
 /** The network, replaceable in tests. Throws [IOException] when no response came. */
@@ -102,7 +153,8 @@ internal fun interface HttpTransport {
  * `Origin` header (an `apps` key with one is refused), never follows redirects, never caches.
  */
 internal class UrlConnectionTransport(
-    private val connectTimeoutMs: Int = 15_000,
+    /** 28.3 item 6: a host has 5 s to connect; the next host is asked after it. */
+    private val connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = 60_000,
 ) : HttpTransport {
     override fun send(request: HttpRequest): HttpResponse {
@@ -123,7 +175,7 @@ internal class UrlConnectionTransport(
             val file = request.bodyFile
             val bytes = request.body
             if (file != null) {
-                // segments stream from disk with their length (never chunked: R2 refuses that)
+                // segments stream from disk with their length (never chunked: the storage refuses that)
                 c.doOutput = true
                 c.setFixedLengthStreamingMode(file.length())
                 connected(c, abort)
@@ -167,17 +219,21 @@ internal class UrlConnectionTransport(
      * A request that can be ended connects first: closing a connection that does not exist yet ends nothing, so an
      * end that came while it was connecting is seen here, before anything of the request is sent.
      */
+    /** Connected within the host's time, TCP and TLS ([connectWithin], 28.3 item 6); then a request the app's thread
+     *  ended fails as ended. */
     private fun connected(c: HttpURLConnection, abort: HttpAbort?) {
-        if (abort == null) return
-        c.connect()
-        if (abort.aborted) throw IOException(ENDED)
+        c.connectWithin(connectTimeoutMs)
+        if (abort?.aborted == true) throw IOException(ENDED)
     }
 
-    private companion object {
-        const val ENDED = "the request was ended"
+    companion object {
+        /** Contract 28.3 item 6 (SDK 4.0.1): the time a host has to connect (TCP, and TLS where the platform bounds it). */
+        const val CONNECT_TIMEOUT_MS = 5_000
+
+        private const val ENDED = "the request was ended"
 
         /** A body file is sent in blocks of this size. */
-        const val BLOCK = 16 * 1024
+        private const val BLOCK = 16 * 1024
     }
 }
 
@@ -231,6 +287,10 @@ internal data class ApiError(
     /** The answer's Retry-After in seconds (503 lease_unavailable: 30), when it gave one. */
     val retryAfter: Int? = null,
 ) {
+    /** 28.7: the role of the host that answered (`api`), and whether the request asked more than one host. */
+    @Volatile var hostRole: String? = null
+    @Volatile var fallback: Boolean? = null
+
     /** The API's own refusal (18.4.7.1): a 4xx other than 429 whose body is JSON with an `error` string (a page that is
      *  not the API's has the code `http_<status>`). */
     val apiRefusal: Boolean get() = status in 400..499 && status != 429 && !code.startsWith("http_")
@@ -284,6 +344,13 @@ internal class CloudException(
     val path: String? = null,
 ) : Exception(message, cause) {
     val offline: Boolean get() = api == null
+
+    /** 28.7: the role of the request's hosts (`api`) and whether more than one was asked; the answer's when it has one. */
+    @Volatile var hostRole: String? = api?.hostRole
+    @Volatile var fallback: Boolean? = api?.fallback
+
+    /** 28.5: the largest Retry-After any host gave, when every host was unreachable. */
+    @Volatile var retryAfterMax: Int? = null
 
     /** No answer because the system does not let the app use the network (no INTERNET permission). */
     val notPermitted: Boolean get() = cause is ai.quranlab.tajweedformer.NetworkNotPermitted

@@ -1,0 +1,1912 @@
+{
+ "format": "quranlab.standby-40/1",
+ "about": "ENDPOINTS_40.md 28.9: what a standby host answers. For a server replay (the standby's own CI), not for SDKs. Made by tools/standby40.py --write; do not edit by hand.",
+ "standbys": {
+  "b": {
+   "api": "api-b.tajweedformer.com",
+   "models": "cdn-b.tajweedformer.com",
+   "web_frame": "web-b.tajweedformer.com"
+  },
+  "g": {
+   "api": "api-g.tajweedformer.com",
+   "models": "cdn-g.tajweedformer.com",
+   "web_frame": "web-g.tajweedformer.com"
+  },
+  "a": {
+   "api": "api-a.tajweedformer.com",
+   "models": "cdn-a.tajweedformer.com",
+   "web_frame": "web-a.tajweedformer.com"
+  }
+ },
+ "header": "x-qlab-standby",
+ "frame_origins": [
+  "https://web.quranlab.ai",
+  "https://web2.quranlab.ai",
+  "https://web-b.tajweedformer.com",
+  "https://web-g.tajweedformer.com",
+  "https://web-a.tajweedformer.com"
+ ],
+ "retry_after": {
+  "min": 1,
+  "max": 3600,
+  "accelerator": 3600,
+  "day_stop": {
+   "min": 60,
+   "max": 3600
+  }
+ },
+ "served": {
+  "api": [
+   "GET /v1/health",
+   "GET /v1/origin-check",
+   "GET /v1/attest/challenge",
+   "POST /v1/attest",
+   "POST /v1/attest/assert",
+   "GET /v1/config",
+   "POST /v1/register",
+   "POST /v1/model-key",
+   "GET /v1/sdk/latest",
+   "OPTIONS /v1/attest",
+   "OPTIONS /v1/attest/assert",
+   "OPTIONS /v1/attest/challenge",
+   "OPTIONS /v1/config",
+   "OPTIONS /v1/health",
+   "OPTIONS /v1/model-key",
+   "OPTIONS /v1/origin-check",
+   "OPTIONS /v1/register",
+   "OPTIONS /v1/sdk/latest"
+  ],
+  "models": "GET and HEAD of the files of a 4.0 encrypted build the standby holds, its CPU set only; OPTIONS",
+  "web_frame": "GET and HEAD of /4/ files of a hosted build from 4.0.1 the standby holds"
+ },
+ "pass_reasons": [
+  "key_revoked",
+  "app_blocked"
+ ],
+ "states": [
+  "serving",
+  "degraded",
+  "paused",
+  "waiting_for_secrets"
+ ],
+ "modes": {
+  "serving": "serving (or degraded): secrets in place, not paused",
+  "paused": "paused by its operator",
+  "waiting_for_secrets": "started without its secrets, until they are given to it",
+  "address_bytes_spent": "serving, with the requests' address past its bytes for this hour",
+  "day_bytes_spent": "serving, with its model bytes for this UTC day spent"
+ },
+ "stand_in": "what the standby under replay holds: every web_frame host as a frame origin, flags.web4 and flags.protected_model on, no key named qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA, no build 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a, no hosted build 000000000000",
+ "passes_are": "route (config, register, challenge, attest, model-key, origin-check, file, engine), upstream: the answer {status, json?} of the API or CDN code the standby runs, and what the standby sends: pass (that answer unchanged, with x-qlab-standby added) or unavailable (503, error service_unavailable, Retry-After). Replayed with that code stubbed",
+ "passes": [
+  {
+   "name": "a config",
+   "route": "config",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "v": 1
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a 304 to If-None-Match",
+   "route": "config",
+   "upstream": {
+    "status": 304
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a challenge",
+   "route": "challenge",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "challenge": "c1.1790000500.AAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a lease",
+   "route": "model-key",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "v": 1
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a range of a model file",
+   "route": "file",
+   "upstream": {
+    "status": 206
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a 5xx goes out as the code gave it",
+   "route": "config",
+   "upstream": {
+    "status": 500,
+    "json": {
+     "error": "internal"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the lease route's own 503",
+   "route": "model-key",
+   "upstream": {
+    "status": 503,
+    "json": {
+     "error": "lease_unavailable"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the CDN's 503 network_blocked",
+   "route": "file",
+   "upstream": {
+    "status": 503,
+    "json": {
+     "error": "network_blocked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "429 rate_limited",
+   "route": "config",
+   "upstream": {
+    "status": 429,
+    "json": {
+     "error": "rate_limited"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "429 model_limit",
+   "route": "file",
+   "upstream": {
+    "status": 429,
+    "json": {
+     "error": "model_limit"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a 429 that is not JSON",
+   "route": "file",
+   "upstream": {
+    "status": 429
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "403 sdk_too_old",
+   "route": "register",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "sdk_too_old",
+     "min_sdk": "4.0.1"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "403 sdk_too_old on the lease route",
+   "route": "model-key",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "sdk_too_old"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a revoked key",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "key_revoked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a token of a key revoked since",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_token",
+     "reason": "key_revoked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a blocked app",
+   "route": "config",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "app_blocked",
+     "reason": "app_blocked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a signed stop: a revoked key",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "key_revoked",
+     "signed": "cXVyYW5sYWItcmVmdXNhbCAx.c2lnbmF0dXJl"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a signed stop: a blocked app",
+   "route": "model-key",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "app_blocked",
+     "reason": "app_blocked",
+     "signed": "cXVyYW5sYWItcmVmdXNhbCAx.c2lnbmF0dXJl"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the CDN's 401 for a revoked key",
+   "route": "file",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "missing or invalid x-qlab-key",
+     "reason": "key_revoked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "a key the standby does not hold yet",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "key_unknown"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "an app added to the key since the sync",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "app_not_allowed"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "an origin added since the sync",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "origin_not_allowed"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "key_type_mismatch",
+   "route": "config",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "key_type_mismatch"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a developer approved since the sync",
+   "route": "config",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "developer_not_approved",
+     "reason": "developer_not_approved"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a signed stop for a key it does not hold",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "key_unknown",
+     "signed": "cXVyYW5sYWItcmVmdXNhbCAx.c2lnbmF0dXJl"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a signed stop: app_not_allowed",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_key",
+     "reason": "app_not_allowed",
+     "signed": "cXVyYW5sYWItcmVmdXNhbCAx.c2lnbmF0dXJl"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the CDN's 401 for a key it does not hold",
+   "route": "file",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "missing or invalid x-qlab-key",
+     "reason": "key_unknown"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a 404 that carries a stop reason",
+   "route": "config",
+   "upstream": {
+    "status": 404,
+    "json": {
+     "error": "not_found",
+     "reason": "key_revoked"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "401 invalid_token without a reason (renew the token)",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_token"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "401 challenge_invalid (a new challenge)",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "challenge_invalid"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "401 install_cert_invalid (attest again)",
+   "route": "model-key",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "install_cert_invalid",
+     "why": "expired"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the CDN's 401 invalid_token",
+   "route": "file",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "invalid_token"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "lease_integrity_failed",
+   "route": "model-key",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "lease_integrity_failed",
+     "why": "verdict",
+     "check": "boot"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "lease_integrity_failed on attest",
+   "route": "attest",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "lease_integrity_failed",
+     "why": "downgrade"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "lease_attestation_required",
+   "route": "model-key",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "lease_attestation_required"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "turnstile_failed",
+   "route": "model-key",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "turnstile_failed",
+     "why": "hostname"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a build the standby does not know yet",
+   "route": "model-key",
+   "upstream": {
+    "status": 404,
+    "json": {
+     "error": "build_unknown"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the lease route off",
+   "route": "model-key",
+   "upstream": {
+    "status": 404,
+    "json": {
+     "error": "not_found"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "model_attestation_required",
+   "route": "file",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "model_attestation_required"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "model_not_allowed",
+   "route": "file",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "model_not_allowed"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the CDN's 401 without a reason",
+   "route": "file",
+   "upstream": {
+    "status": 401,
+    "json": {
+     "error": "missing or invalid x-qlab-key"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a model file it does not hold",
+   "route": "file",
+   "upstream": {
+    "status": 404
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "a /4/ file it does not hold",
+   "route": "engine",
+   "upstream": {
+    "status": 404
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "400 invalid_query",
+   "route": "config",
+   "upstream": {
+    "status": 400,
+    "json": {
+     "error": "invalid_query"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "400 invalid_body",
+   "route": "model-key",
+   "upstream": {
+    "status": 400,
+    "json": {
+     "error": "invalid_body"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "409 app_owned_elsewhere",
+   "route": "register",
+   "upstream": {
+    "status": 409,
+    "json": {
+     "error": "app_owned_elsewhere"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "403 app_mismatch",
+   "route": "register",
+   "upstream": {
+    "status": 403,
+    "json": {
+     "error": "app_mismatch"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the origin check: allowed",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": true
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the origin check: a revoked key",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": false,
+     "why": "key_revoked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the origin check: a blocked app",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": false,
+     "why": "app_blocked"
+    }
+   },
+   "standby": "pass"
+  },
+  {
+   "name": "the origin check: a key it does not hold",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": false,
+     "why": "key_unknown"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the origin check: an origin added since the sync",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": false,
+     "why": "origin_not_allowed"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "the origin check: a why that is no stop",
+   "route": "origin-check",
+   "upstream": {
+    "status": 200,
+    "json": {
+     "allowed": false,
+     "why": "local_needs_development_key"
+    }
+   },
+   "standby": "unavailable"
+  },
+  {
+   "name": "attest: the platform's integrity check not available",
+   "route": "attest",
+   "upstream": {
+    "status": 503,
+    "json": {
+     "error": "integrity_unavailable"
+    }
+   },
+   "standby": "pass"
+  }
+ ],
+ "requests_are": "one request to a running standby: role (put the standby's host of that role), method, path, headers, mode (the standby's state, as modes says), upstream (what its API or CDN code answers, where the request reaches it), and the answer expected: status; error, the body's error; retry_after, the Retry-After header in seconds, a number or {min, max}; body_keys, the body's keys exactly; body, fields whose value is that value or one of a list; headers, each name to a value, a list (one of), true (present), null (absent) or {contains: [...]} (a comma list that holds each, any case). {id} is the standby's id. bucket, on the models cases: what a models host served straight from a storage bucket answers instead (28.9 item 2): unreachable (a 5xx, or a 4xx other than 429 that is not JSON with an error string, as 28.3 reads it), an expectation as above, or null where the case does not apply to such a host",
+ "requests": [
+  {
+   "group": "unserved",
+   "name": "the API's root",
+   "role": "api",
+   "method": "GET",
+   "path": "/",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a sharing route: the learner's summary",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/contributions/summary",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a sharing upload",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/uploads",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a sharing upload's URLs",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/uploads/u_standby/urls",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a sharing upload's takes",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/uploads/u_standby/takes",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a sharing deletion",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/contributions/delete",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "telemetry: the SDK keeps it for a first host",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/events",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "issues and error reports: the SDK keeps them for a first host",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/issues",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "the setup API",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/setup",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "an admin route",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/admin/system",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a served path with another method",
+   "role": "api",
+   "method": "DELETE",
+   "path": "/v1/config",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "the models host's root",
+   "role": "models",
+   "method": "GET",
+   "path": "/",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "unserved",
+   "name": "a raw weights link",
+   "role": "models",
+   "method": "GET",
+   "path": "/raw/x",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "unserved",
+   "name": "a model file by POST",
+   "role": "models",
+   "method": "POST",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "unserved",
+   "name": "the web host's root",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "an API path on the web host",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/v1/config",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a /4/ file by POST",
+   "role": "web_frame",
+   "method": "POST",
+   "path": "/4/loader.js",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "unserved",
+   "name": "a preflight for a route it does not serve",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/issues",
+   "headers": {
+    "origin": "https://web.quranlab.ai",
+    "access-control-request-method": "POST",
+    "access-control-request-headers": "authorization, content-type"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": [
+      "*",
+      "https://web.quranlab.ai"
+     ]
+    }
+   }
+  },
+  {
+   "group": "accelerator",
+   "name": "a Core ML package",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/coreml/c16_l64/encoder.mlmodelc.qle",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": 3600,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "accelerator",
+   "name": "a compact Core ML package",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/coreml-compact/c16_l64/encoder.mlmodelc.qle",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": 3600,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "accelerator",
+   "name": "an NPU program",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/npu/qnn-sm8650/encoder.bin.qle",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": 3600,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "accelerator",
+   "name": "a Core program delta",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/c16_l64/encoder.qlpd.qle",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": 3600,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "not_held",
+   "name": "a CPU file of a build it does not hold",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {
+    "x-qlab-key": "qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA",
+    "authorization": "Bearer qlt_v1.standby-vector"
+   },
+   "mode": "serving",
+   "upstream": "401 without a stop reason it holds, or 404: never passed on",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": "unreachable"
+  },
+  {
+   "group": "not_held",
+   "name": "a /4/ file of a build it does not hold",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/4/app/000000000000/frame.html",
+   "headers": {},
+   "mode": "serving",
+   "upstream": "404: never passed on",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "not_held",
+   "name": "a config for a key it does not hold",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/config?bucket=0&sdk=4.0.1",
+   "headers": {
+    "x-qlab-key": "qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "mode": "serving",
+   "upstream": "401 invalid_key, reason key_unknown",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "not_held",
+   "name": "the origin check for a key it does not hold",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/origin-check?key=qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA",
+   "headers": {
+    "origin": "https://recite.example.org"
+   },
+   "mode": "serving",
+   "upstream": "200 {\"allowed\": false, \"why\": \"key_unknown\"}",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "not_held",
+   "name": "a lease with a token that does not verify",
+   "role": "api",
+   "method": "POST",
+   "path": "/v1/model-key",
+   "headers": {
+    "authorization": "Bearer qlt_v1.standby-vector",
+    "content-type": "application/json"
+   },
+   "mode": "serving",
+   "upstream": "401 invalid_token without a reason, or 404 not_found with the lease route off",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from the frame on web.quranlab.ai",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/config",
+   "headers": {
+    "origin": "https://web.quranlab.ai",
+    "access-control-request-method": "GET",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web.quranlab.ai",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from the frame on web2.quranlab.ai",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/model-key",
+   "headers": {
+    "origin": "https://web2.quranlab.ai",
+    "access-control-request-method": "POST",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site, content-type"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web2.quranlab.ai",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from the frame on web-b.tajweedformer.com",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/config",
+   "headers": {
+    "origin": "https://web-b.tajweedformer.com",
+    "access-control-request-method": "GET",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web-b.tajweedformer.com",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from the frame on web-g.tajweedformer.com",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/model-key",
+   "headers": {
+    "origin": "https://web-g.tajweedformer.com",
+    "access-control-request-method": "POST",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site, content-type"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web-g.tajweedformer.com",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from the frame on web-a.tajweedformer.com",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/config",
+   "headers": {
+    "origin": "https://web-a.tajweedformer.com",
+    "access-control-request-method": "GET",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web-a.tajweedformer.com",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight from a lookalike of a frame host",
+   "role": "api",
+   "method": "OPTIONS",
+   "path": "/v1/config",
+   "headers": {
+    "origin": "https://web-c.tajweedformer.com",
+    "access-control-request-method": "GET",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": null
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "a preflight for a model file from the frame on web.quranlab.ai",
+   "role": "models",
+   "method": "OPTIONS",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {
+    "origin": "https://web.quranlab.ai",
+    "access-control-request-method": "GET",
+    "access-control-request-headers": "authorization, x-qlab-key, x-qlab-site, range"
+   },
+   "mode": "serving",
+   "expect": {
+    "status": 204,
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": "https://web.quranlab.ai",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key",
+       "range"
+      ]
+     }
+    }
+   },
+   "bucket": {
+    "status": [
+     200,
+     204
+    ],
+    "headers": {
+     "access-control-allow-origin": "https://web.quranlab.ai",
+     "access-control-allow-headers": {
+      "contains": [
+       "x-qlab-site",
+       "authorization",
+       "x-qlab-key",
+       "range"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "group": "frame",
+   "name": "the frame on web.quranlab.ai asks a config the standby cannot vouch for: a 503 the frame can read",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/config?bucket=0&sdk=4.0.1",
+   "headers": {
+    "origin": "https://web.quranlab.ai",
+    "x-qlab-key": "qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA",
+    "x-qlab-site": "https://recite.example.org"
+   },
+   "mode": "serving",
+   "upstream": "401 invalid_key, reason key_unknown",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": [
+      "*",
+      "https://web.quranlab.ai"
+     ]
+    }
+   }
+  },
+  {
+   "group": "health",
+   "name": "health on the api host",
+   "role": "api",
+   "method": "GET",
+   "path": "/_standby/health",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 200,
+    "body_keys": [
+     "ok",
+     "state"
+    ],
+    "body": {
+     "ok": true,
+     "state": [
+      "serving",
+      "degraded"
+     ]
+    },
+    "headers": {
+     "x-qlab-standby": "{id}"
+    }
+   }
+  },
+  {
+   "group": "health",
+   "name": "health on the models host",
+   "role": "models",
+   "method": "GET",
+   "path": "/_standby/health",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 200,
+    "body_keys": [
+     "ok",
+     "state"
+    ],
+    "body": {
+     "ok": true,
+     "state": [
+      "serving",
+      "degraded"
+     ]
+    },
+    "headers": {
+     "x-qlab-standby": "{id}"
+    }
+   },
+   "bucket": null
+  },
+  {
+   "group": "health",
+   "name": "health on the web_frame host",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/_standby/health",
+   "headers": {},
+   "mode": "serving",
+   "expect": {
+    "status": 200,
+    "body_keys": [
+     "ok",
+     "state"
+    ],
+    "body": {
+     "ok": true,
+     "state": [
+      "serving",
+      "degraded"
+     ]
+    },
+    "headers": {
+     "x-qlab-standby": "{id}"
+    }
+   }
+  },
+  {
+   "group": "paused",
+   "name": "paused: a config",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/config?bucket=0&sdk=4.0.1",
+   "headers": {
+    "x-qlab-key": "qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "mode": "paused",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "paused",
+   "name": "paused: a model file",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {},
+   "mode": "paused",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": null
+  },
+  {
+   "group": "paused",
+   "name": "paused: the loader",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/4/loader.js",
+   "headers": {},
+   "mode": "paused",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "paused",
+   "name": "paused: health says so",
+   "role": "api",
+   "method": "GET",
+   "path": "/_standby/health",
+   "headers": {},
+   "mode": "paused",
+   "expect": {
+    "status": 200,
+    "body_keys": [
+     "ok",
+     "state"
+    ],
+    "body": {
+     "ok": false,
+     "state": [
+      "paused"
+     ]
+    },
+    "headers": {
+     "x-qlab-standby": "{id}"
+    }
+   }
+  },
+  {
+   "group": "waiting_for_secrets",
+   "name": "waiting_for_secrets: a config",
+   "role": "api",
+   "method": "GET",
+   "path": "/v1/config?bucket=0&sdk=4.0.1",
+   "headers": {
+    "x-qlab-key": "qlk_v1_standby-vector-unknown_AAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "mode": "waiting_for_secrets",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "waiting_for_secrets",
+   "name": "waiting_for_secrets: a model file",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {},
+   "mode": "waiting_for_secrets",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": null
+  },
+  {
+   "group": "waiting_for_secrets",
+   "name": "waiting_for_secrets: the loader",
+   "role": "web_frame",
+   "method": "GET",
+   "path": "/4/loader.js",
+   "headers": {},
+   "mode": "waiting_for_secrets",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   }
+  },
+  {
+   "group": "waiting_for_secrets",
+   "name": "waiting_for_secrets: health says so",
+   "role": "api",
+   "method": "GET",
+   "path": "/_standby/health",
+   "headers": {},
+   "mode": "waiting_for_secrets",
+   "expect": {
+    "status": 200,
+    "body_keys": [
+     "ok",
+     "state"
+    ],
+    "body": {
+     "ok": false,
+     "state": [
+      "waiting_for_secrets"
+     ]
+    },
+    "headers": {
+     "x-qlab-standby": "{id}"
+    }
+   }
+  },
+  {
+   "group": "limits",
+   "name": "its bytes for this address and hour spent: a slow down",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {},
+   "mode": "address_bytes_spent",
+   "expect": {
+    "status": 429,
+    "error": "rate_limited",
+    "retry_after": {
+     "min": 1,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": null
+  },
+  {
+   "group": "limits",
+   "name": "its model bytes for the UTC day spent",
+   "role": "models",
+   "method": "GET",
+   "path": "/models/Quran-Lab/tajweedformer-v4/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a/sdk/v4.0/layers.zfw.qle",
+   "headers": {},
+   "mode": "day_bytes_spent",
+   "expect": {
+    "status": 503,
+    "error": "service_unavailable",
+    "retry_after": {
+     "min": 60,
+     "max": 3600
+    },
+    "headers": {
+     "x-qlab-standby": "{id}",
+     "access-control-allow-origin": true
+    }
+   },
+   "bucket": null
+  }
+ ],
+ "turnstile_are": "siteverify's answer on a standby's lease route (its stub in a replay), its reading by 18.4.9 with every web_frame host, and what the standby does",
+ "turnstile": [
+  {
+   "hostname": "web.quranlab.ai",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web.quranlab.ai"
+    }
+   },
+   "reading": "pass",
+   "standby": "the lease route goes on"
+  },
+  {
+   "hostname": "web2.quranlab.ai",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web2.quranlab.ai"
+    }
+   },
+   "reading": "pass",
+   "standby": "the lease route goes on"
+  },
+  {
+   "hostname": "web-b.tajweedformer.com",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web-b.tajweedformer.com"
+    }
+   },
+   "reading": "pass",
+   "standby": "the lease route goes on"
+  },
+  {
+   "hostname": "web-g.tajweedformer.com",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web-g.tajweedformer.com"
+    }
+   },
+   "reading": "pass",
+   "standby": "the lease route goes on"
+  },
+  {
+   "hostname": "web-a.tajweedformer.com",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web-a.tajweedformer.com"
+    }
+   },
+   "reading": "pass",
+   "standby": "the lease route goes on"
+  },
+  {
+   "hostname": "web-b.tajweedformer.com.example.net",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web-b.tajweedformer.com.example.net"
+    }
+   },
+   "reading": {
+    "failed": "hostname"
+   },
+   "standby": "unavailable"
+  },
+  {
+   "hostname": "web-c.tajweedformer.com",
+   "siteverify": {
+    "body": {
+     "success": true,
+     "action": "lease",
+     "cdata": "FwDNDKbH1SN-7swFMAfsXUqXqiiJsb8Kof6hZC4Ni7Y",
+     "hostname": "web-c.tajweedformer.com"
+    }
+   },
+   "reading": {
+    "failed": "hostname"
+   },
+   "standby": "unavailable"
+  }
+ ]
+}

@@ -51,7 +51,7 @@ internal interface SharingGate {
     fun invalidateToken()
     /** The network may be used now (the developer's "unmetered only" option). */
     fun networkAllowed(): Boolean = true
-    /** The first session of this learner reached R2 (the thank-you). */
+    /** The first session of this learner reached Quran Lab's storage (the thank-you). */
     fun uploaded(id: String) {}
     /** The contributor id was revoked on the server (deleted from elsewhere): a new one from now on. */
     fun contributorRevoked() {}
@@ -348,11 +348,11 @@ internal class ShareCapture(
 }
 
 /**
- * The shared sessions on their way to R2 (PLATFORM_CLIENT.md section 10), as the Swift SDK's outbox:
+ * The shared sessions on their way to Quran Lab's storage (PLATFORM_CLIENT.md section 10), as the Swift SDK's outbox:
  * each session a folder `<root>/<id>/`; the upload starts once the first segment is closed (POST
- * /v1/uploads answers with 20 presigned PUT URLs), every closed segment is PUT straight to R2 to its
+ * /v1/uploads answers with 20 presigned PUT URLs), every closed segment is PUT straight to the storage to its
  * own URL, the next batch is asked for while 5 unused URLs remain, fresh ones from the same segment
- * when R2 answers 403. Nothing else is sent: the last page of a finished session ends the stream.
+ * when the storage answers 403. Nothing else is sent: the last page of a finished session ends the stream.
  * Everything is on disk (`item.json` per session), so a killed app or a reboot resumes where it
  * stopped; on Android a WorkManager job drains it whenever the network allows.
  *

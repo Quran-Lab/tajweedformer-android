@@ -367,11 +367,20 @@ internal class ModelManifest(
          * A folder opened without a config passes null for both.
          */
         @JvmStatic
-        fun accept(bytes: ByteArray, verifier: ManifestVerifier, configBuild: String? = null, configVersion: String? = null): ModelManifest {
+        @JvmOverloads
+        fun accept(bytes: ByteArray, verifier: ManifestVerifier, configBuild: String? = null, configVersion: String? = null,
+                   passed: ManifestVerdicts.Flags? = null): ModelManifest {
             val sha = hex(MessageDigest.getInstance("SHA-256").digest(bytes))
             if (configBuild != null && !sha.startsWith(configBuild.lowercase())) throw RecognizerException.ChecksumMismatch(FILE_NAME)
             val m = parse(String(bytes, Charsets.UTF_8), sha.take(40))
-            verifier.verify(m)
+            // [passed]: these exact bytes passed this verifier's check before ([ManifestVerdicts], 4.0.1): what the check
+            // decided about them is used, and nothing is verified again; any other bytes are verified in full
+            if (passed != null) {
+                m.toleranceSigned = passed.tolerance && m.goldenTolerance != null
+                m.rawToleranceSigned = passed.raw && m.hasRawTolerance
+            } else {
+                verifier.verify(m)
+            }
             if (configVersion != null && m.version != configVersion) {
                 throw RecognizerException.ManifestInvalid("the manifest is version ${m.version}, the config named $configVersion")
             }
@@ -580,6 +589,21 @@ internal class ManifestVerifier @JvmOverloads constructor(
     /** Refuse a manifest without `version` (a 2.x build). On by default: SDK 3.0 runs 3.0 builds only. */
     val requireVersion: Boolean = true,
 ) {
+    /**
+     * What this verifier is, for a remembered verdict ([ManifestVerdicts]): its trusted keys and its rules. A verdict of
+     * another verifier is never used.
+     */
+    val id: String by lazy {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update("quranlab-manifest-verifier 1\n".toByteArray(Charsets.US_ASCII))
+        for (k in trustedKeys) md.update((ModelManifest.hex(k) + "\n").toByteArray(Charsets.US_ASCII))
+        md.update("$requireSignature $requireVersion $sdkVersion\n".toByteArray(Charsets.US_ASCII))
+        ModelManifest.hex(md.digest())
+    }
+
+    /** Full checks made by this verifier ([verify]): tests see when a remembered verdict was used instead. */
+    internal val checks = java.util.concurrent.atomic.AtomicInteger()
+
     /** The signature alone: it must verify when present, and be present when [required]. */
     fun verifySignature(m: ModelManifest, required: Boolean = requireSignature) {
         val sig = m.signature
@@ -614,6 +638,7 @@ internal class ManifestVerifier @JvmOverloads constructor(
 
     /** Signature, compatibility and structure. Throws a [RecognizerException]. */
     fun verify(m: ModelManifest) {
+        checks.incrementAndGet()
         verifySignature(m)
         if (requireVersion && m.version == null) {
             throw RecognizerException.ModelIncompatible("${m.modelId} ${m.revision} has no version: it is a build for SDK 2.x (this is $sdkVersion)")

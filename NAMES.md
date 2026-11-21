@@ -19,10 +19,10 @@ explicit API mode, and the Quran Lab Core inside it has no public Kotlin name at
 | `TajweedChunk` | class |  | `index`, `startMs`, `endMs`, `firstFrame`, `backend`, `speech`, `heads`, `decoded` |
 | `TajweedClient` | class | `model`, `prefetch`, `removeModels`, `diagnose`, `background`, `foreground` | `sharing`, `analytics`, `storage` |
 | `TajweedClient.Companion` | companion object |  | `current` |
-| `TajweedClientOptions` | class |  | `appId`, `appVersion`, `storage`, `unmeteredOnly` |
+| `TajweedClientOptions` | class |  | `appId`, `appVersion`, `storage`, `unmeteredOnly`, `appBuild` |
 | `TajweedClip` | class |  | `name`, `kind`, `durationMs` |
 | `TajweedDecoded` | class |  | `tokens`, `frames`, `settled`, `isFinal`, `text`, `words` |
-| `TajweedDiagnosis` | class | `toMap`, `toJson` | `sdkVersion`, `sdkLatest`, `keyAccepted`, `keyReason`, `config`, `modelVersion`, `modelBuild`, `modelVerified`, `context`, `backend`, `microphone`, `storage`, `lastError`, `droppedChunks`, `connection`, `downloadProtocol`, `protectedModel` |
+| `TajweedDiagnosis` | class | `toMap`, `toJson` | `sdkVersion`, `sdkLatest`, `keyAccepted`, `keyReason`, `config`, `modelVersion`, `modelBuild`, `modelVerified`, `context`, `backend`, `microphone`, `storage`, `lastError`, `droppedChunks`, `connection`, `downloadProtocol`, `protectedModel`, `endpoints` |
 | `TajweedError` | class |  | `code`, `fix`, `docs` |
 | `TajweedEvent` | sealed class |  |  |
 | `TajweedEvent.BackendChanged` | class |  | `backend`, `fromChunk` |

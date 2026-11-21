@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.0.1
+
+No change is needed in an app.
+
+- If Quran Lab's main servers can't be reached, the SDK uses backup servers automatically. There is nothing to set.
+- A faster first launch and model open: the model's files download four at a time and are checked as they arrive, and
+  opening a model already on the phone skips a signature check that was already done. What is downloaded, checked or
+  refused is unchanged.
+- `TajweedClientOptions.appBuild`: the app's build number (the app's own when not set). The app's version and build go
+  with the config request, so Quran Lab can give each release of an app the model it was built for.
+- When the model fails to open, the error report says why (memory or the engine), and the error keeps the Core's
+  failure as its `cause`.
+- A `client.model()` call cancelled while the model was opening no longer leaves the model open (every later
+  `client.model()` of that Client failed with `engine_failed`).
+- `diagnose()` gains `endpoints`, and an error report says whether its request needed a backup server. In
+  `diagnose()`, `protected.leaseClass` is `attested` or `standard`.
+- The error catalogue's advice for `reference_missing` is updated; codes and messages are unchanged.
+
 ## 4.0.0
 
 The model is protected. It is encrypted from Quran Lab's server to the phone and runs only inside the Quran Lab Core,
@@ -12,11 +30,10 @@ a closed native library in the AAR, under a lease for each install. The calls of
   that sets them no longer compiles. Every app shows the same sharing sheet. Complying with children's privacy law is
   the app's and the app store's. A learner who said yes before keeps that yes and is never asked again.
 - **Add your app's signing certificates** on your Android key's page at sdk.quranlab.ai. Until you do, your installs
-  get 24-hour leases.
-- **The lease.** The model opens under a lease Quran Lab signs for the install: 7 days when the phone attests the
-  install, 24 hours otherwise, renewed in the background. Offline within it, the model opens. When it has ended and
-  Quran Lab cannot be reached, the model keeps opening for 24 hours more; a refusal ends that at once. A Model that is
-  open keeps running.
+  are not hardware-verified for your app.
+- **Offline.** The first `client.model()` or `client.prefetch()` needs a connection; after that the model works
+  offline. When the phone is online, the SDK keeps itself up to date in the background. `needs_connection` means the
+  SDK needs Quran Lab to continue. A Model that is open keeps running.
 - **The first start after the upgrade downloads the model once more**, encrypted, so it needs a connection once.
 - **The CPU engine on every phone.** At launch Quran Lab serves no NPU program; NPU support returns when a build
   faster than the CPU engine ships.

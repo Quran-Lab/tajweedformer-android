@@ -29,6 +29,7 @@ public class TajweedClientOptions
     public val appVersion: String?
     public val storage: File?
     public val unmeteredOnly: Boolean
+    public val appBuild: String?
 public class TajweedSessionOptions
     public val context: String?
     public val sampleRate: Int
@@ -229,6 +230,7 @@ public class TajweedDiagnosis
     public val connection: String,
     public val downloadProtocol: String?
     public val protectedModel: Map<String, Any?>?
+    public val endpoints: Map<String, Any?>?
     public fun toMap(): Map<String, Any?>
     public fun toJson(): String
 ```

@@ -26,6 +26,9 @@ internal data class CloudOptions @JvmOverloads constructor(
     val apiUrl: String = QuranLabApi.DEFAULT_API,
     /** The Ed25519 keys the signed config may be signed with (raw 32 bytes). */
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
+    /** SDK 4.0.1: the hosts of each role. Null: the built-in sets ([Endpoints.of] for a test
+     *  build's [apiUrl]); a test build passes its stand-ins ([Endpoints.mapped]). */
+    val endpoints: Endpoints? = null,
 )
 
 /** What the cloud side needs from the platform (Android: `QuranLabAndroid` builds it). */
@@ -95,7 +98,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
 
     /** Every API answer: a 401 or a 403 whose body carries a stop reason is remembered as a refusal of the API. A
      *  stop reason under any other status is not a stop (SPEC 15.3). */
-    val api = QuranLabApi(options.apiUrl, env.http) { r ->
+    /** The hosts of each role and their failover order, for the API and the model requests. */
+    val endpoints: Endpoints = options.endpoints ?: Endpoints.of(options.apiUrl, env.clock)
+
+    val api = QuranLabApi(options.apiUrl, env.http, endpoints) { r ->
         if (r.status == 401 || r.status == 403) r.error.reason?.let { if (ModelGate.stops(r.status, it)) refusals.stop(it, Refusals.API) }
     }
     val config = ConfigStore(cloudDir, options.trustedKeys, env.clock)
@@ -136,6 +142,12 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     @Volatile var recited: RecitedCount? = null
 
     init {
+        // 28.2: the hosts a config names are used while that config is in force, never after
+        endpoints.configured = { config.current?.raw?.get("endpoints") }
+        // 28.7: a request answered on another host after its first host was unreachable, one silent report per stage
+        endpoints.onFailover = { f ->
+            f.stage?.let { stage -> silent(ErrorCause(stage, "failover", f.status, errorCode = f.reason, hostRole = f.role, fallback = true)) }
+        }
         // SDK 4.0 (owner, 11-16): anonymous analytics are always on; the signed config's flags.analytics is the only switch
         telemetry.enabled = config.current?.flags?.analytics != false
         telemetry.metric = { g -> currentConfig?.flags?.metric(g) != false }
@@ -363,11 +375,18 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     @Synchronized
     fun refreshConfig(silentReport: Boolean = true): RemoteConfig? {
         if (key == null || stopped.get()) return config.current
+        var answer: HttpResponse? = null
         return try {
             val pin = modelVersion
             // a pin changes the answer: never conditional on the ETag of an answer made for another pin
             val etag = if (pin == pinOfStored()) config.etagToSend() else null
-            val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, etag, pin) }
+            // 28.3: a config that does not verify is no answer of that host, and the next one is asked
+            val verify: (HttpResponse) -> Unit = { a ->
+                try { RemoteConfig.verify(a.body, a.header("x-qlab-signature"), a.header("x-qlab-key-id"), config.trustedKeys, env.clock() / 1000) }
+                catch (_: ConfigRejected) { throw NotTaken() }
+            }
+            val r = authed("config") { api.config(Credential.Token(it), bucket, env.app, etag, pin, verify) }
+            answer = r
             val c = config.apply(r)
             // a verified config (or the server's 304 for the one in force) accepts the key
             refusals.apiAccepted(freshConfig = true)
@@ -381,7 +400,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             c
         } catch (e: ConfigRejected) {
             lastConfigError = "signature_invalid"
-            lastConfigCause = ErrorCause("config", e.reason)
+            lastConfigCause = ErrorCause("config", e.reason, hostRole = QuranLabApi.ROLE, fallback = answer?.fallback ?: false)
             report("signature_invalid", "config:" + (e.message ?: "rejected").replace(' ', '_'))
             if (silentReport) silent(lastConfigCause!!)
             config.current.also { noteSdkLatest(it) }
@@ -571,6 +590,11 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         c.errorName?.let { d["error_name"] = it }
         c.errorCode?.let { d["error_code"] = it }
         c.retries?.let { d["retries"] = it }
+        // 28.7: every report of a request to Quran Lab's hosts names its role and whether another host was asked
+        (c.hostRole ?: ErrorRules.roleOfStage(c.stage, c.reason))?.let { role ->
+            d["host_role"] = role
+            d["fallback"] = c.fallback ?: false
+        }
         val (version, build) = reportModel ?: currentConfig?.let { it.recommendedVersion to it.recommendedRevision } ?: (null to null)
         version?.let { d["revision"] = it }
         build?.let { d["build"] = it }

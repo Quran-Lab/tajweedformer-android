@@ -20,7 +20,7 @@ import java.nio.file.Files
 
 /**
  * SDK 2.0.3, takes in a row share one recording, through the whole client: the observer hooks the recognizer calls,
- * the real capture (libopus), the outbox and [StubQlab] (qlab-api and R2 on 127.0.0.1, with the take list route as
+ * the real capture (libopus), the outbox and [StubQlab] (qlab-api and the upload storage on 127.0.0.1, with the take list route as
  * the server checks it). The clients' clock moves only when a test moves it, and the join window's timer never runs
  * (a test asks for the window's check after moving the clock), so nothing here waits for wall time.
  */

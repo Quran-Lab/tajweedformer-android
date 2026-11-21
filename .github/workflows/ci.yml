@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      VERSION: "4.0.0"
+      VERSION: "4.0.1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

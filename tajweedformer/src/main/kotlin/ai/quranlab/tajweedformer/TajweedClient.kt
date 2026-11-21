@@ -74,7 +74,7 @@ public class TajweedClient internal constructor(
             if (!platform.cloud.storage.isDirectory) throw RecognizerException.StorageFailed(platform.cloud.storage.path)
             val c = QuranLabCloud(CloudOptions(
                 key = key,
-                apiUrl = platform.apiUrl, trustedKeys = platform.trustedKeys,
+                apiUrl = platform.apiUrl, trustedKeys = platform.trustedKeys, endpoints = platform.endpoints,
             ), platform.cloud)
             QuranLabCloud.install(c)
             val bridge = CloudBridge(c, platform.cloud.inputRoute, sessionOpen = { open -> try { onSessionOpen?.invoke(open) } catch (_: Exception) {} })
@@ -139,7 +139,7 @@ public class TajweedClient internal constructor(
      * already open. Call it early (at app start) so the first take starts at once.
      *
      * [version] pins a model version (`"4.0.0"`); null takes the version Quran Lab serves this app. Errors:
-     * `needs_connection` (the model is not on the device and there is no connection), `download_failed`,
+     * `needs_connection` (the SDK needs to reach Quran Lab to continue, and there is no connection), `download_failed`,
      * `storage_full`, `storage_failed`, `invalid_key`, `sdk_too_old`, `server_rejected`, and the model's own:
      * `model_invalid`, `signature_invalid`, `checksum_mismatch`, `model_incompatible`.
      *
@@ -160,10 +160,11 @@ public class TajweedClient internal constructor(
             // the Core opens one model at a time and installs nothing while one is open: the open Model goes first
             model?.close()
             model = null
-            val m = withContext(Dispatchers.IO) { runInterruptible { openModel(version) } }
-            model = m
-            modelPin = version
-            m
+            // Gate C (SDK 4.0.1): the opened Model becomes the Client's, or is closed; never dropped ([openKept])
+            openKept({ openModel(version) }) { m ->
+                model = m
+                modelPin = version
+            }
         }
     }
 
@@ -231,6 +232,7 @@ public class TajweedClient internal constructor(
             model?.close()
             model = null
             withContext(Dispatchers.IO) {
+                ManifestVerdicts.forget()
                 if (modelsDir.exists() && !modelsDir.deleteRecursively()) throw RecognizerException.StorageFailed(modelsDir.path)
                 // a download that was going on in the background is not owed any more
                 settle(job = true)
@@ -279,6 +281,7 @@ public class TajweedClient internal constructor(
             connection = connection(),
             downloadProtocol = downloadProtocol,
             protectedModel = try { leases?.diagnosis() } catch (_: Exception) { null },
+            endpoints = try { cloud.endpoints.diagnosis() } catch (_: Exception) { null },
         )
     }
 
@@ -369,6 +372,8 @@ public class TajweedClient internal constructor(
      * unsent recordings are elsewhere and not touched. Returns whether every model file is gone.
      */
     internal fun removeModelsForStop(): Boolean = synchronized(removalLock) {
+        // nothing the manifest's check decided is used any more (the sealed verdicts go with the builds' folders)
+        ManifestVerdicts.forget()
         try {
             removalOwed.parentFile?.mkdirs()
             removalOwed.writeText("owed\n")
@@ -529,7 +534,14 @@ public class TajweedClient internal constructor(
      */
     private fun store(t: Target): ModelStore =
         ModelStore(dir(t), leases?.record?.takeIf { it.build == t.build }?.base ?: "", modelHttp, ModelRequestHeaders(cloud),
-            ManifestVerifier(platform.trustedKeys), expectBuild = t.build, expectVersion = t.version, ranges = platform.modelRanges, retry = platform.modelRetry)
+            ManifestVerifier(platform.trustedKeys), expectBuild = t.build, expectVersion = t.version, ranges = platform.modelRanges, retry = platform.modelRetry,
+            endpoints = cloud.endpoints, verdicts = manifestVerdicts)
+
+    /**
+     * The manifest check's verdicts, remembered for the exact bytes that passed (4.0.1, [ManifestVerdicts]): sealed by
+     * the install's state vault (the Keystore's key on Android), beside each build. A stop or a removal forgets them.
+     */
+    private val manifestVerdicts by lazy { ManifestVerdicts(platform.stateVault(File(platform.cloud.storage, "core/vault"))) }
 
     /** The encrypted build [m] of [store] (SDK 4.0): the Core opens it under the install's lease. */
     private fun protectedBuild(store: ModelStore, m: ModelManifest): ProtectedBuild {
@@ -818,10 +830,17 @@ public class TajweedClient internal constructor(
                 else -> e.at("model_open", if (oom) "memory" else "engine")
             }
         }
-        // the index is loaded where it is used (a counted take's end, a take a kill cut short), not at the open
-        prepareRecitedIndex(b)
-        // the accelerator's program for the next open, when the lease allows it (on Wi-Fi, in the background)
-        fetchAccelerator(store, b, m.contextInForce() ?: folder.defaultContext, m)
+        // Gate C (SDK 4.0.1): from here the Model is open in the Core, which opens one at a time; a step after it that
+        // fails closes it before the failure goes on, so no later open of this Client meets QLC_E_BUSY
+        try {
+            // the index is loaded where it is used (a counted take's end, a take a kill cut short), not at the open
+            prepareRecitedIndex(b)
+            // the accelerator's program for the next open, when the lease allows it (on Wi-Fi, in the background)
+            fetchAccelerator(store, b, m.contextInForce() ?: folder.defaultContext, m)
+        } catch (t: Throwable) {
+            try { m.close() } catch (_: Exception) {}
+            throw t
+        }
         return m
     }
 
@@ -1122,5 +1141,25 @@ public class TajweedAnalytics internal constructor(private val client: TajweedCl
             if (checked < 0 || checked > MAX_CHECKED) throw RecognizerException.InvalidAppOption("checked", "$checked is not 0..$MAX_CHECKED")
             if (flagged < 0 || flagged > checked) throw RecognizerException.InvalidAppOption("flagged", "$flagged is not 0..$checked")
         }
+    }
+}
+
+/**
+ * Gate C (2026-11-20, SDK 4.0.1): a model that was opened is never dropped. [open] runs on the IO dispatcher, where the
+ * caller's cancel interrupts it; what it opened is handed to [keep] in the caller's coroutine. When the caller is
+ * cancelled while the open runs (the Core's open does not stop for an interrupt and completes, and `withContext` then
+ * throws the cancel instead of returning the model), or [keep] throws, the opened model is closed here: dropped, it
+ * would hold the Core's one open model, and every later open of the Client would fail with QLC_E_BUSY (`engine_failed`,
+ * error_code `busy`).
+ */
+internal suspend fun <M : AutoCloseable> openKept(open: () -> M, keep: (M) -> Unit): M {
+    val opened = AtomicReference<M?>()
+    try {
+        val m = withContext(Dispatchers.IO) { runInterruptible { open().also { opened.set(it) } } }
+        keep(m)
+        opened.set(null)
+        return m
+    } finally {
+        opened.getAndSet(null)?.let { m -> try { m.close() } catch (_: Exception) {} }
     }
 }

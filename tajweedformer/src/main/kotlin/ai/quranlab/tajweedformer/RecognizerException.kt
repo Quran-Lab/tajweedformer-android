@@ -28,8 +28,9 @@ internal sealed class RecognizerException(code: String, params: Map<String, Stri
     /** A backend that was asked for cannot run here. */
     class BackendUnavailable(val why: String) : RecognizerException("engine_failed", mapOf("detail" to "backend unavailable, $why"))
 
-    /** The engine returned an error, with its message. */
-    class EngineFailed(val detail: String) : RecognizerException("engine_failed", mapOf("detail" to detail))
+    /** The engine returned an error, with its message; [cause] the failure underneath when there is one (the Core's, at
+     *  the model's open: contract 24.3). */
+    class EngineFailed(val detail: String, cause: Throwable? = null) : RecognizerException("engine_failed", mapOf("detail" to detail), cause)
 
     /** A model file could not be downloaded ([path]): the network, the server's answer, or a hash
      *  that did not match after the download (the file is deleted then). */

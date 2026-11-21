@@ -122,8 +122,8 @@ class ClientStartTest : OpenChecked() {
         assertNull(p["keyStore"])
         assertEquals("none", p["lease"])
         for (k in listOf("leaseExpires", "leaseClass", "refreshAfter", "graceUntil")) assertNull(k, p[k])
-        // the eleven fields of 3.0 and downloadProtocol come first, as before
-        assertEquals("protected", c.let { kotlinx.coroutines.runBlocking { it.diagnose() } }.toMap().keys.last())
+        // the eleven fields of 3.0 and downloadProtocol come first, as before; 4.0.1's endpoints after protected (25.3)
+        assertEquals(listOf("protected", "endpoints"), c.let { kotlinx.coroutines.runBlocking { it.diagnose() } }.toMap().keys.toList().takeLast(2))
     }
 
     @Test

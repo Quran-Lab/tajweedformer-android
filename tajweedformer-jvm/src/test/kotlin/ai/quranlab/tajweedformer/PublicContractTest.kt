@@ -87,9 +87,8 @@ class PublicContractTest : OpenChecked() {
     fun theErrorCatalogueIsTheContracts() {
         val bytes = javaClass.getResourceAsStream("/ai/quranlab/tajweedformer/errors.json")!!.use { it.readBytes() }
         val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-        // recorded from the contract's errors.json; the copy in
-        // the SDK is never typed by hand
-        assertEquals("923da8f3d66e765a34574c4e12cbce5ae963688f407a07106f46dcd865fad3bd", sha)
+        // recorded from the contract's errors.json; the copy in the SDK is never typed by hand
+        assertEquals("9b6c034e8a2ec73080b2621aef821d5f7117fa828a27c5f6cf97e672e044c880", sha)
         // where the contract folder is at hand (not on CI), byte for byte
         val contract = (System.getProperty("TJ_ERRORS_JSON") ?: "").let(::File)
         if (contract.isFile) assertArrayEquals("the embedded catalogue differs from ${contract.path}", contract.readBytes(), bytes)

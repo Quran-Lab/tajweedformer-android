@@ -47,11 +47,19 @@ public class TajweedDiagnosis internal constructor(
      * SDK 4.0, the protected model:
      * `keyStore` (`strongbox`, `tee` or `software`: where the install's key lives; null before the install has one),
      * `lease` (`valid`, `grace`, `expired`, `stopped` or `none`), `leaseExpires`, `refreshAfter` and `graceUntil`
-     * (unix seconds; `graceUntil` only while `lease` is `grace`), `leaseClass` (`7d` or `24h`) and `core` (the Core's
+     * (unix seconds; `graceUntil` only while `lease` is `grace`), `leaseClass` (`attested` or `standard`) and `core` (the Core's
      * release and target). In [toMap] as `protected`. Null where the client has no key (no lease is ever asked for).
      * An optional field of the report: a reader must not expect it from every SDK.
      */
     public val protectedModel: Map<String, Any?>? = null,
+    /**
+     * SDK 4.0.1, Quran Lab's hosts: `api` and
+     * `models`, the host each role's next request goes to first, and `lastFailover`, null or the last request of this
+     * process that found its first host unreachable (`role`, `from`, `to`, null when no host answered, `reason`, `status`
+     * and `at` in unix seconds). Host names only, never a path, a query or a key. In [toMap] as `endpoints`, after
+     * `protected`. An optional field of the report: a reader must not expect it from every SDK.
+     */
+    public val endpoints: Map<String, Any?>? = null,
 ) {
     /** The report as a plain map, in the layout the four SDKs share. */
     public fun toMap(): Map<String, Any?> = linkedMapOf<String, Any?>(
@@ -67,7 +75,10 @@ public class TajweedDiagnosis internal constructor(
         "droppedChunks" to droppedChunks,
         "connection" to connection,
         "downloadProtocol" to downloadProtocol,
-    ).also { m -> protectedModel?.let { m["protected"] = it } }
+    ).also { m ->
+        protectedModel?.let { m["protected"] = it }
+        endpoints?.let { m["endpoints"] = it }
+    }
 
     /** The report as JSON. */
     public fun toJson(): String = Json.write(toMap())

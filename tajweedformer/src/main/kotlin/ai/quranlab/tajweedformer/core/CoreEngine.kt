@@ -83,11 +83,12 @@ internal class ProtectedBuild(
         }
     }
 
-    /** Opens the model of [context] in the Core (the device forms decrypted into its memory). */
+    /** Opens the model of [context] in the Core (the device forms decrypted into its memory). A status the Core fails the
+     *  open with names itself in the error report. */
     fun open(context: String, threads: Int, sampleRate: Int, noPin: Int): CoreModel {
         val c = core()
         roots(c)
-        val m = try { c.modelOpen(manifestBytes, context, threads, sampleRate, noPin) } catch (x: CoreException) { throw x.toError() }
+        val m = try { c.modelOpen(manifestBytes, context, threads, sampleRate, noPin) } catch (x: CoreException) { throw x.toOpenError() }
         leases.modelOpened(::roots)
         return m
     }

@@ -55,7 +55,11 @@ import java.util.concurrent.atomic.AtomicReference
  *   have, which the map keeps, and the call fails as a download that was cut does. Any other answer of the server (a
  *   refusal, 401, 403, 429, 404) is never asked for again.
  *
- * The SHA-256 of the whole file is checked by the caller afterwards ([ModelDownloader]), whatever happened here.
+ * The SHA-256 of the whole file is checked by the caller afterwards ([ModelDownloader]), whatever happened here. It is
+ * made as the ranges complete (4.0.1, [PartHash.follow]): each time the complete ranges from the file's first byte
+ * reach further, the stream that completed one reads them into the digest (from the page cache, one stream at a time
+ * while the others go on), so after the last range only what was not followed yet is read. What removes the part here
+ * starts the digest over.
  */
 internal class RangedFetch(
     private val e: ModelManifest.FileEntry,
@@ -64,7 +68,8 @@ internal class RangedFetch(
     private val mapFile: File,
     private val transport: HttpTransport,
     headers: HeaderProvider?,
-    private val url: String,
+    /** SDK 4.0.1: the file's model hosts; a request of the file's g-th resume goes to the g-th. */
+    private val hosts: FilePlan,
     private val plan: RangePlan,
     private val parallel: Int,
     private val cancel: Cancellation?,
@@ -72,6 +77,8 @@ internal class RangedFetch(
     private val stats: FetchStats,
     /** The file's resumes in this call (the retry rule), shared with [single]. */
     private val resumes: Resumes,
+    /** The part's digest, made as the complete ranges reach further (shared with [single]). */
+    private val hash: PartHash,
     /** Fetches the file in one request; given the answer when the server answered a range with the whole file. */
     private val single: (HttpResponse?, Boolean) -> Unit,
 ) {
@@ -123,6 +130,7 @@ internal class RangedFetch(
                 Outcome.Done -> return
                 Outcome.Again -> {
                     wipe(part, validatorFile, mapFile)
+                    hash.reset()
                     if (++starts > 1) fail("the part of the file on the device does not match its map")
                 }
                 Outcome.Anew -> {
@@ -154,6 +162,8 @@ internal class RangedFetch(
         private val lock = Any()
         private val done = BooleanArray(count)
         @Volatile private var validator: String? = null
+        /** The host that gave [validator] (28.4): If-Range goes to it only, and only its answers are compared with it. */
+        @Volatile private var validatorHost: String? = null
         @Volatile private var channel: FileChannel? = null
         private val halted = AtomicBoolean(false)
         private val failure = AtomicReference<Throwable?>(null)
@@ -184,10 +194,13 @@ internal class RangedFetch(
             // an answer that is the file by [AnswerRule]: the range asked for (206), or the whole file (200: the server
             // does not answer ranges, or, with If-Range, its file is another one now; it replaces what the device holds
             // once it is whole)
-            val probe = firstAnswer(first(p), last(p))
+            val (probe, pg) = firstAnswer(first(p), last(p))
             if (probe.code == 200) return Outcome.Whole(probe)
             val v = AnswerRule.validator(probe)
-            if (v == null || (validator != null && v != validator)) {
+            // 28.4: stored ranges of another host's answers are continued here with the Range alone (each range is held to
+            // the manifest's total, and the size and SHA-256 decide); the validator stays with its host
+            val sameHost = validator == null || validatorHost == hosts.host(pg)
+            if ((validator == null && v == null) || (validator != null && sameHost && v != validator)) {
                 // no validator to ask the other ranges with, or the file is another one now: whole, in one stream
                 probe.close()
                 return Outcome.Anew
@@ -195,8 +208,11 @@ internal class RangedFetch(
             try {
                 // the map before the validator and before any byte (see the class)
                 writeMap()
-                if (validator == null) validatorFile.writeText(v)
-                validator = v
+                if (validator == null) {
+                    hosts.writeValidator(validatorFile, v!!, pg)
+                    validator = v
+                    validatorHost = hosts.host(pg)
+                }
                 channel = FileChannel.open(part.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
             } catch (x: IOException) {
                 probe.close()
@@ -206,12 +222,14 @@ internal class RangedFetch(
                 probe.close()
                 fail("cancelled")
             }
+            // the digest follows the complete ranges from the first byte: what an earlier call left first
+            val kept0 = prefixEnd()
             val queue = ConcurrentLinkedQueue(pending.drop(1))
             val streams = minOf(parallel, pending.size)
             val ended = CountDownLatch(streams)
             for (w in 0 until streams) {
                 val mine = if (w == 0) p else null
-                val given = if (w == 0) probe else null
+                val given = if (w == 0) probe to pg else null
                 Thread({
                     try {
                         val buf = ByteArray(ModelDownloader.BUFFER)
@@ -225,7 +243,7 @@ internal class RangedFetch(
                             r = null
                             fetchRange(range, answer, buf)
                         }
-                        r?.close()
+                        r?.first?.close()
                     } catch (_: Halted) {
                     } catch (x: Throwable) {
                         when {
@@ -244,6 +262,8 @@ internal class RangedFetch(
                     }
                 }, "tajweedformer-range-$w").apply { isDaemon = true }.start()
             }
+            // the ranges an earlier call completed from the first byte, read into the digest while the streams run
+            if (kept0 > 0) hash.follow(kept0)
             try {
                 while (!ended.await(100, TimeUnit.MILLISECONDS)) {
                     if (halted.get()) {
@@ -335,12 +355,14 @@ internal class RangedFetch(
         private fun load() {
             if (!part.isFile) {
                 wipe(part, validatorFile, mapFile)
+                hash.reset()
                 return
             }
             if (mapFile.exists()) {
                 val m = readMap()
                 if (m == null || m.first != size || m.second != plan.rangeSize) {
                     wipe(part, validatorFile, mapFile)
+                    hash.reset()
                     return
                 }
                 for (k in m.third) if (k in 0 until count) done[k] = true
@@ -348,24 +370,27 @@ internal class RangedFetch(
                 val have = part.length()
                 if (have > size) {
                     wipe(part, validatorFile, mapFile)
+                    hash.reset()
                     return
                 }
                 for (k in 0 until count) if (last(k) < have) done[k] = true
             }
-            val v = try { validatorFile.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() } } catch (_: IOException) { null }
+            val v = hosts.readValidator(validatorFile)
             if (v == null) {
                 orphaned = true
                 prefix = !mapFile.exists() && part.length() > 0
             }
-            validator = v
+            validator = v?.first
+            validatorHost = v?.second
         }
 
-        private fun request(a: Long, b: Long): HttpResponse {
+        /** A range request of the resume [g] of the file, to its host; If-Range only to the validator's host (28.4). */
+        private fun request(a: Long, b: Long, g: Int): HttpResponse {
             val h = HashMap<String, String>()
             h["Accept-Encoding"] = "identity"
             h["Range"] = "bytes=$a-$b"
-            validator?.let { h["If-Range"] = it }
-            val r = modelRequest(transport, url, e.path, h, auth, setOf(200, 206, 416), ending)
+            validator?.takeIf { validatorHost == hosts.host(g) }?.let { h["If-Range"] = it }
+            val r = modelRequest(transport, hosts.url(g, e.path), e.path, h, auth, setOf(200, 206, 416), ending)
             stats.answer(r)
             return r
         }
@@ -375,12 +400,12 @@ internal class RangedFetch(
          * that range or a 200 of the manifest's length. An answer that is neither is a failed attempt and counts
          * against the file's resumes; a 416 ends the call.
          */
-        private fun firstAnswer(a: Long, b: Long): HttpResponse {
+        private fun firstAnswer(a: Long, b: Long): Pair<HttpResponse, Int> {
             while (true) {
                 val g = resumes.generation
                 try {
                     if (cancel?.isCancelled == true) fail("cancelled")
-                    val r = request(a, b)
+                    val r = request(a, b, g)
                     val bad = when (r.code) {
                         200 -> AnswerRule.whole(r, size)
                         206 -> AnswerRule.range(r, a, b, size)
@@ -388,12 +413,13 @@ internal class RangedFetch(
                             r.close()
                             fail("HTTP ${r.code} for bytes $a-$b of $size; nothing on the device was changed")
                         }
-                    } ?: return r
+                    } ?: return r to g
                     r.close()
                     wrong(bad)
                 } catch (x: RecognizerException.DownloadFailed) {
                     if (cancel?.isCancelled == true) fail("cancelled")
-                    if (!RetryPlan.resumable(x)) throw x
+                    if (!RetryPlan.resumable(x, hosts.many)) throw x
+                    hosts.failed(g, x)
                     val more = try {
                         resumes.again(g) { if (cancel?.isCancelled == true || Thread.currentThread().isInterrupted) fail("cancelled") }
                     } catch (_: InterruptedException) {
@@ -406,10 +432,11 @@ internal class RangedFetch(
         }
 
         /** Range [k] from where it is to its end, the first answer [given] when there is one. */
-        private fun fetchRange(k: Int, given: HttpResponse?, buf: ByteArray) {
+        private fun fetchRange(k: Int, given: Pair<HttpResponse, Int>?, buf: ByteArray) {
             val b = last(k)
             var pos = first(k)
-            var r = given
+            var r = given?.first
+            var rg = given?.second ?: 0
             while (true) {
                 if (cancel?.isCancelled == true) halt()
                 if (halted.get()) {
@@ -417,16 +444,20 @@ internal class RangedFetch(
                     throw Halted()
                 }
                 // the file's resume this request belongs to: when it fails with others of the same one, they count once
-                val g = resumes.generation
+                val g = if (r != null) rg else resumes.generation
                 val resp = r ?: try {
-                    request(pos, b)
+                    request(pos, b, g)
                 } catch (x: RecognizerException.DownloadFailed) {
                     // a request that the end of the attempt cut off (it was waiting for its answer) is no failure of its own
                     if (halted.get() && x.cause is IOException) throw Halted()
-                    if (!halted.get() && dropped(x) && resumes.again(g) { stopIfHalted() }) continue
+                    if (!halted.get() && dropped(x)) {
+                        hosts.failed(g, x)
+                        if (resumes.again(g) { stopIfHalted() }) continue
+                    }
                     throw x
                 }
                 r = null
+                rg = 0
                 var cut: IOException? = null
                 // what is wrong with an answer that is not this range ([AnswerRule]): a failed attempt, nothing written
                 var bad: String? = null
@@ -436,7 +467,8 @@ internal class RangedFetch(
                     when (resp.code) {
                         206 -> {
                             bad = AnswerRule.range(resp, pos, b, size)
-                            if (bad == null && AnswerRule.validator(resp) != validator) {
+                            // only the validator's host is held to it (28.4): another host's ETag is its own
+                            if (bad == null && validatorHost == hosts.host(g) && AnswerRule.validator(resp) != validator) {
                                 changed = true
                                 halt()
                                 throw Halted()
@@ -475,16 +507,22 @@ internal class RangedFetch(
                 }
                 if (pos > b) {
                     complete(k)
+                    // the complete ranges from the first byte into the digest, on this stream's thread
+                    val end = synchronized(lock) { if (halted.get()) 0L else prefixEnd() }
+                    if (end > 0) hash.follow(end)
                     return
                 }
                 // the answer was not this range: asked for again while the file has resumes left, then the call's failure
                 val what = bad
                 if (what != null) {
+                    hosts.failed(g, AnswerRule.failed(e.path, what))
                     if (!resumes.again(g) { stopIfHalted() }) wrong(what)
                     continue
                 }
                 // the answer ended early, its connection dropped or stalled: the rest of this range, from where it stopped,
                 // while the file has resumes left
+                val lost = cut ?: IOException("the answer ended at byte $pos")
+                hosts.failed(g, RecognizerException.DownloadFailed(e.path, "network", lost).tagged(e.path, "network", lost))
                 if (!resumes.again(g) { stopIfHalted() }) {
                     fail("network: the connection ended at byte $pos of the range $k (${first(k)}-$b); the part and its map are kept for a resume",
                         cut ?: IOException("the answer ended at byte $pos"))
@@ -503,6 +541,13 @@ internal class RangedFetch(
                 halt()
                 fail("cannot write ${part.name}: ${x.message}", x)
             }
+        }
+
+        /** The end of the complete ranges from the file's first byte (0 when the first is not complete). */
+        private fun prefixEnd(): Long {
+            var k = 0
+            while (k < count && done[k]) k++
+            return if (k == 0) 0L else last(k - 1) + 1
         }
 
         /** Range [k] is complete: its bytes are forced to the storage, then the map says so. */
@@ -543,7 +588,7 @@ internal class RangedFetch(
 
     /** A failure the retry rule asks again: no answer came, the answer's connection dropped or stalled, or the server
      *  failed (5xx); not the system's refusal of the network, not any other answer of the server. */
-    private fun dropped(x: Throwable): Boolean = RetryPlan.resumable(x)
+    private fun dropped(x: Throwable): Boolean = RetryPlan.resumable(x, hosts.many)
 
     /**
      * The Client's model-request rules for one download in ranges: the token is renewed at most once for the whole

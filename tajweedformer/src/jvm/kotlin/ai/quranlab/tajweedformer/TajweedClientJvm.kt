@@ -40,7 +40,7 @@ public fun TajweedClient(key: String, storage: File, options: TajweedClientOptio
     val os = System.getProperty("os.version") ?: "1"
     val env = CloudEnvironment(
         storage = dir,
-        app = AppIdentity(options.appId ?: "ai.quranlab.tajweedformer.desktop", AppIdentity.cleanVersion(options.appVersion)),
+        app = AppIdentity(options.appId ?: "ai.quranlab.tajweedformer.desktop", AppIdentity.cleanVersion(options.appVersion), build = options.appBuild),
         device = DeviceProfile(DeviceProfile.deviceClass(System.getProperty("os.arch") ?: "jvm"), null,
             os.takeWhile { it.isDigit() }.toIntOrNull()?.coerceIn(1, 99) ?: 1, os.take(32), abi = jvmAbi()),
         contributorKeys = FileContributorKeyStore(File(dir, "keys")),

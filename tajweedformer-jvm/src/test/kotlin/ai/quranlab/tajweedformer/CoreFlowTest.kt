@@ -302,7 +302,7 @@ class CoreFlowTest : OpenChecked() {
             val pb = ProtectedBuild(buildDir, m, File(buildDir, "manifest.json").readBytes(), l)
             pb.core()
             pb.install(m.files, { e -> File(pb.cdnDir, e.localPath).isFile }, { e -> File(pb.cdnDir, e.localPath) })
-            val folder = ModelFolder.protected(pb, ManifestVerifier(listOf(ProtectedKit.signerPublic), sdkVersion = "4.0.0"))
+            val folder = ModelFolder.protected(pb)
             val records = ai.quranlab.tajweedformer.core.AcceleratorRecords(File(dir, "core/accel.json"))
             val reports = java.util.concurrent.LinkedBlockingQueue<ai.quranlab.tajweedformer.core.PromotionInfo>()
             val plan = ai.quranlab.tajweedformer.core.AcceleratorPlan("tensor_g4", null, null,
@@ -319,6 +319,55 @@ class CoreFlowTest : OpenChecked() {
             } finally {
                 rec.close()
             }
+        } finally {
+            l.close()
+        }
+    }
+
+    /**
+     * 4.0.1 dropped the Kotlin re-check of the manifest's signature at open ([ModelFolder.protected], perf plan row 2):
+     * the Core checks the signature with its pinned keys at install and at open, so a manifest with one file's SHA-256
+     * changed and its signature kept is refused there, by the real Core, on the real model. (At download the store
+     * refuses it first: TamperedManifestTest.)
+     */
+    @Test
+    fun aTamperedManifestIsRefusedByTheCoreAtInstallAndAtOpen() {
+        assumeTrue(CoreLibrary.available)
+        assumeTrue(tb != null)
+        val dir = temp()
+        val buildDir = File(dir, "models/v4.0/build").apply { mkdirs() }
+        val m = place(buildDir)
+        val good = File(buildDir, "manifest.json").readBytes()
+        val text = String(good, Charsets.UTF_8)
+        val at = text.indexOf("layers.zfw")
+        val sha = Regex("\"sha256\"\\s*:\\s*\"([0-9a-f]{64})\"").find(text, at)!!.groups[1]!!.range.first
+        val bad = (text.substring(0, sha) + (if (text[sha] == '0') '1' else '0') + text.substring(sha + 1)).toByteArray(Charsets.UTF_8)
+        val l = LeaseClient(File(dir, "core"), SoftwareIdentity(File(dir, "core/keys")), FileStateVault(File(dir, "core/vault")),
+            api(m, 8), key, app, token = { "qlt_v1.e30.s" }, invalidateToken = {}, adoptToken = {}, integrity = null,
+            projectNumber = { null }, removeModels = { true })
+        try {
+            val pb = ProtectedBuild(buildDir, m, good, l)
+            pb.core()
+            val forged = ProtectedBuild(buildDir, ModelManifest.parse(bad), bad, l)
+            // at install: refused, nothing installed, the CDN forms kept for an install with the signed manifest
+            try {
+                forged.install(m.files, { e -> File(forged.cdnDir, e.localPath).isFile }, { e -> File(forged.cdnDir, e.localPath) })
+                fail("the Core installed with a tampered manifest")
+            } catch (x: TajweedError) {
+                assertTrue("the Core's refusal of the manifest's signature: $x", x is RecognizerException.SignatureInvalid)
+            }
+            for (e in m.files.filter { it.encoding == ModelManifest.Encoding.QLE1 }) assertFalse(e.localPath, pb.installed(e))
+            pb.install(m.files, { e -> File(pb.cdnDir, e.localPath).isFile }, { e -> File(pb.cdnDir, e.localPath) })
+            // at open: the folder is made without a check of its own (4.0.1), and the Core refuses the tampered manifest
+            val folder = ModelFolder.protected(forged)
+            try {
+                Recognizer.open(folder, Recognizer.Options(context = "c16_l64")).close()
+                fail("a model opened with a tampered manifest")
+            } catch (x: TajweedError) {
+                assertTrue("the Core's refusal of the manifest's signature at qlc_model_open: $x", x is RecognizerException.SignatureInvalid)
+            }
+            // the signed manifest opens the same build
+            Recognizer.open(ModelFolder.protected(pb), Recognizer.Options(context = "c16_l64")).close()
         } finally {
             l.close()
         }

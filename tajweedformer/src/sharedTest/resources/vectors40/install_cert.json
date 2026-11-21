@@ -558,19 +558,19 @@
  },
  "cert_cap": [
   {
-   "name": "a 7-day lease on a certificate that ends in 2 days: the lease ends with it",
+   "name": "an attested-class lease on a certificate that ends in 2 days: exp stays the class's, refresh_after is before it",
    "lease_exp": 1790604300,
    "refresh_after": 1790080000,
    "cert_exp": 1790172800,
-   "exp": 1790172800,
+   "exp": 1790604300,
    "refresh_after_capped": 1790080000
   },
   {
-   "name": "a 24-hour lease on a recheck certificate that ends in 3 hours: both capped",
+   "name": "a lease on a recheck certificate that ends in 3 hours: refresh_after capped to it, exp kept",
    "lease_exp": 1790086300,
    "refresh_after": 1790050000,
    "cert_exp": 1790010800,
-   "exp": 1790010800,
+   "exp": 1790086300,
    "refresh_after_capped": 1790010800
   },
   {
@@ -580,6 +580,14 @@
    "cert_exp": 1791728000,
    "exp": 1790086300,
    "refresh_after_capped": 1790050000
+  },
+  {
+   "name": "a 14-day lease in the last 6 hours of a 30-day certificate: exp 14 days on, refresh_after at the certificate's end",
+   "lease_exp": 1791209100,
+   "refresh_after": 1790080000,
+   "cert_exp": 1790021600,
+   "exp": 1791209100,
+   "refresh_after_capped": 1790021600
   }
  ],
  "lease_trust": {
