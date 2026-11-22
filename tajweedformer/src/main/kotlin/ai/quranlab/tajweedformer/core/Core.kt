@@ -235,12 +235,14 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
     fun install(manifest: ByteArray, decodedPath: String) =
         gated("qlc_install") { x -> check(x, "qlc_install", CoreNative.install(x, manifest, decodedPath)) }
 
-    fun modelOpen(manifest: ByteArray, context: String?, threads: Int, sampleRate: Int, noPin: Int): CoreModel = gated("qlc_model_open") { x ->
-        val out = IntArray(2)
-        val m = CoreNative.modelOpen(x, manifest, context, threads, 0, sampleRate, 1, noPin, out)
-        if (m == 0L) throw CoreException(out[0], out[1], "qlc_model_open")
-        CoreModel(m)
-    }
+    /** [closed]: told once the model is really closed (qlc_model_close returned), never before. */
+    fun modelOpen(manifest: ByteArray, context: String?, threads: Int, sampleRate: Int, noPin: Int, closed: () -> Unit = {}): CoreModel =
+        gated("qlc_model_open") { x ->
+            val out = IntArray(2)
+            val m = CoreNative.modelOpen(x, manifest, context, threads, 0, sampleRate, 1, noPin, out)
+            if (m == 0L) throw CoreException(out[0], out[1], "qlc_model_open")
+            CoreModel(m, closed)
+        }
 
     fun recitedIndex(manifest: ByteArray) =
         gated("qlc_recited_index") { x -> check(x, "qlc_recited_index", CoreNative.recitedIndex(x, manifest)) }
@@ -453,8 +455,9 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
 }
 
 /** An open model of the Core (qlc_model): the device forms decrypted into the Core's memory. Its own calls and its close
- *  are gated as [Core]'s are; its streams (CoreEngine) are closed before it. */
-internal class CoreModel(handle: Long) : AutoCloseable {
+ *  are gated as [Core]'s are; its streams (CoreEngine) are closed before it. [onClosed] runs once qlc_model_close has
+ *  returned (after the gate is let go): SDK 4.0.3 lets go of the model's hold of its Core there ([CoreRegistry]). */
+internal class CoreModel(handle: Long, private val onClosed: () -> Unit = {}) : AutoCloseable {
     @Volatile private var h = handle
     private val gate = java.util.concurrent.locks.ReentrantReadWriteLock()
     @Volatile private var closed = false
@@ -513,9 +516,12 @@ internal class CoreModel(handle: Long) : AutoCloseable {
         val w = gate.writeLock()
         val now = try { w.tryLock(Core.CLOSE_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); false }
         if (now) {
-            try { closeNow() } finally { w.unlock() }
+            try { closeNow() } finally { w.unlock(); ended() }
         } else {
-            Thread({ w.lock(); try { closeNow() } finally { w.unlock() } }, "tajweedformer-model-close").apply { isDaemon = true }.start()
+            Thread({
+                w.lock()
+                try { closeNow() } finally { w.unlock(); ended() }
+            }, "tajweedformer-model-close").apply { isDaemon = true }.start()
         }
     }
 
@@ -524,4 +530,6 @@ internal class CoreModel(handle: Long) : AutoCloseable {
         h = 0
         if (x != 0L) CoreNative.modelClose(x)
     }
+
+    private fun ended() = try { onClosed() } catch (_: Exception) {}
 }

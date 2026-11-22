@@ -84,6 +84,8 @@ internal object AndroidPlatform {
     fun client(context: Context, key: String, options: TajweedClientOptions): TajweedClient {
         val app = context.applicationContext
         appContext = app
+        // SDK 4.0.3: no open waits on the main looper for another Client's model (session_open at once there)
+        ai.quranlab.tajweedformer.core.OpenWait.isUiThread = { Looper.myLooper() == Looper.getMainLooper() }
         // before the lifecycle hooks: the activity that is in front already (3.1.5 learnt it only from callbacks, so
         // a Client made after the activity resumed had none: asks were lost and listen() was microphone_denied)
         val seeded = seedForeground(context)

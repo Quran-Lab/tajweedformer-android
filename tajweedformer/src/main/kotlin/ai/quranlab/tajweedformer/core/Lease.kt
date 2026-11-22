@@ -96,8 +96,12 @@ internal data class LeaseRecord(
  * lets go ([Core.close]: after its calls in flight). A test makes a registry of its own for another process.
  */
 internal class CoreRegistry {
-    private class Entry(val core: Core, var holds: Int)
+    private class Entry(val core: Core, var holds: Int) {
+        /** SDK 4.0.3: for each model open or opening in this Core, the lease client it belongs to (one entry per model). */
+        val models = ArrayList<Any>()
+    }
     private val entries = HashMap<String, Entry>()
+    private val modelsChanged = Object()
     private val folderLocks = HashMap<String, Any>()
     private val clears = HashMap<String, Long>()
 
@@ -127,6 +131,60 @@ internal class CoreRegistry {
 
     /** Whether [core] is still live here (tests). */
     fun live(core: Core): Boolean = synchronized(this) { entries.values.any { it.core === core } }
+
+    /**
+     * SDK 4.0.3: a model of [owner] is about to open in [core]: one hold more, kept until [modelEnded] (the open failed,
+     * or its model is really closed), so the Core is never destroyed under an open or an open model (qlc_destroy does
+     * not close the Core's model). False when [core] is not live any more.
+     */
+    fun modelBegins(core: Core, owner: Any): Boolean = synchronized(this) {
+        val e = entries.values.firstOrNull { it.core === core } ?: return false
+        e.holds++
+        e.models += owner
+        true
+    }
+
+    /** The open [modelBegins] began failed, or its model is closed: its hold goes ([release]). */
+    fun modelEnded(core: Core, owner: Any) {
+        synchronized(this) {
+            entries.values.firstOrNull { it.core === core }?.models?.remove(owner)
+        }
+        synchronized(modelsChanged) { modelsChanged.notifyAll() }
+        release(core)
+    }
+
+    /** The models open or opening in [core]: [owner]'s and the other owners' (null when [core] is not live). */
+    private fun counts(core: Core, owner: Any): Pair<Int, Int>? = synchronized(this) {
+        entries.values.firstOrNull { it.core === core }?.models?.let { m -> m.count { it === owner } to m.count { it !== owner } }
+    }
+
+    /** Whether [owner] has a model open in [core] besides the open it is making (which [modelBegins] counted). */
+    fun ownModelOpen(core: Core, owner: Any): Boolean = (counts(core, owner)?.first ?: 0) > 1
+
+    /** Whether a model of another owner is open or opening in [core]. */
+    fun othersOpen(core: Core, owner: Any): Boolean = (counts(core, owner)?.second ?: 0) > 0
+
+    /**
+     * After an open of [owner] in [core] met QLC_E_BUSY (that open counted by [modelBegins]), on a thread that may
+     * block (a sync call off the main looper, [OpenWait]): waits at most [waitMs] while a model of ANOTHER owner is
+     * open or opening in [core] (a Client that was closed while its model opened closes that model as soon as its open
+     * returns). True when none is left: the open may be tried once more. False at once when [owner] has a model of its
+     * own open there (its Client's, which only its Client closes), when [core] is not live, and when the wait ends
+     * with one still open.
+     */
+    fun awaitOthers(core: Core, owner: Any, waitMs: Long): Boolean {
+        val end = System.nanoTime() + waitMs * 1_000_000
+        synchronized(modelsChanged) {
+            while (true) {
+                val counts = counts(core, owner) ?: return false
+                if (counts.first > 1) return false
+                if (counts.second == 0) return true
+                val ms = (end - System.nanoTime()) / 1_000_000
+                if (ms <= 0) return false
+                try { modelsChanged.wait(ms) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); return false }
+            }
+        }
+    }
 
     /** The lock of [dir]'s lease files: lease.json is read, compared and written under it, by every client of the folder. */
     fun folderLock(dir: File): Any = synchronized(this) { folderLocks.getOrPut(name(dir)) { Any() } }
@@ -328,6 +386,23 @@ internal class LeaseClient(
         val flags = if (hostClock != null) Core.FLAG_HOST_CLOCKS else 0
         return Core.open(host, k, state, dir, bootId, identity.signals or platformSignals, flags)
     }
+
+    /** SDK 4.0.3 ([CoreRegistry.modelBegins]): a model of this client is about to open in [c], which is held until
+     *  [modelEnded]; false when [c] is not live any more. */
+    fun modelBegins(c: Core): Boolean = registry.modelBegins(c, this)
+
+    /** The open [modelBegins] began failed, or its model is really closed. */
+    fun modelEnded(c: Core) = registry.modelEnded(c, this)
+
+    /** After a busy open in [c], blocking: waits at most [waitMs] for another client's model there to close
+     *  ([CoreRegistry.awaitOthers]); true when the open may be tried once more. */
+    fun awaitOtherModels(c: Core, waitMs: Long): Boolean = registry.awaitOthers(c, this, waitMs)
+
+    /** Whether this client has a model open in [c] besides the open it is making. */
+    fun ownModelOpen(c: Core): Boolean = registry.ownModelOpen(c, this)
+
+    /** Whether another client's model is open or opening in [c]. */
+    fun otherModelsOpen(c: Core): Boolean = registry.othersOpen(c, this)
 
     /** A model of the Core opened or closed: the install key is not replaced while one is open (the Core's model is
      *  bound to the handle it was opened on). */

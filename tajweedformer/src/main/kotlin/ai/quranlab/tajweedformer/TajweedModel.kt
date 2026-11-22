@@ -239,10 +239,16 @@ public class TajweedModel internal constructor(
 
     private suspend fun start(options: TajweedSessionOptions, sampleRate: Int, listening: Boolean): TajweedSession {
         val context = Recognizer.resolveContext(folder, options.context, host.configContext())
-        val rec = recognizerFor(context)
+        // SDK 4.0.3: an open that meets another Client's model in the Core waits for it with delay, at most
+        // OpenWait.MS ([ai.quranlab.tajweedformer.core.OpenWait])
+        val rec = ai.quranlab.tajweedformer.core.OpenWait.retrying { p -> recognizerFor(context, p) }
         // a first take at another rate than the engine was warmed for reopens it: off the caller's thread
-        val inner = withContext(Dispatchers.IO) {
-            rec.startSession(sampleRate, options.headSet(), cpuOnly = options.backend == TajweedSessionOptions.Backend.CPU)
+        val inner = ai.quranlab.tajweedformer.core.OpenWait.retrying { p ->
+            withContext(Dispatchers.IO) {
+                ai.quranlab.tajweedformer.core.OpenWait.marked(p) {
+                    rec.startSession(sampleRate, options.headSet(), cpuOnly = options.backend == TajweedSessionOptions.Backend.CPU)
+                }
+            }
         }
         val session = TajweedSession(this, rec, inner, options, listening)
         synchronized(lock) {
@@ -257,7 +263,7 @@ public class TajweedModel internal constructor(
      * or no longer does) a new one in its place. Another context's files are downloaded first when they are not on
      * the device.
      */
-    private suspend fun recognizerFor(context: String): Recognizer = switching.withLock {
+    private suspend fun recognizerFor(context: String, p: ai.quranlab.tajweedformer.core.OpenWait.Pending): Recognizer = switching.withLock {
         val now = recognizer
         if (now != null && now.context == context) return now
         withContext(Dispatchers.IO) {
@@ -269,7 +275,7 @@ public class TajweedModel internal constructor(
                 val ensure = host.ensureContext ?: throw RecognizerException.ModelMissing("context $context is not on this device")
                 folder = runInterruptible { ensure(context) }
             }
-            openRecognizer(folder, host, context).also { recognizer = it }
+            ai.quranlab.tajweedformer.core.OpenWait.marked(p) { openRecognizer(folder, host, context) }.also { recognizer = it }
         }
     }
 

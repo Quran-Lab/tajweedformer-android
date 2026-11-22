@@ -12,6 +12,9 @@ import ai.quranlab.tajweedformer.StageClock
 import ai.quranlab.tajweedformer.TajweedEngine
 import ai.quranlab.tajweedformer.TajweedEngineStream
 import ai.quranlab.tajweedformer.TopK
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -88,9 +91,39 @@ internal class ProtectedBuild(
     fun open(context: String, threads: Int, sampleRate: Int, noPin: Int): CoreModel {
         val c = core()
         roots(c)
-        val m = try { c.modelOpen(manifestBytes, context, threads, sampleRate, noPin) } catch (x: CoreException) { throw x.toOpenError() }
+        // SDK 4.0.3: the Core is held from here until the model is really closed (or the open failed): a Client closed
+        // meanwhile lets go of its Core, and the Core is never destroyed under an open or an open model
+        if (!leases.modelBegins(c)) throw CoreException(Core.E_CLOSED, 0, "qlc_model_open").toOpenError()
+        var m: CoreModel? = null
+        try {
+            m = try {
+                c.modelOpen(manifestBytes, context, threads, sampleRate, noPin) { leases.modelEnded(c) }
+            } catch (x: CoreException) {
+                // the Core's one open model is another Client's: one closed while its model opened, which closes that
+                // model as soon as its open returns. Waited for at most OpenWait.MS, then one more open ([OpenWait]):
+                // a suspend API's wait is its own (with delay, no thread blocked); a sync call off the main looper
+                // waits here; on the main looper the call is session_open at once, and so is a wait that runs out. A
+                // model of this Client's own fails at once, as before (engine_failed, busy)
+                if (x.status != Core.E_BUSY || leases.ownModelOpen(c)) throw x
+                val p = OpenWait.pending()
+                when {
+                    p != null -> {
+                        p.busy = c to leases
+                        throw x
+                    }
+                    OpenWait.isUiThread() -> if (leases.otherModelsOpen(c)) throw OpenWait.sessionOpen()
+                    !leases.awaitOtherModels(c, OpenWait.MS) -> throw OpenWait.sessionOpen()
+                }
+                roots(c)
+                c.modelOpen(manifestBytes, context, threads, sampleRate, noPin) { leases.modelEnded(c) }
+            }
+        } catch (x: CoreException) {
+            throw x.toOpenError()
+        } finally {
+            if (m == null) leases.modelEnded(c)
+        }
         leases.modelOpened(::roots)
-        return m
+        return m!!
     }
 
     fun closed(m: CoreModel) {
@@ -101,6 +134,68 @@ internal class ProtectedBuild(
     /** The engine's files of [context] in their device form (the CPU set less the plain files). */
     fun contextInstalled(context: String): Boolean =
         ModelProfile.cpu(manifest, context).all { installed(it) }
+}
+
+/**
+ * SDK 4.0.3: how an open that meets another Client's model in the Core (a Client closed while its model opened closes
+ * that model as soon as its open returns) waits for it: at most [MS], one bound for every caller. A suspend API waits
+ * with delay and never blocks a thread ([retrying] around the call, [marked] around its blocking part); a sync call off
+ * the main looper blocks for at most [MS]; a call on the main looper (Android's ANR limit is 5 s) never waits and is
+ * `session_open` at once. A wait that runs out is `session_open` too, as on the other SDKs ([sessionOpen]).
+ */
+internal object OpenWait {
+    /** The one bound of the wait (ms). */
+    const val MS = 3_000L
+
+    private const val POLL_MS = 20L
+
+    /** Whether the calling thread is the app's main looper's: Android sets it (AndroidPlatform); tests replace it. */
+    @Volatile var isUiThread: () -> Boolean = { false }
+
+    /** A suspend API's blocking part: the Core and lease client of an open that met another Client's model there. */
+    class Pending {
+        @Volatile var busy: Pair<Core, LeaseClient>? = null
+    }
+
+    private val current = ThreadLocal<Pending?>()
+
+    /** The suspend API this thread's blocking part runs for, or null (a sync call). */
+    fun pending(): Pending? = current.get()
+
+    /** [block] on this thread (the IO dispatcher's) for a suspend API: an open in it that meets another Client's model
+     *  fails at once, noted in [p], so that the call waits with delay ([retrying]). */
+    fun <T> marked(p: Pending, block: () -> T): T {
+        val before = current.get()
+        current.set(p)
+        try {
+            return block()
+        } finally {
+            current.set(before)
+        }
+    }
+
+    /** [run]; when an open in its [marked] part met another Client's model: a wait with delay (at most [MS]) for that
+     *  model to close, then [run] once more. The wait running out is `session_open` ([sessionOpen]). */
+    suspend fun <T> retrying(run: suspend (Pending) -> T): T {
+        val p = Pending()
+        try {
+            return run(p)
+        } catch (e: Throwable) {
+            val (c, l) = p.busy ?: throw e
+            p.busy = null
+            if (e is CancellationException) throw e
+            val gone = withTimeoutOrNull(MS) {
+                while (l.otherModelsOpen(c)) delay(POLL_MS)
+                true
+            } ?: false
+            if (!gone) throw sessionOpen()
+        }
+        return run(p)
+    }
+
+    /** The answer when another Client's model still holds the Core's one open model and the call does not wait for it
+     *  (the main looper) or waited [MS] in vain: `session_open` (a code of the app's own: no `errorCause`). */
+    fun sessionOpen(): RecognizerException = RecognizerException.SessionActive()
 }
 
 /** The recited count's hook into a take's engine calls (on the engine's thread, between pushes). */
