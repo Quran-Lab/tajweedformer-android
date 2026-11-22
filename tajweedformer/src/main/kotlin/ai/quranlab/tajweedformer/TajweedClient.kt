@@ -57,6 +57,9 @@ public class TajweedClient internal constructor(
     /** One removal of the models at a time (SPEC 15.3); made before the init block that may run one. */
     private val removalLock = Any()
     @Volatile private var closed = false
+    /** SDK 4.0.3: [closed] is set, and a Model opened by model() becomes [model], under this lock: a Model is the
+     *  Client's only while the Client is open, so close() closes every Model the Client handed out. */
+    private val publishLock = Any()
     @Volatile private var model: TajweedModel? = null
     /** The version the open Model was asked for (null: Quran Lab's choice). The server may have answered a pin with
      *  another version; the same pin again is still this Model. */
@@ -169,10 +172,29 @@ public class TajweedClient internal constructor(
             // the Core opens one model at a time and installs nothing while one is open: the open Model goes first
             model?.close()
             model = null
-            // Gate C (SDK 4.0.1): the opened Model becomes the Client's, or is closed; never dropped ([openKept])
-            openKept({ openModel(version) }) { m ->
-                model = m
-                modelPin = version
+            // Gate C (SDK 4.0.1): the opened Model becomes the Client's, or is closed; never dropped ([openKept]). SDK
+            // 4.0.3: never the Model of a Client that was closed while it opened (close() found no Model to close): it
+            // is closed here, on the IO side right after the open (no wait for the caller's thread) and again when it
+            // would be handed over, and the call fails as a call on a closed Client does. Left open, it would hold the
+            // Core's one open model, and the next Client of the storage (which may share that Core) would meet busy
+            // and an open that meets another Client's model in the Core waits for it with delay, at most OpenWait.MS
+            ai.quranlab.tajweedformer.core.OpenWait.retrying { p ->
+                openKept({
+                    ai.quranlab.tajweedformer.core.OpenWait.marked(p) {
+                        openModel(version).also { m ->
+                            if (closed) {
+                                try { m.close() } catch (_: Exception) {}
+                                checkOpen()
+                            }
+                        }
+                    }
+                }) { m ->
+                    synchronized(publishLock) {
+                        checkOpen()
+                        model = m
+                        modelPin = version
+                    }
+                }
             }
         }
     }
@@ -342,8 +364,10 @@ public class TajweedClient internal constructor(
      *  start. A `model()` or `prefetch()` call that is downloading ends with `download_failed`, and what it had
      *  downloaded stays on the device for the next client. After it a new client can be made. */
     override fun close() {
-        if (closed) return
-        closed = true
+        synchronized(publishLock) {
+            if (closed) return
+            closed = true
+        }
         val deadline = System.nanoTime() + ai.quranlab.tajweedformer.core.LeaseClient.CLOSE_WAIT_MS * 1_000_000
         backgroundCancel.cancel()
         try { model?.close() } catch (_: Exception) {}

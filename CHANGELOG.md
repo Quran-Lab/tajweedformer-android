@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.0.3
+
+- A client closed while its `model()` call was still opening the model no longer leaves that model open: that call
+  now fails, and the next client on the same storage opens the model (4.0.2 could fail it with `engine_failed`,
+  `busy`). While another client's model is still closing, `model()` waits for it up to 3 seconds, never on the main
+  thread, and fails with `session_open` if it is still open then.
+
 ## 4.0.2
 
 Two changes an app may need to make: delete `unmeteredOnly` where you pass it, and read the new `errorCause` if you
