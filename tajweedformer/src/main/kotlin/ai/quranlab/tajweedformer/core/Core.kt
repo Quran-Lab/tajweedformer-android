@@ -157,121 +157,148 @@ internal data class RecitedTotals(val day: Long, val takes: Int, val ayahs: Int,
 internal class Core private constructor(handle: Long, val key: AgreementKey, private val host: CoreHost) : AutoCloseable {
     @Volatile private var h = handle
 
-    private fun handle(): Long = h.takeIf { it != 0L } ?: throw IllegalStateException("the Core is closed")
+    /**
+     * Every native call of this handle holds the read side of [gate] (calls still run side by side: the Core serialises
+     * its own), and [close] takes the write side before the destroy: a call never meets freed memory. A call after
+     * [close] began fails with [E_CLOSED], a [CoreException] like any other (the SDK's normal error path), and touches
+     * nothing native.
+     */
+    private val gate = java.util.concurrent.locks.ReentrantReadWriteLock()
+    @Volatile private var closed = false
 
-    private fun check(call: String, status: Int) {
-        if (status < 0) throw CoreException(status, CoreNative.detail(handle()), call)
+    private inline fun <T> gated(call: String, f: (Long) -> T): T {
+        val r = gate.readLock()
+        r.lock()
+        try {
+            val x = h
+            if (closed || x == 0L) throw CoreException(E_CLOSED, 0, call)
+            return f(x)
+        } finally {
+            r.unlock()
+        }
+    }
+
+    private fun check(x: Long, call: String, status: Int) {
+        if (status < 0) throw CoreException(status, CoreNative.detail(x), call)
     }
 
     /** The folders of the build in use; set before an install, a lease accept or an open of that build. */
-    fun roots(plain: File, cdn: File, device: File) = CoreNative.setRoots(handle(), plain.path, cdn.path, device.path)
+    fun roots(plain: File, cdn: File, device: File) = gated("qlc_set_roots") { x -> CoreNative.setRoots(x, plain.path, cdn.path, device.path) }
 
     /** The `core` object (JSON) of POST /v1/model-key and its `install_sig`. */
-    fun leaseAsk(challenge: String, build: String): Pair<String, String> {
+    fun leaseAsk(challenge: String, build: String): Pair<String, String> = gated("qlc_lease_ask") { x ->
         val out = IntArray(2)
-        val r = CoreNative.leaseAsk(handle(), challenge, build, out) ?: throw CoreException(out[0], out[1], "qlc_lease_ask")
-        return r[0] to r[1]
+        val r = CoreNative.leaseAsk(x, challenge, build, out) ?: throw CoreException(out[0], out[1], "qlc_lease_ask")
+        r[0] to r[1]
     }
 
-    /** Accepts a lease for [build] of [manifest]: its expiry and refresh time (server seconds). */
-    fun leaseAccept(lease: ByteArray, manifest: ByteArray, build: String): Pair<Long, Long> {
+    /** Accepts a lease for [build] of [manifest]: its expiry and refresh time (server seconds). The Core saves its state
+     *  with the lease ([CoreHost.saveState]) before this returns. */
+    fun leaseAccept(lease: ByteArray, manifest: ByteArray, build: String): Pair<Long, Long> = gated("qlc_lease_accept") { x ->
         val t = LongArray(2)
-        check("qlc_lease_accept", CoreNative.leaseAccept(handle(), lease, manifest, build, t))
-        return t[0] to t[1]
+        check(x, "qlc_lease_accept", CoreNative.leaseAccept(x, lease, manifest, build, t))
+        t[0] to t[1]
     }
 
     /** A refusal body of the lease route: true when the Core verified it as a signed stop (the lease is gone and the
      *  models are removed, now or when the open model closes). */
-    fun refusalAccept(body: ByteArray, apiKeyId: String): Boolean = CoreNative.refusalAccept(handle(), body, apiKeyId) == E_STOPPED
+    fun refusalAccept(body: ByteArray, apiKeyId: String): Boolean =
+        gated("qlc_refusal_accept") { x -> CoreNative.refusalAccept(x, body, apiKeyId) == E_STOPPED }
 
-    fun leasePiece(piece: ByteArray): Boolean = CoreNative.leasePiece(handle(), piece) == OK
+    fun leasePiece(piece: ByteArray): Boolean = gated("qlc_lease_piece") { x -> CoreNative.leasePiece(x, piece) == OK }
 
     /** 18.4.7.1: tells the Core how a lease attempt that brought no lease ended; the Core's status (OK, E_NEEDS_CONNECTION
      *  without a lease, E_STOPPED after a verified stop). */
-    fun leaseAttempt(refused: Boolean): Int = CoreNative.leaseAttempt(handle(), if (refused) ATTEMPT_REFUSED else ATTEMPT_UNREACHABLE)
+    fun leaseAttempt(refused: Boolean): Int =
+        gated("qlc_lease_attempt") { x -> CoreNative.leaseAttempt(x, if (refused) ATTEMPT_REFUSED else ATTEMPT_UNREACHABLE) }
 
     /** 18.4.7.1: whether the Core opens the lease now while Quran Lab cannot be reached, and until when (0 without a lease). */
-    fun grace(): Pair<Boolean, Long> {
+    fun grace(): Pair<Boolean, Long> = gated("qlc_lease_grace") { x ->
         val out = LongArray(1)
-        return (CoreNative.leaseGrace(handle(), out) == 1) to out[0]
+        (CoreNative.leaseGrace(x, out) == 1) to out[0]
     }
 
-    fun tick(): LeaseStatus {
+    fun tick(): LeaseStatus = gated("qlc_tick") { x ->
         val o = LongArray(7)
-        check("qlc_tick", CoreNative.tick(handle(), o))
-        return LeaseStatus(o[0] != 0L, o[1] != 0L, o[2] != 0L, o[3] != 0L, o[4], o[5], o[6])
+        check(x, "qlc_tick", CoreNative.tick(x, o))
+        LeaseStatus(o[0] != 0L, o[1] != 0L, o[2] != 0L, o[3] != 0L, o[4], o[5], o[6])
     }
 
     /** Audio seconds the streams processed: (UTC day, seconds) today and the day before, by the Core's clock. */
-    fun usage(): DoubleArray {
+    fun usage(): DoubleArray = gated("qlc_usage") { x ->
         val o = DoubleArray(4)
-        check("qlc_usage", CoreNative.usage(handle(), o))
-        return o
+        check(x, "qlc_usage", CoreNative.usage(x, o))
+        o
     }
 
     /** CDN form to device form of one encrypted file, its plaintext SHA-256 checked once. */
-    fun install(manifest: ByteArray, decodedPath: String) = check("qlc_install", CoreNative.install(handle(), manifest, decodedPath))
+    fun install(manifest: ByteArray, decodedPath: String) =
+        gated("qlc_install") { x -> check(x, "qlc_install", CoreNative.install(x, manifest, decodedPath)) }
 
-    fun modelOpen(manifest: ByteArray, context: String?, threads: Int, sampleRate: Int, noPin: Int): CoreModel {
+    fun modelOpen(manifest: ByteArray, context: String?, threads: Int, sampleRate: Int, noPin: Int): CoreModel = gated("qlc_model_open") { x ->
         val out = IntArray(2)
-        val m = CoreNative.modelOpen(handle(), manifest, context, threads, 0, sampleRate, 1, noPin, out)
+        val m = CoreNative.modelOpen(x, manifest, context, threads, 0, sampleRate, 1, noPin, out)
         if (m == 0L) throw CoreException(out[0], out[1], "qlc_model_open")
-        return CoreModel(m)
+        CoreModel(m)
     }
 
-    fun recitedIndex(manifest: ByteArray) = check("qlc_recited_index", CoreNative.recitedIndex(handle(), manifest))
+    fun recitedIndex(manifest: ByteArray) =
+        gated("qlc_recited_index") { x -> check(x, "qlc_recited_index", CoreNative.recitedIndex(x, manifest)) }
 
     /** True when [take] was finished before (it counts once). */
-    fun recitedBegin(take: Long): Boolean {
-        val r = CoreNative.recitedBegin(handle(), take)
-        check("qlc_recited_begin", r)
-        return r == 1
+    fun recitedBegin(take: Long): Boolean = gated("qlc_recited_begin") { x ->
+        val r = CoreNative.recitedBegin(x, take)
+        check(x, "qlc_recited_begin", r)
+        r == 1
     }
 
     /** The id of a take left open (a kill), or null. */
-    fun recitedOpen(): Long? {
+    fun recitedOpen(): Long? = gated("qlc_recited_open") { x ->
         val o = LongArray(1)
-        val r = CoreNative.recitedOpen(handle(), o)
-        check("qlc_recited_open", r)
-        return if (r == 1) o[0] else null
+        val r = CoreNative.recitedOpen(x, o)
+        check(x, "qlc_recited_open", r)
+        if (r == 1) o[0] else null
     }
 
-    fun recitedFeedStream(stream: Long) = check("qlc_recited_feed_stream", CoreNative.recitedFeedStream(handle(), stream))
+    fun recitedFeedStream(stream: Long) =
+        gated("qlc_recited_feed_stream") { x -> check(x, "qlc_recited_feed_stream", CoreNative.recitedFeedStream(x, stream)) }
 
-    fun recitedFeed(units: IntArray) = check("qlc_recited_feed", CoreNative.recitedFeed(handle(), units, units.size))
+    fun recitedFeed(units: IntArray) =
+        gated("qlc_recited_feed") { x -> check(x, "qlc_recited_feed", CoreNative.recitedFeed(x, units, units.size)) }
 
-    fun recitedFinish(take: Long, flags: Int): RecitedResult {
+    fun recitedFinish(take: Long, flags: Int): RecitedResult = gated("qlc_recited_finish") { x ->
         val o = IntArray(9)
-        check("qlc_recited_finish", CoreNative.recitedFinish(handle(), take, flags, o))
-        return RecitedResult.of(o)
+        check(x, "qlc_recited_finish", CoreNative.recitedFinish(x, take, flags, o))
+        RecitedResult.of(o)
     }
 
     /** The finished takes the journal remembers (the last 64), oldest first: id and result (R5). */
-    fun recitedDone(): List<Pair<Long, RecitedResult>> {
+    fun recitedDone(): List<Pair<Long, RecitedResult>> = gated("qlc_recited_done") { x ->
         val id = LongArray(1)
         val o = IntArray(9)
-        val n = CoreNative.recitedDone(handle(), -1, id, o)
-        check("qlc_recited_done", n)
-        return (0 until n).mapNotNull { i ->
-            if (CoreNative.recitedDone(handle(), i, id, o) > i) id[0] to RecitedResult.of(o) else null
+        val n = CoreNative.recitedDone(x, -1, id, o)
+        check(x, "qlc_recited_done", n)
+        (0 until n).mapNotNull { i ->
+            if (CoreNative.recitedDone(x, i, id, o) > i) id[0] to RecitedResult.of(o) else null
         }
     }
 
     /** Marks a finished take as counted by the SDK (its report sent), so a restart never counts it again. */
-    fun recitedReported(take: Long): Boolean = CoreNative.recitedReported(handle(), take) == OK
+    fun recitedReported(take: Long): Boolean = gated("qlc_recited_reported") { x -> CoreNative.recitedReported(x, take) == OK }
 
     // ---- R10: the learner days, in the recited journal (committed with it: a kill leaves the last state) ----
-    fun daysMark(utcDay: Long, localDay: Long) = check("qlc_days_mark", CoreNative.daysMark(handle(), utcDay, localDay))
-    fun daysJudged(utcDay: Long, judged: Int, correct: Int) = check("qlc_days_judged", CoreNative.daysJudged(handle(), utcDay, judged, correct))
-    fun daysSeal(utcDay: Long) = check("qlc_days_seal", CoreNative.daysSeal(handle(), utcDay))
-    fun daysTrendSent(week: Long) = check("qlc_days_trend_sent", CoreNative.daysTrendSent(handle(), week))
-    fun daysRead(): CoreDays = CoreDays.of(CoreNative.daysRead(handle()) ?: throw CoreException(E_ENGINE, 0, "qlc_days_read"))
+    fun daysMark(utcDay: Long, localDay: Long) = gated("qlc_days_mark") { x -> check(x, "qlc_days_mark", CoreNative.daysMark(x, utcDay, localDay)) }
+    fun daysJudged(utcDay: Long, judged: Int, correct: Int) =
+        gated("qlc_days_judged") { x -> check(x, "qlc_days_judged", CoreNative.daysJudged(x, utcDay, judged, correct)) }
+    fun daysSeal(utcDay: Long) = gated("qlc_days_seal") { x -> check(x, "qlc_days_seal", CoreNative.daysSeal(x, utcDay)) }
+    fun daysTrendSent(week: Long) = gated("qlc_days_trend_sent") { x -> check(x, "qlc_days_trend_sent", CoreNative.daysTrendSent(x, week)) }
+    fun daysRead(): CoreDays = gated("qlc_days_read") { x -> CoreDays.of(CoreNative.daysRead(x) ?: throw CoreException(E_ENGINE, 0, "qlc_days_read")) }
 
     /** Whether the lease in force allows accelerator programs (flags bit 3): asked before the program's download. */
-    fun accelAllowed(): Boolean {
-        val r = CoreNative.accelAllowed(handle())
-        check("qlc_accel_allowed", r)
-        return r == 1
+    fun accelAllowed(): Boolean = gated("qlc_accel_allowed") { x ->
+        val r = CoreNative.accelAllowed(x)
+        check(x, "qlc_accel_allowed", r)
+        r == 1
     }
 
     /**
@@ -280,25 +307,47 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
      * device runs the CPU engine instead; the model and its CPU streams are untouched. Seconds long: a background
      * thread, never the audio one, and never while the model is being closed.
      */
-    fun accelPrepare(model: CoreModel, kind: String, dispatchDir: String?): String {
+    fun accelPrepare(model: CoreModel, kind: String, dispatchDir: String?): String = gated("qlc_accel_prepare") { x ->
         val st = IntArray(2)
-        return CoreNative.accelPrepare(handle(), model.handle, kind, dispatchDir, st) ?: throw CoreException(st[0], st[1], "qlc_accel_prepare")
+        CoreNative.accelPrepare(x, model.handle, kind, dispatchDir, st) ?: throw CoreException(st[0], st[1], "qlc_accel_prepare")
     }
 
-    fun recitedTotals(): RecitedTotals {
+    fun recitedTotals(): RecitedTotals = gated("qlc_recited_totals") { x ->
         val o = LongArray(6)
-        check("qlc_recited_totals", CoreNative.recitedTotals(handle(), o))
-        return RecitedTotals(o[0], o[1].toInt(), o[2].toInt(), o[3], o[4].toInt(), o[5].toInt())
+        check(x, "qlc_recited_totals", CoreNative.recitedTotals(x, o))
+        RecitedTotals(o[0], o[1].toInt(), o[2].toInt(), o[3], o[4].toInt(), o[5].toInt())
     }
 
-    override fun close() {
+    /**
+     * Destroys the handle, once (a second call does nothing). New calls fail with [E_CLOSED] from here on; the calls
+     * already running end first (the write side of [gate] waits for them), at most [CLOSE_WAIT_MS] on this thread, after
+     * which a thread of its own waits for the last of them and destroys the handle then. Never on freed memory.
+     */
+    override fun close() = close(CLOSE_WAIT_MS)
+
+    /** [close], waiting at most [waitMs] on this thread for the calls in flight. */
+    fun close(waitMs: Long) {
+        synchronized(gate) {
+            if (closed) return
+            closed = true
+        }
+        val w = gate.writeLock()
+        val now = try { w.tryLock(maxOf(0L, waitMs), java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); false }
+        if (now) {
+            try { destroyNow() } finally { w.unlock() }
+        } else {
+            Thread({ w.lock(); try { destroyNow() } finally { w.unlock() } }, "tajweedformer-core-close").apply { isDaemon = true }.start()
+        }
+    }
+
+    private fun destroyNow() {
         val x = h
         h = 0
         if (x != 0L) CoreNative.destroy(x)
     }
 
     /** The bridge's handle, for a [CoreModel]'s streams' recited feed. */
-    internal val raw: Long get() = handle()
+    internal val raw: Long get() = gated("raw") { x -> x }
 
     companion object {
         const val OK = 0
@@ -313,6 +362,11 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
         const val E_STOPPED = -9
         const val E_KEYSTORE = -10
         const val E_BUSY = -11
+        /** The SDK's own status (no Core call returns it): a call on a handle [close] has begun to destroy. */
+        const val E_CLOSED = -100
+
+        /** How long [close] waits on its own thread for the native calls already running (the destroy waits for them). */
+        const val CLOSE_WAIT_MS = 3_000L
 
         /** qlc_lease_attempt's outcomes (18.4.7.1). */
         const val ATTEMPT_UNREACHABLE = 1
@@ -376,7 +430,7 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
         fun statusName(s: Int): String = when (s) {
             OK -> "ok"; E_ARG -> "argument"; E_NOMEM -> "no memory"; E_STORAGE -> "storage"; E_MANIFEST -> "manifest"
             E_NEEDS_CONNECTION -> "needs a lease"; E_LEASE -> "lease refused"; E_FILE -> "file refused"; E_ENGINE -> "engine"
-            E_STOPPED -> "stopped"; E_KEYSTORE -> "key store"; E_BUSY -> "busy"; else -> "status $s"
+            E_STOPPED -> "stopped"; E_KEYSTORE -> "key store"; E_BUSY -> "busy"; E_CLOSED -> "closed"; else -> "status $s"
         }
 
         /**
@@ -398,21 +452,38 @@ internal class Core private constructor(handle: Long, val key: AgreementKey, pri
     }
 }
 
-/** An open model of the Core (qlc_model): the device forms decrypted into the Core's memory. */
+/** An open model of the Core (qlc_model): the device forms decrypted into the Core's memory. Its own calls and its close
+ *  are gated as [Core]'s are; its streams (CoreEngine) are closed before it. */
 internal class CoreModel(handle: Long) : AutoCloseable {
     @Volatile private var h = handle
-    val handle: Long get() = h.takeIf { it != 0L } ?: throw IllegalStateException("the model is closed")
+    private val gate = java.util.concurrent.locks.ReentrantReadWriteLock()
+    @Volatile private var closed = false
 
-    val chunkMs: Int get() = CoreNative.chunkMs(handle)
+    private inline fun <T> gated(call: String, f: (Long) -> T): T {
+        val r = gate.readLock()
+        r.lock()
+        try {
+            val x = h
+            if (closed || x == 0L) throw CoreException(Core.E_CLOSED, 0, call)
+            return f(x)
+        } finally {
+            r.unlock()
+        }
+    }
+
+    /** The model's handle, for its streams (CoreEngine, which closes them before the model): [Core.E_CLOSED] once closed. */
+    val handle: Long get() = gated("qlc_model") { x -> x }
+
+    val chunkMs: Int get() = gated("qlc_model_chunk_ms") { x -> CoreNative.chunkMs(x) }
 
     /** `calibration.json` as shipped (public data), or null. */
-    val calibration: ByteArray? get() = CoreNative.calibration(handle)
+    val calibration: ByteArray? get() = gated("qlc_model_calibration") { x -> CoreNative.calibration(x) }
 
     /** The build's vocabulary (its tokens.txt, R4): the names of the output units by id. */
-    fun tokenNames(): List<String> {
-        val n = CoreNative.tokenCount(handle)
+    fun tokenNames(): List<String> = gated("qlc_model_token_count") { x ->
+        val n = CoreNative.tokenCount(x)
         if (n <= 0) throw CoreException(if (n < 0) n else Core.E_ENGINE, 0, "qlc_model_token_count")
-        return (0 until n).map { CoreNative.tokenName(handle, it) ?: throw CoreException(Core.E_ENGINE, 0, "qlc_model_token_name") }
+        (0 until n).map { CoreNative.tokenName(x, it) ?: throw CoreException(Core.E_ENGINE, 0, "qlc_model_token_name") }
     }
 
     /**
@@ -421,19 +492,34 @@ internal class CoreModel(handle: Long) : AutoCloseable {
      * E_LEASE, E_KEYSTORE then; a later call tries again); E_FILE when the build has none, it is not installed, or it
      * was refused; E_ARG for an ayah the table does not have.
      */
-    fun referenceExpected(surah: Int, ayah: Int): Pair<IntArray, IntArray> {
+    fun referenceExpected(surah: Int, ayah: Int): Pair<IntArray, IntArray> = gated("qlc_reference_expected") { x ->
         val st = IntArray(1)
-        val r = CoreNative.referenceExpected(handle, surah, ayah, st) ?: throw CoreException(st[0], 0, "qlc_reference_expected")
-        return r[0] to r[1]
+        val r = CoreNative.referenceExpected(x, surah, ayah, st) ?: throw CoreException(st[0], 0, "qlc_reference_expected")
+        r[0] to r[1]
     }
 
     /** The ayahs the reference table has of [surah] (0 for one it does not have). */
-    fun referenceAyahCount(surah: Int): Int = CoreNative.referenceAyahCount(handle, surah)
+    fun referenceAyahCount(surah: Int): Int = gated("qlc_reference_ayah_count") { x -> CoreNative.referenceAyahCount(x, surah) }
 
     /** Frees the accelerator program (E_BUSY while a stream runs on it); closing the model does the same. */
-    fun accelRelease(): Int = CoreNative.accelRelease(handle)
+    fun accelRelease(): Int = gated("qlc_accel_release") { x -> CoreNative.accelRelease(x) }
 
+    /** Closes the model once, after the calls already running end (as [Core.close]). */
     override fun close() {
+        synchronized(gate) {
+            if (closed) return
+            closed = true
+        }
+        val w = gate.writeLock()
+        val now = try { w.tryLock(Core.CLOSE_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); false }
+        if (now) {
+            try { closeNow() } finally { w.unlock() }
+        } else {
+            Thread({ w.lock(); try { closeNow() } finally { w.unlock() } }, "tajweedformer-model-close").apply { isDaemon = true }.start()
+        }
+    }
+
+    private fun closeNow() {
         val x = h
         h = 0
         if (x != 0L) CoreNative.modelClose(x)

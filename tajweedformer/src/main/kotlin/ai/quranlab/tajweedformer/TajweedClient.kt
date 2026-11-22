@@ -48,7 +48,11 @@ public class TajweedClient internal constructor(
     /** Run the launch sequence (the signed config, a telemetry send point) on a background thread now; tests drive it. */
     autoLaunch: Boolean = true,
 ) : AutoCloseable {
-    private val work = Executors.newSingleThreadExecutor { r -> Thread(r, "tajweedformer-client").apply { isDaemon = true; priority = Thread.MIN_PRIORITY } }
+    /** The thread of [work] ([close] waits for it, except on it). */
+    @Volatile private var workThread: Thread? = null
+    private val work = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "tajweedformer-client").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.also { workThread = it }
+    }
     private val modelLock = Mutex()
     /** One removal of the models at a time (SPEC 15.3); made before the init block that may run one. */
     private val removalLock = Any()
@@ -60,7 +64,7 @@ public class TajweedClient internal constructor(
     @Volatile private var lastErrorCode: String? = null
     private val undo = ArrayList<() -> Unit>()
 
-    /** A take opened or closed (Android keeps the config fresh while one is open). */
+    /** A take opened or closed (Android keeps its minute tick, a send point and the lease refresh, going while one is open). */
     @Volatile internal var onSessionOpen: ((Boolean) -> Unit)? = null
 
     internal val cloud: QuranLabCloud = start(key)
@@ -77,7 +81,10 @@ public class TajweedClient internal constructor(
                 apiUrl = platform.apiUrl, trustedKeys = platform.trustedKeys, endpoints = platform.endpoints,
             ), platform.cloud)
             QuranLabCloud.install(c)
-            val bridge = CloudBridge(c, platform.cloud.inputRoute, sessionOpen = { open -> try { onSessionOpen?.invoke(open) } catch (_: Exception) {} })
+            val bridge = CloudBridge(c, platform.cloud.inputRoute, sessionOpen = { open ->
+                if (open) sessionStarted()
+                try { onSessionOpen?.invoke(open) } catch (_: Exception) {}
+            })
             SdkEvents.add(bridge)
             undo += { SdkEvents.remove(bridge) }
             platform.sheets?.let { show -> c.sharing.prompts = { r -> show(c.sharing, r) } }
@@ -98,6 +105,8 @@ public class TajweedClient internal constructor(
         // and from now on every refusal that stops a model removes them
         if (removalOwed.exists() || (cloud.refusals.current != null && hasModelFiles())) removeModelsForStop()
         cloud.refusals.onStop = { removeModelsForStop() }
+        // section 33.3: a download an earlier SDK left owed goes on on any network
+        oweAgain()
         platform.lifecycle?.let { undo += it(this) }
         // without a lifecycle of its own (the desktop JVM), or made while the app is already in the foreground (Android:
         // a client made after the first activity started, as a Flutter app makes it), the making of the client is the
@@ -175,23 +184,20 @@ public class TajweedClient internal constructor(
     /**
      * Downloads and verifies the model ahead of use, without opening it. [onProgress] gets the bytes done and the
      * total of the download. A download that was cut resumes where it stopped at the next call; when everything is
-     * on the device the call does nothing. With [unmeteredOnly] nothing is downloaded while the connection is
-     * `metered` or `none` (the call returns, and a later call on Wi-Fi does the work; `diagnose().connection` says
-     * which it is). Where the platform cannot tell (`unknown`: the desktop JVM) the option cannot be honoured and
-     * the download runs. Safe to call at every app start.
+     * on the device the call does nothing. It downloads on whatever network the device has (mobile data too): no
+     * download of the SDK waits for Wi-Fi. Safe to call at every app start.
      */
     @JvmOverloads
-    public suspend fun prefetch(unmeteredOnly: Boolean = false, onProgress: ((done: Long, total: Long) -> Unit)? = null): Unit = tracked {
+    public suspend fun prefetch(onProgress: ((done: Long, total: Long) -> Unit)? = null): Unit = tracked {
         checkOpen()
         modelLock.withLock {
             checkOpen()
             withContext(Dispatchers.IO) {
                 runInterruptible {
-                    if (unmeteredOnly && connection() in WAITS) return@runInterruptible
                     val target = target(cloud.modelVersion, refresh = true)
                     val store = store(target)
                     admit(store, target)
-                    download(store, target, onProgress, unmeteredOnly)
+                    download(store, target, onProgress)
                     Unit
                 }
             }
@@ -308,7 +314,8 @@ public class TajweedClient internal constructor(
         work.execute {
             try {
                 cloud.foreground(heldRevision())
-                cloud.refreshConfig()
+                // 28.11 item 5: the config only when the one in force is older than 300 s
+                cloud.refreshConfigIfOlder()
                 cloud.deliver()
                 refreshLease()
             } catch (_: Exception) {
@@ -316,10 +323,19 @@ public class TajweedClient internal constructor(
         }
     }
 
-    /** While the app is in use (Android: every minute): the signed config is refreshed and a send point taken when due. */
+    /**
+     * While the app is in use (Android: every minute): a send point when due and a lease refresh when due. SDK 4.0.2
+     *: no config here any more; 4.0.1 asked it at every tick.
+     */
     internal fun tick() {
         if (closed) return
-        work.execute { try { cloud.refreshConfig(); cloud.tick(); refreshLease() } catch (_: Exception) {} }
+        work.execute { try { cloud.tick(); refreshLease() } catch (_: Exception) {} }
+    }
+
+    /** A session started (28.11 item 5): the config, when the one in force is older than 300 s. */
+    internal fun sessionStarted() {
+        if (closed) return
+        try { work.execute { try { cloud.refreshConfigIfOlder() } catch (_: Exception) {} } } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
     /** Ends the client: the open Model and its Session are closed, what was counted is kept on disk for the next
@@ -328,6 +344,7 @@ public class TajweedClient internal constructor(
     override fun close() {
         if (closed) return
         closed = true
+        val deadline = System.nanoTime() + ai.quranlab.tajweedformer.core.LeaseClient.CLOSE_WAIT_MS * 1_000_000
         backgroundCancel.cancel()
         try { model?.close() } catch (_: Exception) {}
         model = null
@@ -338,6 +355,13 @@ public class TajweedClient internal constructor(
         for (u in undo) try { u() } catch (_: Exception) {}
         QuranLabCloud.install(null)
         work.shutdown()
+        // the Client's own work in flight (a config refresh, a send point, a lease refresh) ends first, within the same
+        // bound as the lease's: nothing it writes lands after close() returns, when a new Client may start on the storage
+        if (Thread.currentThread() !== workThread) try {
+            work.awaitTermination(maxOf(0L, (deadline - System.nanoTime()) / 1_000_000), java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         CURRENT.compareAndSet(this, null)
         OpenObjects.closed(this)
     }
@@ -421,7 +445,10 @@ public class TajweedClient internal constructor(
             integrity = platform.cloud.integrity, projectNumber = { cloud.currentConfig?.flags?.playIntegrityProjectNumber },
             removeModels = { removeModelsForStop() },
             report = { kind, code -> cloud.report(kind, code) },
-            leaseEvent = { failed -> cloud.telemetry.lease(failed) },
+            leaseEvent = { failed ->
+                cloud.telemetry.lease(failed)
+                if (failed == null) leaseAccepted()
+            },
             onGrace = { cause -> try { cloud.silent(cause) } catch (_: Exception) {} },
             bootId = platform.bootId, clock = platform.cloud.clock, hostClock = platform.coreClock, platformSignals = platform.coreSignals,
         )
@@ -503,7 +530,8 @@ public class TajweedClient internal constructor(
         if (cause != null && ErrorRules.codeFor(cause.stage, cause.reason, cause.httpStatus, "none", cause.errorCode) == "download_failed") {
             throw RecognizerException.DownloadFailed("config", configFailure(cause)).at(cause)
         }
-        throw RecognizerException.NeedsConnection().at(cause ?: ErrorCause("config", "network"))
+        // nothing of a build this call can open is on the device (24.13 item 3: the model's files)
+        throw RecognizerException.NeedsConnection().at(cause ?: ErrorCause("config", "network")).needing("none")
     }
 
     /** What answered a config request that failed, for `download_failed`'s detail. */
@@ -582,7 +610,8 @@ public class TajweedClient internal constructor(
         try {
             l.ensure(leaseTarget(store, t), ProtectedBuild.roots(store.root))
         } catch (f: LeaseFailure) {
-            throw f.error
+            // 24.13 item 3: no lease and no answer is `needs_connection`; it waits for the model's files or for the lease
+            throw f.error.needing(onDevice(store))
         }
         l.record?.takeIf { it.build == t.build }?.base?.let { store.filesBase = it }
     }
@@ -632,6 +661,30 @@ public class TajweedClient internal constructor(
         }
     }
 
+    /**
+     * Contract 24.4's `on_device` for a call that opens the build of [store]: `complete` when its manifest and every CPU
+     * file of the context it opens first are on the device, `partial` when some file of the build is, else `none`.
+     */
+    private fun onDevice(store: ModelStore): String {
+        val f = File(store.root, ModelManifest.FILE_NAME)
+        val some = if (anyFileOf(store)) "partial" else "none"
+        if (!f.isFile) return some
+        return try {
+            // what is on the device, from the manifest kept there: no signature check and no Core is needed to tell
+            // which files are here (a container installed by the Core is in device/, any other file is in place)
+            val m = ModelManifest.parse(f.readBytes())
+            val device = File(store.root, "device")
+            // (not through the store's downloader: it needs the folder a lease named, which a device without a lease lacks)
+            val all = ModelProfile.cpu(m, firstContext(m)).all { e ->
+                if (e.encoding == ModelManifest.Encoding.QLE1) File(device, e.localPath).isFile
+                else File(store.root, e.localPath).let { it.isFile && it.length() == e.localSize }
+            }
+            if (all) "complete" else some
+        } catch (_: Exception) {
+            some
+        }
+    }
+
     /** Whether any file of the build is on the device (its kept files, or a part of one): contract 24.4's "nothing". */
     private fun anyFileOf(store: ModelStore): Boolean = try {
         store.root.walkTopDown().any { it.isFile && it.name != ModelManifest.FILE_NAME && it.length() > 0 }
@@ -647,7 +700,7 @@ public class TajweedClient internal constructor(
     private fun specific(e: RecognizerException.DownloadFailed, onDevice: String, need: Long = 0): TajweedError {
         val c = ErrorCause.of(e)
         return when (ErrorRules.codeFor(c.stage, c.reason, c.httpStatus, onDevice, c.errorCode)) {
-            "needs_connection" -> RecognizerException.NeedsConnection(e)
+            "needs_connection" -> RecognizerException.NeedsConnection(e).needing(onDevice)
             "storage_full" -> RecognizerException.StorageFull(need, try { platform.freeSpace?.invoke(modelsDir) ?: modelsDir.usableSpace } catch (_: Exception) { 0L }).at(c)
             "storage_failed" -> RecognizerException.StorageFailed(e.path, e)
             else -> e
@@ -663,12 +716,12 @@ public class TajweedClient internal constructor(
      * may be open in the Core then: with [install] false, while one is open, the forms wait for the next open).
      *
      * A download that starts is owed to the app until it is complete (SDK 3.1.3): the platform's background job
-     * ([BackgroundDownloads], [unmeteredOnly] its network rule) continues it when the app leaves or its process ends.
+     * ([BackgroundDownloads], on any network) continues it when the app leaves or its process ends.
      * What fails for good (a refusal, the daily limit, the storage) is not owed any more. [background]: the call is that
      * continuation ([continueDownload]).
      */
     private fun download(store: ModelStore, t: Target, onProgress: ((Long, Long) -> Unit)?,
-                         unmeteredOnly: Boolean = false, background: Boolean = false, install: Boolean = model == null): ModelFolder {
+                         background: Boolean = false, install: Boolean = model == null): ModelFolder {
         lease(store, t)
         val m = manifest(store, t)
         val b = protectedBuild(store, m)
@@ -678,7 +731,7 @@ public class TajweedClient internal constructor(
             val need = missing.sumOf { it.size + it.localSize }
             val free = platform.freeSpace?.invoke(store.root)
             if (free != null && free < need) throw RecognizerException.StorageFull(need, free).at("storage", "quota")
-            if (!background) owe(unmeteredOnly)
+            if (!background) owe()
         }
         var got = false
         val folder = try {
@@ -710,21 +763,43 @@ public class TajweedClient internal constructor(
     private val backgroundCancel = Cancellation()
 
     /**
-     * A download of the CPU set that is owed to the app (SDK 3.1.3): there while it is not complete, with the network
-     * rule and the version pin of the call that started it. Inside `models/`, so a stop and [removeModels] take it
-     * away with the models.
+     * A download of the CPU set that is owed to the app (SDK 3.1.3): there while it is not complete, with the version
+     * pin of the call that started it. Inside `models/`, so a stop and [removeModels] take it away with the models.
+     * SDK 4.0.2 (section 33.3): the `unmetered_only` that 4.0.1 wrote beside the pin is read as absent, and the file is
+     * written again without it at the Client's start ([oweAgain]).
      */
     private val owedFile: File get() = File(modelsDir, "download.json")
 
-    private fun owe(unmeteredOnly: Boolean) {
+    private fun owe() {
         val bg = platform.downloads ?: return
         try {
             modelsDir.mkdirs()
-            owedFile.writeText(Json.write(linkedMapOf("unmetered_only" to unmeteredOnly, "version" to cloud.modelVersion)))
+            owedFile.writeText(Json.write(linkedMapOf("version" to cloud.modelVersion)))
         } catch (_: Exception) {
             return
         }
-        try { bg.owe(unmeteredOnly) } catch (_: Exception) {}
+        try { bg.owe() } catch (_: Exception) {}
+    }
+
+    /**
+     * Section 33.3, at the Client's start: a download 4.0.1 left owed (its file names `unmetered_only`) is given to the
+     * platform's job again, on any network. Android's job is unique work replaced by this one, so a job 4.0.1 queued for
+     * an unmetered network only (its `prefetch(unmeteredOnly = true)`) does not keep waiting for Wi-Fi after the update.
+     * The file is written again without the field, so this happens once: a download 4.0.2 owes already has a job on any
+     * network, and asking for it again at every start (the job's own process makes a Client too) would replace the
+     * running job and reset its backoff.
+     */
+    private fun oweAgain() {
+        val bg = platform.downloads ?: return
+        if (!owedFile.isFile) return
+        try {
+            val o = Json.parse(owedFile.readText()) as? Map<*, *> ?: return
+            if (!o.containsKey("unmetered_only")) return
+            owedFile.writeText(Json.write(linkedMapOf("version" to o["version"] as? String)))
+        } catch (_: Exception) {
+            return
+        }
+        try { bg.owe() } catch (_: Exception) {}
     }
 
     /** Nothing is owed; with [job] the platform's job is called off too (the continuation itself leaves its own). */
@@ -742,8 +817,9 @@ public class TajweedClient internal constructor(
      * Continues, blocking, a download of the model that the app started and did not finish (SDK 3.1.3): the platform's
      * background job calls it ([BackgroundDownloads]), in the app's process or in one it started. It waits for a call
      * of the app that is downloading, then downloads what is still missing of the build the config names (the same
-     * pin), under the same rules as `prefetch`: the install record, a refusal, the key and the token, the network rule
-     * of the call that started it. Not an app's call: `diagnose().lastError` does not change.
+     * pin), under the same rules as `prefetch`: the install record, a refusal, the key and the token, on any network
+     * (an `unmetered_only` a 4.0.1 file still names is read as absent, 33.3). Not an app's call: `diagnose().lastError`
+     * does not change.
      */
     internal fun continueDownload(): Continued {
         if (closed || !owedFile.isFile) return Continued.DONE
@@ -755,12 +831,11 @@ public class TajweedClient internal constructor(
                             val o = try { Json.parse(owedFile.readText()) as? Map<*, *> } catch (_: Exception) { null }
                             when {
                                 closed || o == null -> Continued.DONE
-                                o["unmetered_only"] == true && connection() in WAITS -> Continued.RETRY
                                 else -> {
                                     val target = target(o["version"] as? String, refresh = true)
                                     val store = store(target)
                                     admit(store, target)
-                                    download(store, target, null, o["unmetered_only"] == true, background = true)
+                                    download(store, target, null, background = true)
                                     Continued.DONE
                                 }
                             }
@@ -779,7 +854,9 @@ public class TajweedClient internal constructor(
     }
 
     private fun openModel(version: String?): TajweedModel {
-        val t = target(version, refresh = cloud.lastConfigAt == 0L)
+        // the first open of a process asks the config, unless one was answered in the last minutes (28.11 item 5: also by
+        // an earlier process, so a restart does not ask again at once)
+        val t = target(version, refresh = cloud.lastConfigAt == 0L && !cloud.configFresh())
         val store = store(t)
         admit(store, t)
         val folder = download(store, t, null, install = true)
@@ -801,7 +878,7 @@ public class TajweedClient internal constructor(
         val host = ModelHost(
             store = store, verifier = store.verifier, engine = platform.engine, soc = platform.soc, warmRate = platform.warmRate,
             microphone = { platform.microphone }, configContext = { cloud.inferenceContext },
-            ensureContext = { ctx -> store.ensureCpu(b, ctx, backgroundCancel) },
+            ensureContext = { ctx -> ensureContext(store, b, ctx) },
             takeStarted = { s -> recited.takeStarted(s) },
             takeEnded = { s, finished ->
                 recited.takeEnded(s, finished)
@@ -835,7 +912,7 @@ public class TajweedClient internal constructor(
         try {
             // the index is loaded where it is used (a counted take's end, a take a kill cut short), not at the open
             prepareRecitedIndex(b)
-            // the accelerator's program for the next open, when the lease allows it (on Wi-Fi, in the background)
+            // the accelerator's program for the next open, when the lease allows it (in the background, any network)
             fetchAccelerator(store, b, m.contextInForce() ?: folder.defaultContext, m)
         } catch (t: Throwable) {
             try { m.close() } catch (_: Exception) {}
@@ -844,10 +921,77 @@ public class TajweedClient internal constructor(
         return m
     }
 
+    /**
+     * Another context's files, for a session on a context that is not on the device yet: downloaded on any network
+     * (section 33: Apple 4.0.1 took them for an update of the build and waited for Wi-Fi), each installed by the Core. A
+     * download that fails is the code 24.4 gives for THAT context's files (24.13 item 3: the default context on the device
+     * does not count): with no answer and none of its files here, `needs_connection` with `needs` `model`.
+     */
+    private fun ensureContext(store: ModelStore, b: ProtectedBuild, ctx: String): ModelFolder {
+        val missing = try { store.missingCpu(ctx, b) } catch (_: Exception) { emptyList() }
+        var got = false
+        return try {
+            store.ensureCpu(b, ctx, backgroundCancel, { p -> if (p.bytes > 0) got = true })
+        } catch (e: RecognizerException.DownloadFailed) {
+            throw when {
+                e.cause is NetworkNotPermitted -> RecognizerException.NetworkNotPermitted(e)
+                else -> specific(e, if (got || missing.any { store.downloader.begun(it) }) "partial" else "none", missing.sumOf { it.size + it.localSize })
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- R2 and R3
 
-    /** The verdicts of this device's accelerator per build (`<storage>/core/accel.json`). */
-    private val accelRecords by lazy { ai.quranlab.tajweedformer.core.AcceleratorRecords(File(File(platform.cloud.storage, "core"), "accel.json")) }
+    /** The verdicts of this device's accelerator per build (`<storage>/core/accel.json`); 4.0.1's verdicts of a lease that
+     *  allowed no accelerator program go back to pending (21.6 item 4). */
+    private val accelRecords by lazy {
+        ai.quranlab.tajweedformer.core.AcceleratorRecords(File(File(platform.cloud.storage, "core"), "accel.json"))
+            .also { r -> try { r.migrateLeaseNoAccel() } catch (_: Exception) {} }
+    }
+
+    /** Whether the lease in force allows accelerator programs (`qlc_accel_allowed`, 21.6); true when the Core cannot say
+     *  (its prepare refuses then, and that refusal takes the same path). */
+    private fun accelAllowed(): Boolean = try { leases?.core()?.accelAllowed() ?: true } catch (_: Exception) { true }
+
+    /**
+     * 21.6 item 1: the lease in force allows no accelerator program for [b]'s key: no attempt and nothing counted; said
+     * as the config's deny list says a denial (the `denylist` demotion with detail `lease_no_accel`), once while it
+     * holds: a lease that allows programs ends it ([leaseAccepted]).
+     */
+    private fun noteLeaseNoAccel(b: ProtectedBuild, ctx: String) {
+        val soc = platform.soc ?: return
+        if (!deniedSaid.add("${accelKey(b, soc, ctx)}|$LEASE_NO_ACCEL")) return
+        try {
+            cloud.telemetry.promotion(ai.quranlab.tajweedformer.core.PromotionInfo(soc, b.manifest.build, ctx, promoted = false,
+                failedAt = "download", reason = "denylist", detail = LEASE_NO_ACCEL, version = b.manifest.version ?: ""))
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 21.6 item 2: at every lease the Core accepts (a new install's, a renewal, a lease after a refusal ended) the SDK
+     * asks again whether accelerator programs are allowed. When they are, the open Model's key goes on from where it
+     * stood (a promoted key loads its build again with no golden test, one never tried starts its attempt), and the
+     * program is fetched for the next open when it is not on the device.
+     */
+    private fun leaseAccepted() {
+        if (closed) return
+        try {
+            work.execute {
+                try {
+                    if (closed || !accelAllowed()) return@execute
+                    deniedSaid.removeIf { it.endsWith("|$LEASE_NO_ACCEL") }
+                    val m = model ?: return@execute
+                    m.promoteAgain()
+                    val b = m.folder.protected ?: return@execute
+                    val t = current() ?: return@execute
+                    fetchAccelerator(store(t), b, m.contextInForce() ?: m.defaultContext, m)
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+        }
+    }
 
     private fun accelKey(b: ProtectedBuild, soc: String, ctx: String) = "${b.manifest.build}:npu:$soc:$ctx"
 
@@ -905,7 +1049,8 @@ public class TajweedClient internal constructor(
             clips = { goldenClips(b) }, records = accelRecords,
             report = { p -> try { cloud.telemetry.promotion(p) } catch (_: Exception) {} },
             minSpeedup = { cloud.currentConfig?.flags?.accelMinSpeedup },
-            os = platform.osBuild, clock = platform.cloud.clock, dispatchId = folder.id)
+            os = platform.osBuild, clock = platform.cloud.clock, dispatchId = folder.id,
+            allowed = { accelAllowed() }, leaseNoAccel = { noteLeaseNoAccel(b, ctx) })
     }
 
     /**
@@ -957,7 +1102,8 @@ public class TajweedClient internal constructor(
 
     /**
      * The program's CDN forms (110 to 167 MB) in the background, for the next open: only when the lease in force allows
-     * accelerator programs (`qlc_accel_allowed`), on an unmetered network, and not when the system asks to save data.
+     * accelerator programs (`qlc_accel_allowed`), on any network (SDK 4.0.2, section 33: 4.0.1 waited for Wi-Fi here);
+     * with no network at all it is left for the next open.
      */
     private fun fetchAccelerator(store: ModelStore, b: ProtectedBuild, ctx: String, m: TajweedModel? = null) {
         val choice = acceleratorChoice(b, ctx)
@@ -967,9 +1113,13 @@ public class TajweedClient internal constructor(
         val nothingInstalled = choice.files.none { b.installed(it) }
         work.execute {
             try {
-                if (connection() != "unmetered" || saveData()) return@execute
+                if (offline()) return@execute
                 val c = leases?.core() ?: return@execute
-                if (!c.accelAllowed()) return@execute
+                // 21.6: no program while the lease allows none (said once, never counted); asked again at the next lease
+                if (!c.accelAllowed()) {
+                    noteLeaseNoAccel(b, ctx)
+                    return@execute
+                }
                 // a firmware the Core refuses is known before the download (AcceleratorGate.firmwareRefused)
                 val soc = platform.soc
                 val host = if (nothingInstalled) m?.acceleratorHost() else null
@@ -995,8 +1145,9 @@ public class TajweedClient internal constructor(
     private fun prepareReference(store: ModelStore, b: ProtectedBuild) {
         val files = ModelProfile.reference(b.manifest).filter { it.encoding == ModelManifest.Encoding.QLE1 && !b.installed(it) }
         if (files.isEmpty()) return
+        // any network; with none at all the fetch is left for the next open, and what is on the device is installed
+        if (files.any { !store.downloader.isInPlace(it) } && !offline()) try { store.fetch(files, backgroundCancel) } catch (_: Exception) {}
         try {
-            if (files.any { !store.downloader.isInPlace(it) } && !saveData()) store.fetch(files, backgroundCancel)
             b.install(files, { store.downloader.isInPlace(it) }, { store.downloader.local(it) })
         } catch (_: Exception) {
         }
@@ -1016,7 +1167,7 @@ public class TajweedClient internal constructor(
                 val m = store.manifest()
                 if (!recitedWanted()) return@execute
                 val e = m.files.firstOrNull { it.role in RECITED_ROLES && it.forPlatform(SdkInfo.PLATFORM) } ?: return@execute
-                if (!saveData()) store.fetch(listOf(e), backgroundCancel)
+                if (!offline()) store.fetch(listOf(e), backgroundCancel)
             } catch (_: Exception) {
             }
         }
@@ -1024,21 +1175,21 @@ public class TajweedClient internal constructor(
 
     private fun recitedWanted(): Boolean = cloud.telemetry.enabled && cloud.currentConfig?.flags?.recited != false
 
-    /** 17.3: the SDK's own downloads wait while the system says to save data (Data Saver, roaming), or for Wi-Fi with
-     *  the Client's `unmeteredOnly`. */
-    private fun saveData(): Boolean = try {
-        val c = connection()
-        c == "none" || (options.unmeteredOnly && c == "metered") || platform.network.saveData()
-    } catch (_: Exception) {
-        false
-    }
+    /**
+     * No network at all (section 33.1: what a background task may wait for): an optional fetch the SDK makes on its own
+     * is left for the next open. Never the kind of network or the system's data saver: SDK 4.0.2 holds nothing for
+     * Wi-Fi (4.0.1's `saveData()` held these fetches on Data Saver, roaming, and with the Client's `unmeteredOnly`).
+     */
+    private fun offline(): Boolean = connection() == "none"
 
     /** The index file of [b] (role `recited`) installed by the Core when its CDN form is here and no model is open. */
     private fun prepareRecited(store: ModelStore, b: ProtectedBuild) {
         if (!recitedWanted()) return
         val e = b.manifest.files.firstOrNull { it.role in RECITED_ROLES && it.forPlatform(SdkInfo.PLATFORM) } ?: return
+        if (!b.installed(e) && sessionRanFile.exists() && !store.downloader.isInPlace(e) && !offline()) {
+            try { store.fetch(listOf(e), backgroundCancel) } catch (_: Exception) {}
+        }
         try {
-            if (!b.installed(e) && sessionRanFile.exists() && !store.downloader.isInPlace(e) && !saveData()) store.fetch(listOf(e), backgroundCancel)
             b.install(listOf(e), { store.downloader.isInPlace(it) }, { store.downloader.local(it) })
         } catch (_: Exception) {
         }
@@ -1101,8 +1252,8 @@ public class TajweedClient internal constructor(
         /** What `diagnose().downloadProtocol` may say beside null (the contract's names.json, `diagnosis.downloadProtocol`). */
         internal val DOWNLOAD_PROTOCOLS = listOf("h3", "h2", "http/1.1")
 
-        /** The connections on which `prefetch(unmeteredOnly = true)` waits. */
-        private val WAITS = setOf("metered", "none")
+        /** The Core's detail name of a lease that allows no accelerator program (21.6). */
+        private const val LEASE_NO_ACCEL = ai.quranlab.tajweedformer.core.AcceleratorRecords.LEASE_NO_ACCEL
 
         /** The recited-ayah index's roles (quranlab-core `recited`; SPEC 17.5 `recited-index`). */
         private val RECITED_ROLES = setOf(ModelProfile.RECITED_ROLE, "recited-index")

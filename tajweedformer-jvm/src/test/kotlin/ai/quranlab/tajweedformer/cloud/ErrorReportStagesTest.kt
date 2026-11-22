@@ -56,6 +56,14 @@ class ErrorReportStagesTest : OpenChecked() {
 
     private fun error(b: Map<String, Any?>) = b["error"] as Map<String, Any?>
 
+    /** SDK 4.0.2 (24.13): the app's error carries the tokens of its report [r], each exactly the report's value. */
+    private fun sameAsReport(e: TajweedError, r: ErrorReporter.Report) {
+        val c = e.errorCause!!
+        assertEquals(listOf(r.stage, r.reason, r.httpStatus, r.detail["error_name"], r.detail["error_code"]),
+            listOf(c.stage, c.reason, c.httpStatus, c.errorName, c.errorCode))
+        assertEquals(if (e.code == "needs_connection") c.needs else null, c.needs)
+    }
+
     /** The section 7 top level of 24.2, and nothing of 24.2's "never". */
     private fun checkBody(b: Map<String, Any?>) {
         assertEquals("error", b["kind"])
@@ -83,6 +91,7 @@ class ErrorReportStagesTest : OpenChecked() {
         val q = c.cloud.errors.queued()
         assertEquals(listOf(listOf("config", "http", 503, "none", 1), listOf("config", "http", 503, "download_failed", 1)),
             q.map { listOf(it.stage, it.reason, it.httpStatus, it.code, it.count) })
+        sameAsReport(e, q.last())
         c.cloud.deliver()
         val sent = stub.errorReports()
         assertEquals(listOf("none", "download_failed"), sent.map { it["code"] })
@@ -111,6 +120,8 @@ class ErrorReportStagesTest : OpenChecked() {
         val q = c.cloud.errors.queued().last()
         assertEquals(listOf("config", "http", 401, "download_failed"), listOf(q.stage, q.reason, q.httpStatus, q.code))
         assertEquals("invalid_token", q.detail["error_code"])
+        sameAsReport(e, q)
+        assertEquals("invalid_token", e.errorCause!!.errorCode)
         assertEquals("http", ErrorRules.reasonOf(401, "invalid_token", null))
         assertEquals("refused", ErrorRules.reasonOf(401, "invalid_token", "key_revoked"))
     }
@@ -148,6 +159,9 @@ class ErrorReportStagesTest : OpenChecked() {
         val q = c.cloud.errors.queued().single()
         assertEquals(listOf("attest", "network", null, "needs_connection"), listOf(q.stage, q.reason, q.httpStatus, q.code))
         assertEquals("java.io.IOException", q.detail["error_name"])
+        // 24.13: the same tokens on the app's error, and what it waits for: a first install, the model's files
+        sameAsReport(e, q)
+        assertEquals("model", e.errorCause!!.needs)
         stub.down = false
         c.cloud.deliver()
         val b = stub.errorReports().single()

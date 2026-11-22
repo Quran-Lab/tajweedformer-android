@@ -390,7 +390,7 @@ internal class RangedFetch(
             h["Accept-Encoding"] = "identity"
             h["Range"] = "bytes=$a-$b"
             validator?.takeIf { validatorHost == hosts.host(g) }?.let { h["If-Range"] = it }
-            val r = modelRequest(transport, hosts.url(g, e.path), e.path, h, auth, setOf(200, 206, 416), ending)
+            val r = modelRequest(transport, hosts.url(g, e.path), e.path, h, auth, setOf(200, 206, 416), ending, hosts.tap(g, e.path))
             stats.answer(r)
             return r
         }
@@ -418,7 +418,10 @@ internal class RangedFetch(
                     wrong(bad)
                 } catch (x: RecognizerException.DownloadFailed) {
                     if (cancel?.isCancelled == true) fail("cancelled")
-                    if (!RetryPlan.resumable(x, hosts.many)) throw x
+                    if (!RetryPlan.resumable(x, hosts.many)) {
+                        hosts.unreachable(g, x)
+                        throw x
+                    }
                     hosts.failed(g, x)
                     val more = try {
                         resumes.again(g) { if (cancel?.isCancelled == true || Thread.currentThread().isInterrupted) fail("cancelled") }
@@ -453,6 +456,8 @@ internal class RangedFetch(
                     if (!halted.get() && dropped(x)) {
                         hosts.failed(g, x)
                         if (resumes.again(g) { stopIfHalted() }) continue
+                    } else if (!halted.get()) {
+                        hosts.unreachable(g, x)
                     }
                     throw x
                 }
@@ -643,6 +648,13 @@ internal class RangedFetch(
 
         /** Deletes what a download left of a file: the validator first (without it nothing is continued), then the part,
          *  then the map. */
+        /** The range size a stored map was written with, or null when there is none that reads. */
+        fun mapRangeSize(map: File): Long? = try {
+            ((Json.parse(map.readText()) as? Map<*, *>)?.get("range") as? Number)?.toLong()
+        } catch (_: Exception) {
+            null
+        }
+
         fun wipe(part: File, validator: File, map: File) {
             validator.delete()
             part.delete()

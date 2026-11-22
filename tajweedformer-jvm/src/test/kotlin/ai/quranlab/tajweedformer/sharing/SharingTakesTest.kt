@@ -593,6 +593,10 @@ class SharingTakesTest : OpenChecked() {
         assertEquals("a refusal to retry waits for its backoff", 1, stub.takeCalls(a).size)
         c.sharing.outbox.drain(ignoringBackoff = true)
         assertEquals(ContributionOutbox.TAKES_PENDING, c.sharing.outbox.takesState(a))
+        // SDK 4.0.2: after the 429 the uploads route waits 300 s (no Retry-After), an explicit retry too
+        c.sharing.outbox.drain(ignoringBackoff = true)
+        assertEquals("a request inside the 429's wait", 2, stub.takeCalls(a).size)
+        now += 300_001
         c.sharing.outbox.drain(ignoringBackoff = true)
         assertEquals(ContributionOutbox.TAKES_SENT, c.sharing.outbox.takesState(a))
         assertEquals(listOf(twoTakes, twoTakes, twoTakes), bodies(a))

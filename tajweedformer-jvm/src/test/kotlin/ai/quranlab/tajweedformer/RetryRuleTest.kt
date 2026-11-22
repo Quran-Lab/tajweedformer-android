@@ -65,7 +65,7 @@ class RetryRuleTest : OpenChecked() {
     }
 
     private fun store(root: File, stallMs: Int = 30_000) =
-        ModelStore(root, base, UrlConnectionTransport(15_000, stallMs), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier)
+        ModelStore(root, base, UrlConnectionTransport(15_000, stallMs), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, ranges = RangePlan.RANGED_401)
 
     private fun big(): List<DownloadRuleServer.Req> = server.of(BIG)
 

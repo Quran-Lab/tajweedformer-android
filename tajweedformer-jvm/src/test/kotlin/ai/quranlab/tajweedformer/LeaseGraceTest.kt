@@ -14,6 +14,7 @@ import ai.quranlab.tajweedformer.cloud.QuranLabApi
 import ai.quranlab.tajweedformer.cloud.QuranLabKey
 import ai.quranlab.tajweedformer.core.Core
 import ai.quranlab.tajweedformer.core.CoreLibrary
+import ai.quranlab.tajweedformer.core.CoreRegistry
 import ai.quranlab.tajweedformer.core.FileStateVault
 import ai.quranlab.tajweedformer.core.LeaseClient
 import ai.quranlab.tajweedformer.core.LeaseFailure
@@ -22,7 +23,9 @@ import ai.quranlab.tajweedformer.core.SoftwareIdentity
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -218,13 +221,15 @@ class LeaseGraceTest : OpenChecked() {
         }
     }
 
-    private inner class Setup(val api: Api, val clock: Clock, val l: LeaseClient, val pb: ProtectedBuild, val reports: MutableList<ErrorCause>)
+    private inner class Setup(val api: Api, val clock: Clock, val l: LeaseClient, val pb: ProtectedBuild, val reports: MutableList<ErrorCause>,
+                              val dir: File)
 
     /** A fresh install leased at the clock's time, then the clock 2 hours past that lease's exp. With [hosts] (SDK 4.0.1,
      *  section 28) every later request goes through that `api` list, the app token's renewal too: the fake answers the
      *  stand-in host `stub` for the first lease, and each listed host by [Api.hostScript]. */
     @Suppress("UNCHECKED_CAST")
-    private fun install(waitMs: Long = 10_000, reuseMs: Long = 60_000, past: Boolean = true, hosts: List<String>? = null): Setup {
+    private fun install(waitMs: Long = 10_000, reuseMs: Long = 60_000, past: Boolean = true, hosts: List<String>? = null,
+                        leased: Boolean = true): Setup {
         val dir = temp()
         val v = ProtectedKit.vector("manifest_40.json")
         val bytes = Json.write(v["manifest"]).toByteArray()
@@ -254,11 +259,13 @@ class LeaseGraceTest : OpenChecked() {
             hostClock = ({ clock.wallMs }) to ({ clock.bootMs }), onGrace = { reports += it }, graceWaitMs = waitMs, graceReuseMs = reuseMs)
             .also { clients += it }
         val pb = ProtectedBuild(dir, m, bytes, l)
+        // [leased] false: no lease yet (the app's first call asks for it)
+        if (!leased) return Setup(api, clock, l, pb, reports, dir)
         val c = pb.core()
         assertTrue(c.tick().valid)
         first = false
         if (past) clock.pass((86_400L + 2 * 3600) * 1000)
-        return Setup(api, clock, l, pb, reports)
+        return Setup(api, clock, l, pb, reports, dir)
     }
 
     private fun Setup.open(): Core = l.ensure(pb.target, pb::roots)
@@ -392,10 +399,15 @@ class LeaseGraceTest : OpenChecked() {
         s.open()
         assertEquals(asked, s.api.seen.count { it == "model-key" })
         assertEquals(2, s.reports.size)
-        // the background refresh: due in the grace, its 503 sets the next try 30 s on (18.4.7's backoff would say 60)
+        // SDK 4.0.2 (18.4.7.3): the open's attempt counts, and its Retry-After (30 s) is only a floor: the background
+        // refresh waits a drawn 600 to 1800 s (4.0.1: 30 s, the Retry-After in place of the step)
+        assertTrue(s.l.record!!.nextTryMs - s.clock.wallMs in 600_000L..1_800_000L)
+        assertFalse(s.l.refreshDue())
+        s.clock.pass(1_800_000)
         assertTrue(s.l.refreshDue())
         s.l.refreshIfDue(s.pb.target, s.pb::roots)
-        assertEquals(s.clock.wallMs + 30_000, s.l.record!!.nextTryMs)
+        // the next failure: again 600 to 1800 s, never the 30 s the answer names
+        assertTrue(s.l.record!!.nextTryMs - s.clock.wallMs in 600_000L..1_800_000L)
         assertFalse(s.l.refreshDue())
     }
 
@@ -405,6 +417,12 @@ class LeaseGraceTest : OpenChecked() {
         s.api.override = { path, _ -> if (path == "/v1/model-key") s.api.reply(503, mapOf("error" to "not_configured")) else null }
         assertTrue(s.open().grace().first)
         s.api.override = { path, _ -> if (path == "/v1/model-key") s.api.reply(403, mapOf("error" to "sdk_too_old", "min_sdk" to "4.1.0")) else null }
+        // SDK 4.0.2 (18.4.7.3 item 3): an open in the grace asks again only once the wait after the failure (600 to
+        // 1800 s) has passed; before it, it opens in the grace with no request
+        val asked = s.api.seen.count { it == "model-key" }
+        assertTrue(s.open().grace().first)
+        assertEquals("a request inside the wait", asked, s.api.seen.count { it == "model-key" })
+        s.clock.pass(1_800_000)
         try {
             s.open()
             fail("a refusal opened the model")
@@ -472,10 +490,10 @@ class LeaseGraceTest : OpenChecked() {
         assertEquals(until, d["graceUntil"])
         assertEquals(st.exp, d["leaseExpires"])
         // a 7-day lease (flags bit 3) and a 24-hour class lease stretched to 7 days by the emergency switch; past the
-        // minute in which a second open reuses the grace without asking
+        // wait after a failed attempt (SDK 4.0.2, 18.4.7.3: 600 to 1800 s; until then an open in the grace asks nothing)
         s.api.override = null
         s.api.leaseFlags = 8
-        s.clock.pass(2 * 60_000L)
+        s.clock.pass(1_800_000L)
         assertTrue(s.open().tick().valid)
         assertEquals("attested", s.l.diagnosis()["leaseClass"])
         s.clock.pass(2L * 86_400 * 1000)
@@ -566,5 +584,417 @@ class LeaseGraceTest : OpenChecked() {
         } catch (f: LeaseFailure) {
             assertEquals("needs_connection", f.error.code)
         }
+    }
+
+    // ---------------------------------------------------------------- close() and a lease attempt in flight (4.0.2)
+
+    /** The lease request's answer, made when the request came (its lease issued then), held until [release]; with
+     *  [answers] false no answer at all then. An interrupt of the waiting request is an InterruptedIOException, as
+     *  Android's HTTP stack gives it. */
+    private inner class Held(s: Setup, private val answers: Boolean = true) {
+        val arrived = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+
+        init {
+            s.api.override = { path, body ->
+                if (path == "/v1/model-key") {
+                    val answer = s.api.default(path, body)
+                    arrived.countDown()
+                    try { release.await() } catch (_: InterruptedException) { throw java.io.InterruptedIOException("interrupted") }
+                    if (!answers) throw IOException("no answer")
+                    answer
+                } else null
+            }
+        }
+    }
+
+    /** A new lease client on the same storage: in this process (it shares a live Core of the folder), or with
+     *  [registry] another process's (its Core made again from the state saved). [offline]: nothing answers. */
+    private fun Setup.restart(offline: Boolean, registry: CoreRegistry = CoreRegistry.PROCESS): Setup {
+        api.override = if (offline) ({ _, _ -> throw IOException("offline") }) else null
+        val l2 = LeaseClient(File(dir, "core"), SoftwareIdentity(File(dir, "core/keys")), FileStateVault(File(dir, "core/vault")),
+            QuranLabApi("http://stub", api.transport), key, app, token = { api.token() }, invalidateToken = { api.needToken = true }, adoptToken = {},
+            integrity = null, projectNumber = { null }, removeModels = { true }, clock = { clock.wallMs },
+            hostClock = ({ clock.wallMs }) to ({ clock.bootMs }), onGrace = { reports += it }, graceWaitMs = 1_000, graceReuseMs = 60_000,
+            registry = registry)
+            .also { clients += it }
+        return Setup(api, clock, l2, ProtectedBuild(dir, pb.manifest, pb.manifestBytes, l2), reports, dir)
+    }
+
+    /** 13 hours into a 24-hour lease: past its refresh_after (12 h), still valid. */
+    private fun refreshDueInstall(): Setup = install(past = false).also {
+        it.clock.pass(13L * 3600 * 1000)
+        assertTrue(it.l.refreshDue())
+    }
+
+    /** The exp of the lease the fake answers now (24 hours from a minute ago). */
+    private fun Setup.expNow(): Long = api.now() - 60 + 86_400
+
+    private fun background(name: String, f: () -> Unit): Thread =
+        Thread({ try { f() } catch (_: Throwable) {} }, name).apply { isDaemon = true; start() }
+
+    /**
+     * close() during a lease renewal in flight (SDK 4.0.2; the web SDK had the same bug): the background refresh's
+     * answer is held, the client closes, then the answer comes. close() waits for the attempt (at most 3 s), so the
+     * renewed lease is accepted and saved with the Core's state before the Core goes: a restart offline opens it. 4.0.2
+     * before the fix destroyed the Core at once, the answer met a closed Core, and the restart had the old lease.
+     */
+    @Test
+    fun closeWaitsForARefreshInFlightAndTheRestartHasTheRenewedLease() {
+        val s = refreshDueInstall()
+        val old = s.l.core()!!.tick().exp
+        val held = Held(s)
+        val refresh = background("refresh") { s.l.refreshIfDue(s.pb.target, s.pb::roots) }
+        assertTrue(held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val renewed = s.expNow()
+        val closing = background("close") { s.l.close() }
+        Thread.sleep(300)
+        held.release.countDown()
+        closing.join(10_000)
+        refresh.join(10_000)
+        assertFalse("close() returned", closing.isAlive)
+        val st = s.restart(offline = true).open().tick()
+        assertTrue(st.valid)
+        assertEquals("the restart's lease (the old one's exp: $old)", renewed, st.exp)
+    }
+
+    /**
+     * The same in the grace (the worst case of the web's bug): a model open two hours past the lease's exp, its lease
+     * request's answer held, the client closes, the answer comes. A restart offline opens the renewed lease, valid, not
+     * the grace. Before the fix the close cancelled the request, which counted as a failure, and the restart had only
+     * the grace.
+     */
+    @Test
+    fun closeWaitsForARenewalInGraceAndTheRestartOpensTheRenewedLeaseOffline() {
+        val s = install()
+        val held = Held(s)
+        val open = background("open") { s.open() }
+        assertTrue(held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val renewed = s.expNow()
+        val closing = background("close") { s.l.close() }
+        Thread.sleep(300)
+        held.release.countDown()
+        closing.join(10_000)
+        open.join(15_000)
+        assertFalse("close() returned", closing.isAlive)
+        val st = s.restart(offline = true).open().tick()
+        assertTrue("the renewed lease is valid offline", st.valid)
+        assertEquals(renewed, st.exp)
+    }
+
+    /**
+     * The cancel rule (SDK 4.0.2): a lease request that the client's close ends is never a failed attempt.
+     * An open in the grace whose lease request gets no answer; the client closes (it waits its 3 s and returns), then the
+     * request fails. No failure is in the row and no backoff waits, and a restart asks at once. Before the fix close()
+     * interrupted the request, which was told to the Core as unreachable and written as a failure with its backoff.
+     */
+    @Test
+    fun aRenewalThatCloseCancelsIsNoFailedAttempt() {
+        val s = install()
+        Held(s, answers = false).also { h ->
+            val open = background("open") { s.open() }
+            assertTrue(h.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            val t0 = System.nanoTime()
+            s.l.close()
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            h.release.countDown()
+            open.join(15_000)
+            assertTrue("close() waited at most its 3 s: $ms ms", ms < 6_000)
+        }
+        val r = s.l.record!!
+        val asked = s.api.seen.count { it == "model-key" }
+        val again = s.restart(offline = false)
+        assertTrue("the next start may ask at once", again.l.refreshDue())
+        assertTrue(again.open().tick().valid)
+        assertEquals("the next start asked", asked + 1, s.api.seen.count { it == "model-key" })
+        assertEquals("no failure in the row after the cancelled request", 0, r.failures)
+        assertEquals("no backoff after the cancelled request", 0L, r.nextTryMs)
+    }
+
+    /**
+     * Process death right after a renewal (only the Core's own save helps there: qlc_lease_accept saves the state before
+     * it returns, and lease.json follows on the same thread): nothing is closed, and a restart offline opens the renewed
+     * lease. Holds before the fix too.
+     */
+    @Test
+    fun aRenewalIsKeptWithoutAnyClose() {
+        val s = refreshDueInstall()
+        s.l.refreshIfDue(s.pb.target, s.pb::roots)
+        val renewed = s.expNow()
+        // the process ends here: nothing is closed, and the next process makes its Core from what was saved
+        val st = s.restart(offline = true, registry = CoreRegistry()).open().tick()
+        assertTrue(st.valid)
+        assertEquals(renewed, st.exp)
+    }
+
+    /**
+     * A new client of the folder after close() while the closed client's attempt still holds the answer (SDK
+     * 4.0.2, the same design as the Apple SDK's): the closed client returns from close() after its 3 s, a new client
+     * starts, then the answer comes. The new client shares the live Core, the late lease goes into it and is kept, and a
+     * restart offline opens it. Before the fix the new client made a second Core over the old state, the late answer met
+     * a destroyed Core, and the refreshed lease was lost.
+     */
+    @Test
+    fun aNewClientAfterCloseKeepsTheClosedClientsLateLease() {
+        val s = refreshDueInstall()
+        val held = Held(s)
+        val refresh = background("refresh") { s.l.refreshIfDue(s.pb.target, s.pb::roots) }
+        assertTrue(held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val renewed = s.expNow()
+        s.l.close()
+        val b = s.restart(offline = true)
+        val core = b.l.core()!!
+        held.release.countDown()
+        refresh.join(10_000)
+        assertEquals("the new client's Core has the late lease", renewed, core.tick().exp)
+        b.l.close()
+        val st = s.restart(offline = true).open().tick()
+        assertTrue(st.valid)
+        assertEquals(renewed, st.exp)
+    }
+
+    /** The same in the grace: a model open past exp whose renewal is held, close(), a new client, then the answer. */
+    @Test
+    fun aNewClientAfterCloseKeepsTheClosedClientsLateLeaseInGrace() {
+        val s = install()
+        val held = Held(s)
+        val open = background("open") { s.open() }
+        assertTrue(held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val renewed = s.expNow()
+        s.l.close()
+        val b = s.restart(offline = true)
+        val core = b.l.core()!!
+        held.release.countDown()
+        open.join(15_000)
+        assertEquals("the new client's Core has the late lease", renewed, core.tick().exp)
+        assertTrue(core.tick().valid)
+        b.l.close()
+        val st = s.restart(offline = true).open().tick()
+        assertTrue("the renewed lease opens offline, not the grace", st.valid)
+        assertEquals(renewed, st.exp)
+    }
+
+    /** Two clients of one folder made back to back share one Core (the registry of the process). */
+    @Test
+    fun twoClientsOfOneFolderShareOneCore() {
+        val s = install(past = false)
+        val b = s.restart(offline = true)
+        assertSame(s.l.core(), b.l.core())
+    }
+
+    /** The shared Core goes with its last holder, and a client made after that makes a new one from the saved state. */
+    @Test
+    fun theSharedCoreGoesWithItsLastHolder() {
+        val s = install(past = false)
+        val b = s.restart(offline = true)
+        val shared = s.l.core()!!
+        assertSame(shared, b.l.core())
+        s.l.close()
+        assertTrue("one holder left: the Core lives", shared.tick().valid)
+        b.l.close()
+        assertFalse("its last holder let go", CoreRegistry.PROCESS.live(shared))
+        val c = s.restart(offline = true)
+        val fresh = c.l.core()!!
+        assertNotSame(shared, fresh)
+        assertTrue("the new Core has the saved lease", fresh.tick().valid)
+    }
+
+    /**
+     * The monotonic save: a lease the server issued before the one in force never replaces it, in the Core or in
+     * lease.json. A closed client's renewal is held (its lease issued then); a new client of the folder takes a newer
+     * one a minute later; then the older answer comes. The newer lease stays, and lease.json names it.
+     */
+    @Test
+    fun anOlderLeaseNeverReplacesANewerOne() {
+        val s = refreshDueInstall()
+        val held = Held(s)
+        val refresh = background("refresh") { s.l.refreshIfDue(s.pb.target, s.pb::roots) }
+        assertTrue(held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val older = s.expNow()
+        s.l.close()
+        val b = s.restart(offline = false)
+        s.clock.pass(60_000)
+        val newer = s.expNow()
+        b.l.request(b.pb.target, b.pb::roots)
+        assertEquals(newer, b.l.core()!!.tick().exp)
+        held.release.countDown()
+        refresh.join(10_000)
+        assertEquals("the Core keeps the newer lease (the older one's exp: $older)", newer, b.l.core()!!.tick().exp)
+        assertEquals("lease.json names the newer lease", newer, b.l.record!!.exp)
+        b.l.close()
+        assertEquals(newer, s.restart(offline = true, registry = CoreRegistry()).open().tick().exp)
+    }
+
+    /**
+     * A deliberate clear is never held back by the monotonic save (SDK 4.0.2): a stored valid lease, then
+     * Quran Lab's signed stop at its renewal. lease.json is gone, the Core holds no lease, and a restart offline does
+     * not open the model.
+     */
+    @Test
+    fun aStopClearsTheLeaseWhateverItsIssueTime() {
+        val s = refreshDueInstall()
+        assertTrue(s.l.record!!.iat > 0)
+        s.api.script = listOf(mapOf("route" to "model-key", "status" to 401.0, "body" to "json", "core" to "stop"))
+        var stopped = false
+        s.l.refreshIfDue(s.pb.target, s.pb::roots) { f -> stopped = f.stopped }
+        assertTrue("the stop verified", stopped)
+        assertNull("lease.json is gone", s.l.record)
+        assertFalse(s.l.core()!!.tick().hasLease)
+        s.l.close()
+        val r = s.restart(offline = true, registry = CoreRegistry())
+        try {
+            r.open()
+            fail("a stopped lease opened offline")
+        } catch (_: LeaseFailure) {
+        }
+        assertFalse(r.l.core()!!.tick().hasLease)
+        assertNull(r.l.record)
+    }
+
+    /**
+     * A lease save started before a stop never lands after it (SDK 4.0.2, the web SDK's race too): one request's
+     * answer is in hand and its save is held just before the Core takes the lease; a second request gets Quran Lab's
+     * signed stop, which clears the lease; then the held save goes on. The lease stays cleared, and a restart offline
+     * does not open the model. Before the fix the held save could put the lease back.
+     */
+    @Test
+    fun aSaveStartedBeforeAStopNeverPutsTheLeaseBack() {
+        val s = refreshDueInstall()
+        val inSave = java.util.concurrent.CountDownLatch(1)
+        val go = java.util.concurrent.CountDownLatch(1)
+        val held = s.pb.target { _ -> inSave.countDown(); go.await(10, java.util.concurrent.TimeUnit.SECONDS) }
+        val first = background("save") { s.l.request(held, s.pb::roots) }
+        assertTrue(inSave.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        s.api.script = listOf(mapOf("route" to "model-key", "status" to 401.0, "body" to "json", "core" to "stop"))
+        val stop = try { s.l.request(s.pb.target, s.pb::roots); null } catch (f: LeaseFailure) { f }
+        assertTrue("the stop verified", stop?.stopped == true)
+        go.countDown()
+        first.join(10_000)
+        assertNull("lease.json stays cleared", s.l.record)
+        assertFalse("the Core holds no lease", s.l.core()!!.tick().hasLease)
+        s.l.close()
+        val r = s.restart(offline = true, registry = CoreRegistry())
+        try {
+            r.open()
+            fail("the model opened offline after a stop")
+        } catch (_: LeaseFailure) {
+        }
+    }
+
+    /**
+     * The native guard on its own (SDK 4.0.2: no use-after-free): 300 times, four threads call tick() and
+     * grace() on one Core in a loop while its last holder closes it. Every call either returns or fails with E_CLOSED
+     * (the SDK's error, never a crash), a call after the close is E_CLOSED, and a second close does nothing. Under
+     * ASan on CI too (the bridge instrumented). Not run on the code before the fix: there a destroy under a call can
+     * crash the JVM.
+     */
+    @Test
+    fun theCoreClosesUnderCallsInFlightWithNoUseAfterFree() {
+        val random = java.util.Random(17)
+        val bad = java.util.Collections.synchronizedList(ArrayList<String>())
+        var calls = 0L
+        val counted = java.util.concurrent.atomic.AtomicLong()
+        for (round in 0 until 300) {
+            val s = install(past = false)
+            val core = s.l.core()!!
+            val callers = (0 until 4).map { k ->
+                Thread({
+                    while (true) {
+                        try {
+                            if (k % 2 == 0) core.tick() else core.grace()
+                            counted.incrementAndGet()
+                        } catch (e: ai.quranlab.tajweedformer.core.CoreException) {
+                            if (e.status != Core.E_CLOSED) bad += "$round/$k: ${e.message}"
+                            break
+                        } catch (t: Throwable) {
+                            bad += "$round/$k: $t"
+                            break
+                        }
+                    }
+                }, "caller-$round-$k").apply { isDaemon = true; start() }
+            }
+            Thread.sleep(random.nextInt(4).toLong())
+            s.l.close()
+            callers.forEach { it.join(10_000) }
+            if (callers.any { it.isAlive }) bad += "$round: a caller still running"
+            try {
+                core.tick()
+                bad += "$round: a call after close went through"
+            } catch (e: ai.quranlab.tajweedformer.core.CoreException) {
+                if (e.status != Core.E_CLOSED) bad += "$round: after close: ${e.message}"
+            }
+            core.close()
+            clients -= s.l
+            s.dir.deleteRecursively()
+            dirs -= s.dir
+        }
+        calls = counted.get()
+        println("the Core closed under 4 callers 300 times: $calls calls returned, ${bad.size} bad")
+        assertEquals(emptyList<String>(), bad.take(20))
+    }
+
+    /**
+     * The stress (SDK 4.0.2): 1,000 times, close() races a lease attempt held in flight, by turns the
+     * background refresh, a model open in the grace and an app's first lease (ensure()), the answer released 0 to 20 ms
+     * after close() began. Each time the lease the attempt brought is the one a restart offline opens (0 lost), and
+     * nothing crashes: the JVM lives, no thread ends in an exception but the attempt's own LeaseFailure, and no thread
+     * ends uncaught.
+     */
+    @Test
+    fun closeRacesALeaseAttemptInFlight1000Times() {
+        val random = java.util.Random(11)
+        val unexpected = java.util.Collections.synchronizedList(ArrayList<String>())
+        val uncaught = java.util.concurrent.atomic.AtomicInteger()
+        val before = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e -> uncaught.incrementAndGet(); System.err.println("uncaught in ${t.name}: $e") }
+        var lost = 0
+        val kinds = IntArray(3)
+        try {
+            for (i in 0 until 1000) {
+                val kind = i % 3
+                kinds[kind]++
+                val s = when (kind) {
+                    0 -> refreshDueInstall()
+                    1 -> install()
+                    else -> install(leased = false)
+                }
+                val held = Held(s)
+                val attempt = Thread({
+                    try {
+                        if (kind == 0) s.l.refreshIfDue(s.pb.target, s.pb::roots) else s.open()
+                    } catch (_: LeaseFailure) {
+                    } catch (t: Throwable) {
+                        unexpected += "$i/$kind: $t"
+                    }
+                }, "attempt-$i").apply { isDaemon = true; start() }
+                if (!held.arrived.await(10, java.util.concurrent.TimeUnit.SECONDS)) { unexpected += "$i/$kind: no request"; continue }
+                val renewed = s.expNow()
+                val closing = Thread({ try { s.l.close() } catch (t: Throwable) { unexpected += "$i/close: $t" } }, "close-$i")
+                    .apply { isDaemon = true; start() }
+                Thread.sleep(random.nextInt(21).toLong())
+                held.release.countDown()
+                closing.join(10_000)
+                attempt.join(15_000)
+                if (closing.isAlive || attempt.isAlive) unexpected += "$i/$kind: still running"
+                val r = s.restart(offline = true)
+                val st = try { r.open().tick() } catch (_: LeaseFailure) { null }
+                if (st == null || !st.valid || st.exp != renewed) {
+                    lost++
+                    System.err.println("lost $i/$kind: ${st?.valid} ${st?.exp} want $renewed")
+                }
+                r.l.close()
+                clients -= s.l
+                clients -= r.l
+                s.dir.deleteRecursively()
+                dirs -= s.dir
+            }
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(before)
+        }
+        println("close raced a lease attempt 1000 times (refresh ${kinds[0]}, grace ${kinds[1]}, ensure ${kinds[2]}): lost $lost, " +
+            "unexpected ${unexpected.size}, uncaught ${uncaught.get()}")
+        assertEquals(emptyList<String>(), unexpected.take(20))
+        assertEquals("uncaught", 0, uncaught.get())
+        assertEquals("leases lost", 0, lost)
     }
 }

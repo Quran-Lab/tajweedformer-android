@@ -469,11 +469,12 @@ internal class OggFlacWriter @JvmOverloads constructor(
             segment++
             segmentFrames = 0
             val f = segmentFile(segment)
-            out = try { FileOutputStream(f) } catch (e: IOException) {
+            out = try { ShareFiles.writing(f.name); FileOutputStream(f) } catch (e: IOException) {
                 throw SharingException("storage", "cannot create ${f.name}: ${e.message}")
             }
         }
         try {
+            ShareFiles.writing(segmentFile(segment).name)
             out!!.write(d)
         } catch (e: IOException) {
             throw SharingException("storage", "cannot write ${segmentFile(segment).name}: ${e.message}")

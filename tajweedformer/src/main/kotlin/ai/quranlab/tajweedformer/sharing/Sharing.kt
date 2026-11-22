@@ -660,7 +660,6 @@ internal class Sharing internal constructor(private val cloud: QuranLabCloud) {
             }
         }
         override fun invalidateToken() { cloud.tokens?.invalidate() }
-        override fun networkAllowed(): Boolean = !cloud.options.uploadsOnUnmeteredOnly || env.unmetered()
         override fun uploaded(id: String) { if (state.takeThanks()) prompts?.invoke(SheetRequest.Thanks) }
         override fun contributorRevoked() { contributor.reset() }
         override fun contributorReadable(): Boolean = !contributor.lost()

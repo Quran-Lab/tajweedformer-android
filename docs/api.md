@@ -11,7 +11,7 @@ public class TajweedClient
     public val sharing: TajweedSharing
     public val analytics: TajweedAnalytics
     public suspend fun model(version: String? = null): TajweedModel
-    public suspend fun prefetch(unmeteredOnly: Boolean = false, onProgress: ((done: Long, total: Long) -> Unit)? = null): Unit
+    public suspend fun prefetch(onProgress: ((done: Long, total: Long) -> Unit)? = null): Unit
     public val storage: Map<String, Any>
     public suspend fun removeModels(): Unit
     public suspend fun diagnose(): TajweedDiagnosis
@@ -28,7 +28,6 @@ public class TajweedClientOptions
     public val appId: String?
     public val appVersion: String?
     public val storage: File?
-    public val unmeteredOnly: Boolean
     public val appBuild: String?
 public class TajweedSessionOptions
     public val context: String?
@@ -240,6 +239,14 @@ public open class TajweedError
     public val code: String,
     public val fix: String
     public val docs: String
+    public val errorCause: TajweedErrorCause?
+public data class TajweedErrorCause
+    public val stage: String,
+    public val reason: String,
+    public val httpStatus: Int?
+    public val errorName: String?
+    public val errorCode: String?
+    public val needs: String?
 ```
 
 ```kotlin

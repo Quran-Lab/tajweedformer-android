@@ -137,22 +137,28 @@ internal class Failover(val role: String, val from: String, val to: String?, val
 
 /** One host's answer to a request of [Endpoints.request]: it ends the request ([value], [cls]), or the host was unreachable. */
 internal class HostAnswer<out T> private constructor(val cls: AnswerClass, val value: T?, val failure: Throwable?, val reason: String?,
-                                                    val status: Int?, val retryAfter: Int?) {
+                                                    val status: Int?, val retryAfter: Int?,
+                                                    /** The host was asked (a request went out); false: a path held there (28.11 item 2). */
+                                                    val asked: Boolean) {
     companion object {
-        fun <T> ends(cls: AnswerClass, value: T): HostAnswer<T> = HostAnswer(cls, value, null, null, null, null)
+        /** [asked] false: the answer is a held one (a held 429, 28.11 item 2), given without a request to the host. */
+        fun <T> ends(cls: AnswerClass, value: T, asked: Boolean = true): HostAnswer<T> = HostAnswer(cls, value, null, null, null, null, asked)
 
         /** Unreachable: the answer [value] or the error [failure] is the request's when this host was the first and every
-         *  host was unreachable; [reason] its 24.3 reason (network, timeout, http, redirect, invalid_answer). */
-        fun <T> unreachable(value: T?, failure: Throwable?, reason: String, status: Int?, retryAfter: Int? = null): HostAnswer<T> =
-            HostAnswer(AnswerClass.UNREACHABLE, value, failure, reason, status, retryAfter)
+         *  host was unreachable; [reason] its 24.3 reason (network, timeout, http, redirect, invalid_answer). [asked] false:
+         *  the host was not asked (a path held there), and no `failover` report names it (28.7). */
+        fun <T> unreachable(value: T?, failure: Throwable?, reason: String, status: Int?, retryAfter: Int? = null, asked: Boolean = true): HostAnswer<T> =
+            HostAnswer(AnswerClass.UNREACHABLE, value, failure, reason, status, retryAfter, asked)
     }
 }
 
 /** What a request across the hosts came to: the answer that ended it ([by] its host), or the first host's when every host
- *  was unreachable ([by] null), the hosts asked, and then the largest Retry-After any host gave (28.5). */
-internal class Asked<out T>(val answer: HostAnswer<T>, val asked: List<String>, val by: String?, val retryAfterMax: Int?) {
-    /** 28.7: more than one host was asked. */
-    val fallback: Boolean get() = asked.size > 1
+ *  was unreachable ([by] null), the hosts in the order they were taken, and then the largest Retry-After any host gave
+ *  (28.5). [requested]: the hosts a request went to (a model file's path held on a host is not asked there, 28.11 item 2). */
+internal class Asked<out T>(val answer: HostAnswer<T>, val asked: List<String>, val by: String?, val retryAfterMax: Int?,
+                            val requested: List<String> = asked) {
+    /** 28.7: more than one host was asked (a request went to each). */
+    val fallback: Boolean get() = requested.size > 1
 }
 
 /**
@@ -171,6 +177,21 @@ internal class Endpoints(
 
     /** A request ended on another host after its first host was unreachable (28.7: the silent `<stage>`, `failover`). */
     @Volatile var onFailover: (Failover) -> Unit = {}
+
+    /** 34.6: where the counts of each model request to a `models` host go (the Client's telemetry); null: nowhere. */
+    @Volatile var meter: ModelHostMeter? = null
+
+    /** 28.11 items 2 and 3: the holds of model files per path and host (the Client's, kept across restarts); null: none. */
+    @Volatile var holds: RouteHolds? = null
+
+    /** One model request to [host] for [path] (the URL's path): measured (34.6) and held (28.11 item 2), or null (then
+     *  nothing holds it, and the request goes out). [sent]: the request went out to the host. */
+    fun tap(host: String, path: String?, lastByte: (String) -> Unit = {}, sent: () -> Unit = {}): HostTap? {
+        val m = meter
+        val h = holds
+        if (m == null && (h == null || path == null)) return null
+        return HostTap(m, host, lastByte, h, path?.let { RouteHolds.modelKey(host, it) }, sent)
+    }
 
     @Volatile var lastFailover: Failover? = null
         private set
@@ -203,22 +224,25 @@ internal class Endpoints(
         val (order0, probe) = role.order(clock())
         val order = if (first != null && first !in role.hosts) listOf(first) + order0 else order0
         val asked = ArrayList<String>()
+        val requested = ArrayList<String>()
         var head: HostAnswer<T>? = null
         var retryAfter: Int? = null
         for (h in order) {
             asked += h
             val a = ask(h, origin(h))
+            if (a.asked) requested += h
             if (a.cls != AnswerClass.UNREACHABLE) {
                 role.settle(h, clock(), probe)
-                head?.let { f -> failedOver(Failover(role.name, asked[0], h, f.reason ?: "network", f.status, clock() / 1000, stage)) }
-                return Asked(a, asked, h, null)
+                // 28.7: a report needs the first host asked and the host it ended on asked (not a held 429's answer)
+                head?.let { f -> failedOver(Failover(role.name, asked[0], h, f.reason ?: "network", f.status, clock() / 1000, stage), report = f.asked && a.asked) }
+                return Asked(a, asked, h, null, requested)
             }
             if (head == null) head = a
             a.retryAfter?.let { r -> retryAfter = maxOf(retryAfter ?: 0, r) }
         }
         val f = head!!
         failedOver(Failover(role.name, asked[0], null, f.reason ?: "network", f.status, clock() / 1000, stage))
-        return Asked(f, asked, null, retryAfter)
+        return Asked(f, asked, null, retryAfter, requested)
     }
 
     /** The host that ended a model file's attempts (28.4: each resume of 16.2 on the next host) becomes `P`. */
@@ -226,11 +250,12 @@ internal class Endpoints(
 
     /**
      * A request whose first host was unreachable: noted for diagnose(), and when another host ended it ([Failover.to]),
-     * the silent `failover` report of its stage.
+     * the silent `failover` report of its stage. [report] false: the first host, or the host the request ended on, was not
+     * asked (a model file's path held there, 28.11 item 2), and no report goes out (28.7: both were asked).
      */
-    fun failedOver(f: Failover) {
+    fun failedOver(f: Failover, report: Boolean = true) {
         lastFailover = f
-        if (f.to != null && f.stage in FAILOVER_STAGES) try { onFailover(f) } catch (_: Exception) {}
+        if (report && f.to != null && f.stage in FAILOVER_STAGES) try { onFailover(f) } catch (_: Exception) {}
     }
 
     companion object {

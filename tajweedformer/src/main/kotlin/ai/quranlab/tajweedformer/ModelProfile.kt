@@ -7,8 +7,8 @@ package ai.quranlab.tajweedformer
  * - [cpu]: the exact engine, on every device and always first: every `required` file whose context is
  *   `*` or the chosen context, for platform `android`. About 56.5 MB of transport for c16_l64.
  * - [npu]: the optional `npu-*` files for this device's SoC and the chosen context (the model, its
- *   I/O contract, its mask table); downloaded only on an unmetered network after the CPU path passed
- *   its self-test. A chained build (the Exynos 2500) has its parts (`npu-part`, one file each, run in the
+ *   I/O contract, its mask table); downloaded in the background after the model opened, when the lease allows
+ *   accelerator programs, on any network (SDK 4.0.2). A chained build (the Exynos 2500) has its parts (`npu-part`, one file each, run in the
  *   order io.json's `parts` gives) in place of the one `npu-model`.
  *
  * NPU builds ship at c16_l64 only (LAYOUT.md "NPU builds"); another context has no `npu-*` files, so [npu]

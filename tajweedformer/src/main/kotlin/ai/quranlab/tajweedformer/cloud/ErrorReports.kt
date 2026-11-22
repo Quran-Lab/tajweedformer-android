@@ -190,6 +190,10 @@ internal object ErrorRules {
         return "download_failed"
     }
 
+    /** 24.13 item 3: what a `needs_connection` waits for, from 24.4's [onDevice] of the files the call needs: `lease`
+     *  when every one is on the device (`complete`), else `model`. */
+    fun needs(onDevice: String): String = if (onDevice == "complete") "lease" else "model"
+
     /** 24.1: never the app's own misuse, never a silent plain network failure. */
     fun reported(stage: String, reason: String, code: String): Boolean =
         code !in CODES_NOT_REPORTED && !(code == "none" && reason == "network")

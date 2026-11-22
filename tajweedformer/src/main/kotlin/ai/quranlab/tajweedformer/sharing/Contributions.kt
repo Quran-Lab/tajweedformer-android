@@ -49,8 +49,6 @@ internal interface SharingGate {
     fun uploadToken(): String
     /** The token was refused (401): the next [uploadToken] gets a new one. */
     fun invalidateToken()
-    /** The network may be used now (the developer's "unmetered only" option). */
-    fun networkAllowed(): Boolean = true
     /** The first session of this learner reached Quran Lab's storage (the thank-you). */
     fun uploaded(id: String) {}
     /** The contributor id was revoked on the server (deleted from elsewhere): a new one from now on. */
@@ -185,6 +183,7 @@ internal class ShareCapture(
                     folder.mkdirs()
                     // the form is decided once, when the recording starts, and holds for the whole of it (19.3)
                     val lossless = sampleRate != OggOpusWriter.RATE && sampleRate in 8_000..192_000 && flac(sampleRate)
+                    ShareFiles.writing(ShareFiles.SESSION)
                     File(folder, ShareFiles.SESSION).writeBytes(session(sampleRate, route, lossless))
                     rate = sampleRate
                     if (lossless) {
@@ -287,9 +286,18 @@ internal class ShareCapture(
         writer?.abandon()
         writer = null
         failed = true
-        // segments already handed over stay with the outbox only while sharing is on
-        if (segments == 0 || off || !stillOn()) folder.deleteRecursively() else ShareFiles.recover(folder)
-        release()
+        try {
+            // segments already handed over stay with the outbox only while sharing is on
+            if (segments == 0 || off || !stillOn()) folder.deleteRecursively() else ShareFiles.recover(folder)
+        } catch (_: Exception) {
+            // section 29.1: the recovery's own writes failed too (the disk is still full): the recording stays as the
+            // capture last wrote it, not ended, and its finished segments are never deleted for it
+        } finally {
+            // no longer written in this process, whatever the recovery did: the next upload pass (or launch) takes it
+            // for a crash and recovers it. 4.0.1 left it here as being written when the recovery threw, so this
+            // process never sent it and the throw ended the encoder's thread
+            release()
+        }
     }
 
     private fun release() { ACTIVE.remove(id) }
@@ -386,6 +394,9 @@ internal class ContributionOutbox internal constructor(
     /** Called when a segment closed or a session ended (Android: schedule the WorkManager job). */
     private val onWork: () -> Unit = {},
 ) {
+    /** 28.10 (SDK 4.0.2): the uploads route (`/v1/uploads` and its PUTs) after a 429: no request of it before its wait. */
+    internal val slowDown = ai.quranlab.tajweedformer.cloud.SlowDown(clock, api.holds, "sharing_uploads")
+
     internal class Record(
         val id: String,
         var seq: Int = 0,
@@ -647,6 +658,8 @@ internal class ContributionOutbox internal constructor(
             records.values.filter { it.waiting && (ignoringBackoff || it.due <= now) }.sortedBy { it.seq }.map { it.id }
         }
         if (due.isEmpty()) return true
+        // 28.10: the uploads route waits out a 429 (its Retry-After, or the doubling wait), an explicit retry too
+        if (!slowDown.allowed()) return true
         if (!gate.uploadsAllowed()) {
             for (id in due) note(id, "sharing is not allowed here now; waiting")
             return true
@@ -656,7 +669,6 @@ internal class ContributionOutbox internal constructor(
             for (id in due) note(id, "the contributor cannot be read now; waiting")
             return true
         }
-        if (!gate.networkAllowed()) return true
         for (id in due) {
             if (!mayGoOn()) return true
             val token = try {
@@ -719,6 +731,7 @@ internal class ContributionOutbox internal constructor(
             if (halted()) return true
             rec = synchronized(records) { records[id] } ?: return true
             if (rec.state != "active") return true
+            val slow = slowDown.answered(r.status, r.retryAfter)
             if (r.ok) {
                 rec.uploaded.add(name)
                 rec.urls.remove(m.n)
@@ -732,7 +745,7 @@ internal class ContributionOutbox internal constructor(
                 rec.attempts++
                 if (r.status == 403) rec.urls.remove(m.n)
                 save(rec)
-                retry(id, "PUT $name: HTTP ${r.status}", immediately = r.status == 403 && rec.attempts < 5)
+                retry(id, "PUT $name: HTTP ${r.status}", immediately = r.status == 403 && rec.attempts < 5, atLeastMs = slow)
                 return true
             }
         }
@@ -801,8 +814,10 @@ internal class ContributionOutbox internal constructor(
         rec = synchronized(records) { records[id] } ?: return true
         if (rec.takes != TAKES_PENDING) return true
         val e = r.error
+        val slow = slowDown.answered(r.status, r.retryAfter)
         when {
             r.ok -> endTakes(rec, TAKES_SENT)
+            r.status == 429 -> retryTakes(id, atLeastMs = slow)
             r.status == 401 || e.action == ErrorAction.NEW_TOKEN -> {
                 gate.invalidateToken()
                 retryTakes(id, immediately = rec.takesAttempts < 3)
@@ -842,11 +857,11 @@ internal class ContributionOutbox internal constructor(
         save(rec)
     }
 
-    private fun retryTakes(id: String, immediately: Boolean = false, longWait: Boolean = false) {
+    private fun retryTakes(id: String, immediately: Boolean = false, longWait: Boolean = false, atLeastMs: Long = 0) {
         val rec = synchronized(records) { records[id] } ?: return
         // a list that was dropped meanwhile (sharing went off) is not put back in line
         if (rec.takes != TAKES_PENDING) return
-        rec.takesNextAttempt = clock() + delayMs(rec.takesAttempts, immediately, longWait)
+        rec.takesNextAttempt = clock() + maxOf(delayMs(rec.takesAttempts, immediately, longWait), atLeastMs)
         save(rec)
     }
 
@@ -879,10 +894,13 @@ internal class ContributionOutbox internal constructor(
             return null
         }
         if (halted()) return null
+        val slow = slowDown.answered(r.status, r.retryAfter)
         if (r.ok) return r
         if (networkFailure(r.status)) ladder.uploadFailed()
         val e = r.error
         val rec = synchronized(records) { records[id] }
+        // 28.10: a 429 waits the route's wait (its Retry-After, 300 s when none, doubling in a row), never less
+        if (r.status == 429) { retry(id, e.toString(), atLeastMs = slow); return null }
         // a request timeout is the network's, not a refusal: tried again with the backoff
         if (r.status == 408) { retry(id, e.toString()); return null }
         when (e.action) {
@@ -943,10 +961,10 @@ internal class ContributionOutbox internal constructor(
         for (f in File(root, id).listFiles() ?: emptyArray()) if (f.name.endsWith(ShareFiles.OPUS) || f.name.endsWith(ShareFiles.FLAC)) f.delete()
     }
 
-    private fun retry(id: String, why: String, immediately: Boolean = false, longWait: Boolean = false) {
+    private fun retry(id: String, why: String, immediately: Boolean = false, longWait: Boolean = false, atLeastMs: Long = 0) {
         val rec = synchronized(records) { records[id] } ?: return
         rec.lastError = why
-        rec.nextAttempt = clock() + delayMs(rec.attempts, immediately, longWait)
+        rec.nextAttempt = clock() + maxOf(delayMs(rec.attempts, immediately, longWait), atLeastMs)
         save(rec)
     }
 

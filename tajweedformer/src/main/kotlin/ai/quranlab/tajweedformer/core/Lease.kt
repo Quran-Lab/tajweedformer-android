@@ -71,16 +71,78 @@ internal data class LeaseRecord(
     /** Refreshes that failed in a row, and when the next one may run (ms, this device's clock). */
     val failures: Int = 0,
     val nextTryMs: Long = 0,
+    /** The lease's issue time (the answer's `iat`, server seconds; 0 in a record of SDK 4.0.1): a record never gives way
+     *  to one whose lease the server issued before it. */
+    val iat: Long = 0,
 ) {
     fun json(): Map<String, Any?> = linkedMapOf("build" to build, "base" to base, "exp" to exp, "refresh_after" to refreshAfter,
-        "failures" to failures, "next_try_ms" to nextTryMs)
+        "failures" to failures, "next_try_ms" to nextTryMs, "iat" to iat)
 
     companion object {
         fun of(o: Map<*, *>?): LeaseRecord? {
             o ?: return null
             return LeaseRecord(o["build"] as? String ?: return null, o["base"] as? String, (o["exp"] as? Double)?.toLong() ?: 0,
-                (o["refresh_after"] as? Double)?.toLong() ?: 0, (o["failures"] as? Double)?.toInt() ?: 0, (o["next_try_ms"] as? Double)?.toLong() ?: 0)
+                (o["refresh_after"] as? Double)?.toLong() ?: 0, (o["failures"] as? Double)?.toInt() ?: 0, (o["next_try_ms"] as? Double)?.toLong() ?: 0,
+                (o["iat"] as? Double)?.toLong() ?: 0)
         }
+    }
+}
+
+/**
+ * One Core per storage folder and install key in the process (the design approved for Apple and Android, 2026-11-22). A
+ * lease client takes the live Core of its folder and key while any holder still has it (an open client, an attempt in
+ * flight of a client that closed), so a new client never makes a second Core over the same saved state, and the late
+ * answer of a closed client's attempt goes into the Core the new client uses. The Core is destroyed when its last holder
+ * lets go ([Core.close]: after its calls in flight). A test makes a registry of its own for another process.
+ */
+internal class CoreRegistry {
+    private class Entry(val core: Core, var holds: Int)
+    private val entries = HashMap<String, Entry>()
+    private val folderLocks = HashMap<String, Any>()
+    private val clears = HashMap<String, Long>()
+
+    /** The live Core of [dir] and [key] with one hold more, or a new one from [make] (its first hold). */
+    fun hold(dir: File, key: AgreementKey, make: () -> Core): Core = synchronized(this) {
+        val k = name(dir) + "|" + key.alias
+        entries[k]?.let { e -> e.holds++; return e.core }
+        make().also { entries[k] = Entry(it, 1) }
+    }
+
+    /** One hold more of [core], when it is still live (false: its last holder let it go). */
+    fun retain(core: Core): Boolean = synchronized(this) {
+        val e = entries.values.firstOrNull { it.core === core } ?: return false
+        e.holds++
+        true
+    }
+
+    /** One hold less of [core]; the last one destroys it, waiting at most [waitMs] on this thread ([Core.close]). */
+    fun release(core: Core, waitMs: Long = Core.CLOSE_WAIT_MS) {
+        synchronized(this) {
+            val e = entries.entries.firstOrNull { it.value.core === core } ?: return
+            if (--e.value.holds > 0) return
+            entries.remove(e.key)
+        }
+        core.close(waitMs)
+    }
+
+    /** Whether [core] is still live here (tests). */
+    fun live(core: Core): Boolean = synchronized(this) { entries.values.any { it.core === core } }
+
+    /** The lock of [dir]'s lease files: lease.json is read, compared and written under it, by every client of the folder. */
+    fun folderLock(dir: File): Any = synchronized(this) { folderLocks.getOrPut(name(dir)) { Any() } }
+
+    /** How many clears of [dir]'s lease (a stop) this process has made: a lease answer to a request that went out
+     *  before the last one is never accepted. */
+    fun clears(dir: File): Long = synchronized(this) { clears[name(dir)] ?: 0 }
+
+    /** A clear of [dir]'s lease (under the folder's lock). */
+    fun cleared(dir: File) = synchronized(this) { clears[name(dir)] = (clears[name(dir)] ?: 0) + 1 }
+
+    private fun name(dir: File): String = try { dir.canonicalPath } catch (_: Exception) { dir.absoluteFile.normalize().path }
+
+    companion object {
+        /** The process's registry. */
+        @JvmField val PROCESS = CoreRegistry()
     }
 }
 
@@ -127,7 +189,7 @@ internal class LeaseClient(
     /** An issue for Quran Lab (`kind`, `code`): an SDK bug the server named (400 `invalid_body`, `install_sig_invalid`). */
     private val report: (String, String) -> Unit = { _, _ -> },
     /** A lease refresh ended: null ok, else the failure's kind (17.8 `lease`). */
-    private val leaseEvent: (String?) -> Unit = {},
+    leaseEvent: (String?) -> Unit = {},
     private val bootId: ByteArray = ByteArray(32),
     private val clock: () -> Long = System::currentTimeMillis,
     /** Tests: the Core's clocks come from [hostClock] (wall ms, boot ms). */
@@ -140,6 +202,10 @@ internal class LeaseClient(
      *  of this process serves the next open with no request (60 s). Tests shorten them. */
     private val graceWaitMs: Long = 10_000,
     private val graceReuseMs: Long = 60_000,
+    /** 18.4.7.3: the random source of the backoff's drawn waits (uniform in [0, 1)); tests fix it. */
+    private val random: () -> Double = { java.util.concurrent.ThreadLocalRandom.current().nextDouble() },
+    /** Where the Core of this folder and key is shared ([CoreRegistry.PROCESS]; a test's own for another process). */
+    private val registry: CoreRegistry = CoreRegistry.PROCESS,
 ) : AutoCloseable {
     private val lock = Any()
     private val certFile = File(dir, "install_cert.txt")
@@ -149,6 +215,23 @@ internal class LeaseClient(
     private val playRetryFile = File(dir, "play_retry")
     private var core: Core? = null
     @Volatile private var modelsOpen = 0
+
+    private val onLeaseEvent = leaseEvent
+
+    /** A lease attempt ended: told to the Client (17.8 `lease`), except a failure that [close] caused (never a failed
+     *  attempt). */
+    private fun leaseEvent(kind: String?) {
+        if (kind != null && closing) return
+        onLeaseEvent(kind)
+    }
+
+    /** [close] has waited for the attempt in flight and cancels what is left: an attempt that ends from here was
+     *  cancelled by it, never a failed attempt (no outcome told to the Core, no row of 18.4.7.3, no failure event). */
+    @Volatile private var closing = false
+
+    /** [close] has run: no Core is made again. */
+    @Volatile private var closed = false
+    private var closeStarted = false
 
     val cert: InstallCert? get() = InstallCert.parse(try { certFile.readText() } catch (_: Exception) { null })
 
@@ -160,14 +243,26 @@ internal class LeaseClient(
             null
         }
 
-    private fun saveRecord(r: LeaseRecord?) {
+    /** The lock of this folder's lease files, shared by every client of the folder ([CoreRegistry.folderLock]). */
+    private val folderLock: Any = registry.folderLock(dir)
+
+    /**
+     * lease.json, read, compared and written whole under the folder's lock: a record never replaces one whose lease the
+     * server issued later ([LeaseRecord.iat]; another client of the folder took a newer one), unless [accepted] (the
+     * Core holds this one now). Null removes it. Whether it was written.
+     */
+    private fun saveRecord(r: LeaseRecord?, accepted: Boolean = false): Boolean = synchronized(folderLock) {
         try {
-            if (r == null) { leaseFile.delete(); return }
+            if (r == null) { leaseFile.delete(); return true }
+            val cur = record
+            if (!accepted && cur != null && cur.iat > r.iat) return false
             dir.mkdirs()
             val tmp = File(dir, "lease.json.tmp")
             tmp.writeText(Json.write(r.json()))
             if (!tmp.renameTo(leaseFile)) { leaseFile.delete(); tmp.renameTo(leaseFile) }
+            true
         } catch (_: Exception) {
+            false
         }
     }
 
@@ -181,8 +276,10 @@ internal class LeaseClient(
     /** The Core for the install key in force, made at first need with the saved state; null before the first attest. */
     fun core(): Core? = synchronized(lock) {
         core?.let { return it }
+        if (closed) return null
         val k = identity.current() ?: return null
-        val c = openCore(k)
+        // the live Core of this folder and key when another holder has it, else a new one from the saved state
+        val c = registry.hold(dir, k) { openCore(k) }
         core = c
         c
     }
@@ -327,15 +424,23 @@ internal class LeaseClient(
                     identity.discard(k)
                     throw LeaseFailure("attestation", RecognizerException.DownloadFailed("attest", "the answer carries no certificate for this install key"))
                 }
-                synchronized(lock) {
-                    certFile.takeIf { it.isFile }?.let { try { write(previousFile, it.readText()) } catch (_: Exception) {} }
-                    identity.commit(k)
-                    write(certFile, c.encoded)
-                    write(previousFile, c.encoded)
-                    // the Core is made again for the new key: its lease part starts over, the clock and usage carry over
-                    core?.close()
-                    core = null
-                    saveRecord(null)
+                // a client that closed meanwhile commits nothing: a new client of the folder keeps its key and certificate
+                if (closing) {
+                    identity.discard(k)
+                    throw LeaseFailure("attestation", RecognizerException.NeedsConnection())
+                }
+                // the folder's lock before the client's: the one order of the two (an accept writes the certificate so)
+                synchronized(folderLock) {
+                    synchronized(lock) {
+                        certFile.takeIf { it.isFile }?.let { try { write(previousFile, it.readText()) } catch (_: Exception) {} }
+                        identity.commit(k)
+                        write(certFile, c.encoded)
+                        write(previousFile, c.encoded)
+                        // the Core is made again for the new key: its lease part starts over, the clock and usage carry over
+                        core?.let { registry.release(it) }
+                        core = null
+                        saveRecord(null)
+                    }
                 }
                 try { adoptToken(AppToken.from(r)) } catch (_: Exception) {}
                 // `att none` where Play could have answered: one more attest with Play, at most once a day
@@ -379,6 +484,10 @@ internal class LeaseClient(
             c != null && st!!.hasLease && !st.stopped && r?.build == t.build -> pastExp(c, t, roots)
             else -> attempt(t, roots)
         }
+    } catch (e: CoreException) {
+        // the Core closed under the call (the Client closing): the app's error through the usual path, never a crash
+        if (e.status != Core.E_CLOSED) throw e
+        throw LeaseFailure("other", e.toError())
     } finally {
         // the roots of another build, set for this lease, never stay under an open model
         synchronized(lock) { core }?.let { restoreOpenRoots(it) }
@@ -394,8 +503,8 @@ internal class LeaseClient(
 
     /**
      * A refresh in the background (18.4.7): at the first app start or model open after `refresh_after`. After a
-     * failure the next try waits [BACKOFF_MS] (or the server's `Retry-After`). A valid lease is never in question
-     * while it waits.
+     * failure the next try waits the backoff of 18.4.7.3 ([backoffMs]; a `Retry-After` is a floor, never a reset). A
+     * valid lease is never in question while it waits.
      */
     fun refreshIfDue(t: LeaseTarget, roots: (Core) -> Unit, failed: (LeaseFailure) -> Unit = {}) {
         if (!refreshDue()) return
@@ -405,13 +514,25 @@ internal class LeaseClient(
         } catch (f: LeaseFailure) {
             try { failed(f) } catch (_: Exception) {}
             synchronized(lock) { core }?.let { restoreOpenRoots(it) }
-            val r = record ?: return
-            val n = r.failures + 1
-            // an answer that named when to ask again (503 lease_unavailable: Retry-After 30) sets the next try instead
-            val wait = synchronized(graceLock) { attRetryAfterS }.takeIf { it > 0 }?.let { it * 1000L } ?: BACKOFF_MS[minOf(n - 1, BACKOFF_MS.size - 1)]
-            saveRecord(r.copy(failures = n, nextTryMs = clock() + wait))
         }
     }
+
+    /**
+     * 18.4.7.3: an attempt that brought no lease (any outcome but a verified stop) is one more failure in the row, and
+     * the SDK's own next attempt (the refresh, its retries, an open in the grace) waits [backoffMs] of the row's length,
+     * or the answer's `Retry-After` when that is longer. Every attempt counts, an app's call too (item 4). The row ends at
+     * a lease the Core accepts (the record is written again) and at a verified stop (the record goes).
+     */
+    private fun failedInRow(retryAfterS: Int) {
+        synchronized(folderLock) {
+            val r = record ?: return
+            val n = r.failures + 1
+            saveRecord(r.copy(failures = n, nextTryMs = clock() + backoffMs(n, retryAfterS, random)))
+        }
+    }
+
+    /** 18.4.7.3 item 3: the SDK's own attempts wait while the row says so; an app's call that needs a lease does not. */
+    private fun rowWaits(): Boolean = record?.let { it.failures > 0 && clock() < it.nextTryMs } ?: false
 
     /**
      * The lease request, with the one repeat each refusal allows (18.4.10), and one more for a proof refused under a
@@ -431,6 +552,8 @@ internal class LeaseClient(
                 attested = true
             }
             val c = core() ?: throw LeaseFailure("attestation", RecognizerException.NeedsConnection())
+            // the attempt holds the Core it asks with until it ends, also when the client closes meanwhile (its lease is kept)
+            attemptHolds.get()?.let { h -> if (h.none { it === c } && registry.retain(c)) h += c }
             roots(c)
             val tok = try { token() } catch (e: CloudException) { answered(e); throw failure(e, "offline").also { leaseEvent(it.kind) } } catch (e: TajweedError) {
                 throw LeaseFailure("other", e).also { leaseEvent(it.kind) }
@@ -465,9 +588,11 @@ internal class LeaseClient(
             }
             // 28.3, 28.5 (SDK 4.0.1): the request goes through the api hosts, and a 200 is taken only as a lease the Core
             // accepts ([accept]); one that is no lease answer of 18.4.5 (no lease, a base off the allow-list) or whose lease
-            // the Core refuses makes that host unreachable, and the next host is asked with the same challenge
+            // the Core refuses makes that host unreachable, and the next host is asked with the same challenge. A stop
+            // cleared the folder's lease after the request went out: its answer is not accepted ([accept])
+            val clearsBefore = registry.clears(dir)
             val r = try {
-                api.modelKey(tok, body) { a -> accept(c, t, a) }
+                api.modelKey(tok, body) { a -> accept(c, t, a, clearsBefore) }
             } catch (e: CloudException) {
                 answered(e)
                 throw failure(e, "offline").also { leaseEvent(it.kind) }
@@ -502,14 +627,22 @@ internal class LeaseClient(
             // last good piece for the next ask (a proof the server refused under the new one). A refusal is a 4xx with a
             // body, never a 429: a rate limit, a server failure or no answer say nothing about the request and are
             // tried again later (18.4.7's backoff), the piece in force unchanged.
-            val verified = r.status in 400..499 && r.status != 429 && r.body.isNotEmpty() &&
-                try { c.refusalAccept(r.body, key.keyId) } catch (_: Exception) { false }
+            // a clear (a stop) runs under the folder's lock, after any accept already started there, and no lease answer
+            // to a request that went out before it is accepted after it (another attempt of the folder in flight)
+            val stop = (r.status == 401 || r.status == 403) && ModelGate.stops(r.status, e.reason ?: e.code)
+            val verified = synchronized(folderLock) {
+                val v = r.status in 400..499 && r.status != 429 && r.body.isNotEmpty() &&
+                    try { c.refusalAccept(r.body, key.keyId) } catch (_: Exception) { false }
+                if (v || stop) registry.cleared(dir)
+                // lease.json goes whatever its lease's issue time (a clear never passes the monotonic save)
+                if (stop) saveRecord(null)
+                v
+            }
             when {
                 // a stop of 15.3, signed (18.4.10): the Core clears its lease and the models go when it verifies. Contract
                 // 24.4 rule 3: only a stop the Core verified is a stop (reason `stopped`: `invalid_key` or `server_rejected`
                 // by 15.3); one it did not verify is `server_rejected` with its error (reason `refused`)
-                (r.status == 401 || r.status == 403) && ModelGate.stops(r.status, e.reason ?: e.code) -> {
-                    saveRecord(null)
+                stop -> {
                     leaseEvent("refused")
                     val why = e.reason ?: e.code
                     val rules = ai.quranlab.tajweedformer.cloud.ErrorRules
@@ -571,18 +704,29 @@ internal class LeaseClient(
     private fun attempt(t: LeaseTarget, roots: (Core) -> Unit): Core {
         synchronized(graceLock) { attempting++ }
         lastAnswer.set(null)
+        val holds = ArrayList<Core>(1)
+        attemptHolds.set(holds)
         try {
             val c = request(t, roots)
             synchronized(graceLock) { attEndMs = 0; attFailure = null; attRetryAfterS = 0 }
             return c
         } catch (f: LeaseFailure) {
-            told(f)
+            // an attempt the Client's close cancelled is no failed attempt: the Core is told nothing, the row stays
+            if (!closing) {
+                told(f)
+                if (!f.stopped) failedInRow(lastAnswer.get()?.retryAfterS ?: 0)
+            }
             throw f
         } finally {
+            attemptHolds.remove()
+            for (c in holds) registry.release(c)
             lastAnswer.set(null)
             synchronized(graceLock) { attempting--; graceLock.notifyAll() }
         }
     }
+
+    /** The Cores the attempt on this thread holds ([CoreRegistry.retain]). */
+    private val attemptHolds = ThreadLocal<MutableList<Core>?>()
 
     private fun told(f: LeaseFailure) {
         val a = lastAnswer.get() ?: return
@@ -619,6 +763,9 @@ internal class LeaseClient(
      * is used when it comes (a lease accepted, a refusal told). The Core decides the open.
      */
     private fun pastExp(c: Core, t: LeaseTarget, roots: (Core) -> Unit): Core {
+        // 18.4.7.3 item 3: an open in the grace while the row waits opens in it with no attempt; with no grace left, the
+        // app's call asks at once (item 4)
+        if (rowWaits()) inGrace(c)?.let { return it }
         val deadline = System.nanoTime() + graceWaitMs * 1_000_000
         synchronized(graceLock) {
             while (attempting > 0) {
@@ -665,7 +812,7 @@ internal class LeaseClient(
      * last good one if a lease asked under it was accepted. Never before the accept (the Core would take a piece no
      * proof was made under as the good one). A piece that does not verify changes nothing.
      */
-    private fun accept(c: Core, t: LeaseTarget, r: HttpResponse) {
+    private fun accept(c: Core, t: LeaseTarget, r: HttpResponse, clearsBefore: Long = registry.clears(dir)) {
         // no lease answer of 18.4.5: that host was unreachable (28.3); when every host was, the first one's failure
         fun notALease(why: String): Nothing = throw NotTaken(LeaseFailure("other", RecognizerException.DownloadFailed("model-key", why)))
         val o = r.json() ?: notALease("the answer is not JSON")
@@ -674,19 +821,29 @@ internal class LeaseClient(
         // answer, and no file is fetched
         val base = (o["base"] as? String)?.takeIf { baseOk(it) } ?: notALease("the lease answer names no valid folder for the build")
         val manifest = t.manifest(base)
-        try {
-            c.leaseAccept(lease, manifest, t.build)
-        } catch (e: CoreException) {
-            // a lease the Core refuses is no lease (28.3: unreachable, the next host); a key store that lost the key is the
-            // request's own failure
-            if (e.status == Core.E_KEYSTORE) throw e
-            throw NotTaken(e)
-        }
-        (o["piece"] as? String)?.takeIf { it.length in 1..8192 }?.let { p -> try { c.leasePiece(b64urlDecode(p)) } catch (_: Exception) {} }
-        (o["install_cert"] as? String)?.let { s -> InstallCert.parse(s)?.let { synchronized(lock) { write(certFile, it.encoded) } } }
+        val iat = (o["iat"] as? Double)?.toLong() ?: 0
         val exp = (o["exp"] as? Double)?.toLong() ?: 0
         val refresh = (o["refresh_after"] as? Double)?.toLong() ?: 0
-        saveRecord(LeaseRecord(t.build, base, exp, refresh))
+        // read, compare and write under the folder's lock: a lease the server issued before the one in force (another
+        // client of this folder took a newer one meanwhile) replaces nothing, neither in the Core nor in lease.json
+        synchronized(folderLock) {
+            // a stop cleared the folder's lease after this request went out: its lease is never put back (the answer is
+            // the request's failure; a new request asks the server, which refuses a stopped key)
+            if (registry.clears(dir) != clearsBefore) throw CoreException(Core.E_STOPPED, 0, "qlc_lease_accept")
+            val cur = record
+            if (cur != null && cur.build == t.build && cur.iat > iat && (try { c.tick().valid } catch (_: Exception) { false })) return
+            try {
+                c.leaseAccept(lease, manifest, t.build)
+            } catch (e: CoreException) {
+                // a lease the Core refuses is no lease (28.3: unreachable, the next host); a key store that lost the key is
+                // the request's own failure, and so is a Core that is closed (no other host is asked after it)
+                if (e.status == Core.E_KEYSTORE || e.status == Core.E_CLOSED) throw e
+                throw NotTaken(e)
+            }
+            (o["piece"] as? String)?.takeIf { it.length in 1..8192 }?.let { p -> try { c.leasePiece(b64urlDecode(p)) } catch (_: Exception) {} }
+            (o["install_cert"] as? String)?.let { s -> InstallCert.parse(s)?.let { synchronized(lock) { write(certFile, it.encoded) } } }
+            saveRecord(LeaseRecord(t.build, base, exp, refresh, iat = iat), accepted = true)
+        }
     }
 
     /** What to send as `core` (18.4.4, R9): the Core's object as it wrote it, `piece` included (its data piece in force,
@@ -743,15 +900,41 @@ internal class LeaseClient(
         return LeaseFailure(if (r.status == 429 || r.status >= 500) "offline" else kind, err)
     }
 
+    /**
+     * Ends the lease client, once (a second call does nothing). An attempt in flight (the background refresh, a model
+     * open's attempt, an app's call) ends first, at most [CLOSE_WAIT_MS]: a lease it brings is accepted, and saved with
+     * the Core's state. One still running then goes on and holds its Core until it ends ([CoreRegistry]); whatever it
+     * ends with is never a failed attempt ([closing]). The Core is destroyed with its last holder, after its calls in
+     * flight ([Core.close]).
+     */
     override fun close() {
-        executor.shutdownNow()
+        val deadline = System.nanoTime() + CLOSE_WAIT_MS * 1_000_000
+        synchronized(graceLock) {
+            if (closeStarted) return
+            closeStarted = true
+            while (attempting > 0) {
+                val left = (deadline - System.nanoTime()) / 1_000_000
+                if (left <= 0) break
+                try { graceLock.wait(left) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+            }
+        }
+        closing = true
+        // no interrupt: an attempt still running ends on its own, and holds its Core until then (a lease it brings is
+        // accepted and kept, in the Core a new client of the folder shares)
+        executor.shutdown()
         synchronized(lock) {
-            core?.close()
+            closed = true
+            // the destroy waits for the Core's calls in flight within what is left of the same deadline (then on a thread
+            // of its own): close() blocks about CLOSE_WAIT_MS in all
+            core?.let { registry.release(it, maxOf(0L, (deadline - System.nanoTime()) / 1_000_000)) }
             core = null
         }
     }
 
     companion object {
+        /** How long [close] waits for a lease attempt in flight before it cancels it. */
+        const val CLOSE_WAIT_MS = 3_000L
+
         /**
          * Whether a lease answer's `base` may be used as the build's folder: https, a host of
          * the allow-list (`quranlab.ai`, `tajweedformer.com`, `quran-lab.com` or a subdomain; 4.0.0 took `*.quranlab.ai`
@@ -764,8 +947,27 @@ internal class LeaseClient(
         /** 18.4.7.1: the reasons a report of an open in grace names (24.3). */
         val GRACE_REASONS = setOf("network", "timeout", "http", "rate_limited", "redirect", "invalid_answer", "invalid", "lease_unavailable")
 
-        /** 18.4.7: how long a failed refresh waits before its next try, by the number of failures in a row. */
-        @JvmField val BACKOFF_MS = longArrayOf(60_000, 300_000, 1_800_000, 7_200_000, 7_200_000, 14_400_000, 21_600_000)
+        /**
+         * 18.4.7.3 (SDK 4.0.2): after every failed attempt (a 5xx, a 429, no answer) the next background attempt waits a
+         * time drawn uniformly from [RETRY_MIN_S] to [RETRY_MIN_S] + [RETRY_SPREAD_S], afresh at each failure from
+         * [random] (uniform in [0, 1)), so installs that failed together do not come back together. [retryAfterS] (the
+         * answer's `Retry-After`, up to [MAX_RETRY_AFTER_S]; 0 for none) is the floor: the wait is the larger of the two,
+         * never shorter. [n] (the failures in a row) does not change the wait. Before 4.0.2 a `Retry-After` replaced
+         * the step of the backoff, so a short one brought every install back at once.
+         */
+        @Suppress("UNUSED_PARAMETER")
+        fun backoffMs(n: Int, retryAfterS: Int, random: () -> Double): Long {
+            val drawnS = RETRY_MIN_S + (minOf(maxOf(random(), 0.0), 0.999999) * RETRY_SPREAD_S).toLong()
+            val floorS = retryAfterS.toLong().takeIf { it in 1..MAX_RETRY_AFTER_S } ?: 0L
+            return maxOf(drawnS, floorS) * 1000
+        }
+
+        /** 18.4.7.3: the shortest wait after a failed attempt, and the spread of the draw above it (seconds). */
+        const val RETRY_MIN_S = 600L
+        const val RETRY_SPREAD_S = 1200L
+
+        /** The longest `Retry-After` read (seconds); a longer one is none. */
+        const val MAX_RETRY_AFTER_S = 21_600L
 
         /** A token of the server's `why` or `check` (never free text in a message or a report). */
         private fun integrityToken(v: String?): String? = v?.takeIf { Regex("^[a-z][a-z0-9_]{0,31}$").matches(it) }

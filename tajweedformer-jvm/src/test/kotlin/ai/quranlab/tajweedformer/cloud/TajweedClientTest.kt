@@ -4,7 +4,6 @@ import ai.quranlab.tajweedformer.ClientPlatform
 import ai.quranlab.tajweedformer.HeadId
 import ai.quranlab.tajweedformer.HeadValues
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.NetworkPolicy
 import ai.quranlab.tajweedformer.OpenChecked
 import ai.quranlab.tajweedformer.SdkInfo
 import ai.quranlab.tajweedformer.TajweedBackend
@@ -563,7 +562,7 @@ class TajweedClientTest : OpenChecked() {
                 trustedKeys = listOf(stub.publicKey, TestKit.key.first), modelHttp = modelHttp,
                 engine = { _, _, _ -> Engine() }), autoLaunch = false).also { open = it }
 
-            for (call in listOf<suspend () -> Unit>({ c.model() }, { c.prefetch() }, { c.prefetch(unmeteredOnly = true) })) {
+            for (call in listOf<suspend () -> Unit>({ c.model() }, { c.prefetch() })) {
                 try {
                     call()
                     fail("a call that needs the network returned without it")
@@ -693,125 +692,5 @@ class TajweedClientTest : OpenChecked() {
         }
 
         override fun close() {}
-    }
-
-    /**
-     * `prefetch(unmeteredOnly = true)` with a network whose kind the test sets: on a metered network nothing is asked
-     * of any server and nothing is on the device; on an unmetered one the CPU set of the model is downloaded and
-     * verified, with progress up to the total; a second call does nothing. Then `model()` opens what is on the device
-     * (no download), a take runs, `diagnose()` names the model, and `removeModels()` empties the device.
-     */
-    @org.junit.Ignore("SDK 4.0: serves a plaintext build, which 4.0 refuses (model_incompatible); to port to the protected kit (an encrypted build, the stub's lease route, the host Core: CoreLeaseTest shows the pieces)")
-    @Test
-    fun prefetchWaitsForAnUnmeteredNetworkAndTheModelOpensFromTheDevice() = runBlocking {
-        // the files of the model behind a local server, at the address the build in the signed config gives
-        val served = Files.createTempDirectory("tj-served-").toFile()
-        val files = TestKit.v4Files()
-        TestKit.writeTransport(served, files, TestKit.sign(TestKit.manifest(files)))
-        val build = java.security.MessageDigest.getInstance("SHA-256").digest(File(served, "manifest.json").readBytes())
-            .joinToString("") { "%02x".format(it) }.take(40)
-        val asked = java.util.Collections.synchronizedList(ArrayList<String>())
-        val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
-        server.createContext("/") { ex ->
-            val path = ex.requestURI.path
-            asked.add(path)
-            val prefix = "/Quran-Lab/tajweedformer-v4/$build/sdk/v4.0/"
-            val f = if (path.startsWith(prefix)) File(served, path.removePrefix(prefix)) else null
-            if (f == null || !f.isFile) {
-                ex.sendResponseHeaders(404, -1)
-            } else {
-                ex.sendResponseHeaders(200, f.length())
-                ex.responseBody.use { o -> f.inputStream().use { it.copyTo(o) } }
-            }
-            ex.close()
-        }
-        server.start()
-        try {
-            stub.recommended = mapOf("model" to "Quran-Lab/tajweedformer-v4", "model_id" to "v4.0", "folder" to "sdk/v4.0",
-                "revision" to build, "version" to "4.0.0", "source" to "cdn")
-            stub.inference = null
-            // the network is a fake whose kind the test sets
-            var kind = "metered"
-            val network = object : NetworkPolicy {
-                override fun isUnmetered(): Boolean = kind == "unmetered" || kind == "unknown"
-                override fun connection(): String = kind
-            }
-            val c = TajweedClient(stub.key, TajweedClientOptions(), ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan.NONE, cloud = stub.environment(dir), apiUrl = stub.base,
-                trustedKeys = listOf(stub.publicKey, TestKit.key.first),
-                network = network, engine = { _, _, _ -> Engine() }), autoLaunch = false).also { open = it }
-            val progress = java.util.Collections.synchronizedList(ArrayList<Pair<Long, Long>>())
-
-            // a metered network, and no network: the call returns, nothing was asked for or stored, and
-            // diagnose() says what the connection is (how an app sees that the download waits)
-            for (waits in listOf("metered", "none")) {
-                kind = waits
-                c.prefetch(unmeteredOnly = true) { done, total -> progress.add(done to total) }
-                assertTrue("$waits: something was asked of a server: $asked ${stub.seen.map { it.path }}", asked.isEmpty() && stub.seen.isEmpty())
-                assertTrue(progress.isEmpty())
-                assertEquals(emptyList<Any>(), c.storage["models"])
-                val report = valid(c.diagnose())
-                assertEquals(waits, report["connection"])
-                assertNull("waiting is not an error", report["lastError"])
-            }
-
-            // an unmetered one: the CPU set of the default context, verified
-            kind = "unmetered"
-            assertEquals("unmetered", valid(c.diagnose())["connection"])
-            c.prefetch(unmeteredOnly = true) { done, total -> progress.add(done to total) }
-            assertTrue("the manifest and the seven files of the CPU set: $asked", asked.size == 8 && asked.all { it.contains("/$build/sdk/v4.0/") })
-            assertTrue("no progress was reported", progress.isNotEmpty())
-            assertTrue("progress went back: $progress", progress.zipWithNext().all { (a, b) -> b.first >= a.first })
-            assertEquals("progress ends at the total", progress.last().second, progress.last().first)
-            assertTrue(progress.last().second > 300_000)
-            @Suppress("UNCHECKED_CAST")
-            val stored = (c.storage["models"] as List<Map<String, Any>>).single()
-            assertEquals(listOf("4.0.0", build), listOf(stored["version"], stored["build"]))
-            assertTrue((stored["bytes"] as Long) > 300_000)
-
-            // everything is on the device: a second call does nothing, also on a metered network
-            asked.clear()
-            kind = "metered"
-            c.prefetch(unmeteredOnly = true)
-            c.prefetch()
-            assertTrue("a model that is on the device was asked for again: $asked", asked.isEmpty())
-            // where the platform cannot tell, the option cannot be honoured: the download runs
-            c.removeModels()
-            kind = "unknown"
-            c.prefetch(unmeteredOnly = true)
-            assertEquals("unknown: the CPU set was downloaded again", 8, asked.size)
-            assertEquals("unknown", valid(c.diagnose())["connection"])
-            asked.clear()
-
-            // model() opens what is on the device and a take runs
-            val model = c.model()
-            assertTrue("opening downloaded something: $asked", asked.isEmpty())
-            assertEquals(listOf("4.0.0", build), listOf(model.version, model.build))
-            assertEquals("c16_l64", model.defaultContext)
-            val session = model.session()
-            session.push(FloatArray(5120 * 2))
-            val heads = session.finish()
-            assertEquals(24, heads.decoded().frames.size)
-            assertEquals(3, heads.decoded().tokens.size)
-            // a second Session while one is open is refused, and a second model() gives the same Model
-            val other = model.session()
-            assertEquals("session_open", code { runBlocking { model.session() } })
-            other.cancel()
-            assertTrue(c.model() === model)
-            assertTrue("the version that is open, asked for by name", c.model("4.0.0") === model)
-
-            val report = valid(c.diagnose())
-            assertEquals(mapOf("version" to "4.0.0", "build" to build, "verified" to true), report["model"])
-            assertEquals("c16_l64", report["context"])
-            assertEquals(mapOf("kind" to "cpu", "name" to "cpu", "stage" to "cpu", "reason" to null), report["backend"])
-            assertEquals(mapOf("accepted" to true, "reason" to null), report["key"])
-            assertEquals("fresh", report["config"])
-
-            c.removeModels()
-            assertEquals(emptyList<Any>(), c.storage["models"])
-            assertNull(valid(c.diagnose())["model"])
-        } finally {
-            server.stop(0)
-            served.deleteRecursively()
-        }
     }
 }

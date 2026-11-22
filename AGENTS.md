@@ -30,7 +30,7 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the right model for each device (55.5 MB) from our CDN in six regions, verifies it and keeps it up to date.
+**Nothing to host**<br>The SDK downloads the right model for each device (55.5 MB) from Quran Lab's servers, verifies it and keeps it up to date.
 
 </td>
 <td valign="top">
@@ -101,8 +101,9 @@ From 4.0 the model is usable only through the SDK. What changes, and what an app
 - **The lease.** The model opens under a lease Quran Lab signs for this install, this build and this release of the
   Core. The first run needs a connection; after that the model works offline, and the SDK keeps itself up to date in
   the background when the phone is online. `needs_connection` from `client.model()` means the SDK needs to reach Quran
-  Lab to continue; a server's error is `download_failed`. A refusal from Quran Lab is final; a `503 lease_unavailable`
-  is never a refusal: the SDK asks again after its `Retry-After`. A Model that is open keeps running until the app
+  Lab to continue (`errorCause.needs` says why: `model`, the model's files are not on the device yet, or `lease`, the
+  model is on the device and needs Quran Lab's answer to open); a server's error is `download_failed`. A refusal from Quran Lab is final; a `503 lease_unavailable`
+  is never a refusal: the SDK asks again later, never sooner than its `Retry-After`. A Model that is open keeps running until the app
   closes it. Changing the device clock has no effect on the lease. The signed config names the
   build and its key id; the lease answer names the folder its files come from, and no file comes from anywhere else
   (Quran Lab's own hosts over https only). A lease answer may also carry a small
@@ -115,7 +116,7 @@ From 4.0 the model is usable only through the SDK. What changes, and what an app
 - **The accelerator, from memory (not in use at 4.0's launch).** At launch every phone runs the Core's CPU engine:
   Quran Lab serves no NPU program until one is faster than the CPU engine, and an app needs no dispatch library for
   now. When one is served, the NPU program of a phone's SoC is a file of the encrypted build like every
-  other. When the lease allows it, the SDK downloads it on Wi-Fi in the background (110 to 167 MB), the Core installs
+  other. When the lease allows it, the SDK downloads it in the background on any network (110 to 167 MB), the Core installs
   it at the next open, decrypts it into its own memory and hands it to LiteRT from there; the app never gets the
   program, a path to it or a runtime handle. After the golden test against the CPU engine on the build's self-test
   clips, takes run on it when it is not slower than the CPU engine on the phone (the golden test's medians); a take
@@ -137,7 +138,7 @@ hands out its weights or keys. The SDKs around it are open source.
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.1` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.1 |
 | [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
@@ -155,7 +156,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:4.0.1") }
 ```
 
-
+Maven Central serves 4.0.1 today. 4.0.2 follows there once it is released; the quick start below is the same for both.
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
@@ -286,7 +287,7 @@ alignment and the LLR are the app's: [docs/migrating-to-3.md](docs/migrating-to-
 
 `TajweedClient(context, key)` makes the one Client of the process (a second one while the first is not closed is the
 error `client_exists`). Options are always last and optional:
-`TajweedClientOptions(appId, appVersion, storage, unmeteredOnly, appBuild)`. There is no `analytics` option in 4.0: the
+`TajweedClientOptions(appId, appVersion, storage, appBuild)`. There is no `analytics` option in 4.0: the
 anonymous analytics are always on. There is no `audience` option either: every app shows the same sharing sheet.
 
 `storage` is the folder where the SDK keeps its files (default: `noBackupFilesDir/quranlab`). **Use sharing in one
@@ -301,10 +302,8 @@ process needs the model, give it its own `storage` folder.
   ask for) and a `build` (the exact files, 40 hex); `model.contexts`, `defaultContext` and `chunkMs(context)` say
   which response times it has. The context of a take is the app's (`TajweedSessionOptions(context = ...)`), else
   the one set for the app at sdk.quranlab.ai, else the model's default.
-- `client.prefetch(unmeteredOnly, onProgress)` downloads the model before the learner taps, so the first take does
-  not wait. With `unmeteredOnly = true` it waits while the connection is metered or absent (the call returns; call
-  it again later, for example at the next app start) and downloads on Wi-Fi or Ethernet. On the desktop JVM the
-  SDK cannot tell what the connection is, so the option cannot be honoured there and the download runs.
+- `client.prefetch(onProgress)` downloads the model before the learner taps, so the first take does not wait. It
+  downloads on whatever network the phone has, mobile data too: nothing in the SDK waits for Wi-Fi (4.0.2).
   A download that `model()` or `prefetch` started goes on when the learner leaves the app, as long as the app's
   process lives (see "Model download and verification"). `client.storage` says what is on the device,
   `client.removeModels()` deletes it.
@@ -312,7 +311,7 @@ process needs the model, give it its own `storage` folder.
   and the newest one, whether the key was accepted and why not, whether the config is fresh, the model on the
   device and whether it verified, the context, the backend and its stage, the microphone permission, storage, the
   last error, the chunks dropped for a collector that did not read, the connection (`unmetered`, `metered`,
-  `none`, or `unknown` on the desktop JVM), and the protocol of the last model request of the process
+  `none`, or `unknown` on the desktop JVM; it reports the network and holds nothing back), and the protocol of the last model request of the process
   (`downloadProtocol`: `http/1.1` or null). From 4.0.1, `endpoints`: which of Quran Lab's servers the SDK is using.
   It never throws and works offline.
 - A model comes only from Quran Lab's server, through the Client (`client.model()`, `client.prefetch()`). There is
@@ -348,6 +347,21 @@ lost the INTERNET permission the SDK declares) and the rest, 26 in all. When Qur
 (`server_rejected`), the message says which refusal it was and the fix says what to do about that one.
 Catch the one type and show or log the message and the fix.
 
+From 4.0.2 the error also says where its cause is: `errorCause` (a `TajweedErrorCause`: `stage`, `reason`,
+`httpStatus`, `errorName`, `errorCode`, and on `needs_connection` `needs`). The values are short tokens, the same
+ones the SDK's own error report sends, never a message, a path or a host, so an app can log them and send them in a
+support request. `needs` is `model` when the model's files are not on the device yet (connect to download) and
+`lease` when the model is on the device and needs Quran Lab's answer to open. Kotlin's own `cause` stays the
+underlying exception. `errorCause` is null for `invalid_argument`, `client_exists`, `session_open`,
+`session_closed` and `cancelled`.
+
+```kotlin
+try { client.model() } catch (e: TajweedError) {
+    if (e.code == "needs_connection" && e.errorCause?.needs == "model") showConnectToDownload()
+    log("model: ${e.code} ${e.errorCause}")
+}
+```
+
 ### Model download and verification
 
 SDK 4.0: what is downloaded is the encrypted form of each file (`<path>.qle`), checked by its size and SHA-256 as
@@ -359,8 +373,10 @@ files open only with a lease bound to this install's key, so a copied folder ope
 The model comes from Quran Lab's CDN. The SDK fetches the build's signed `manifest.json` (Ed25519, checked against
 Quran Lab's key), and downloads only the files this device needs: the CPU set of the context in use (the shared
 weights, the front end, the tokens, the calibration, and the context's graph, data and frames), later the files of
-this phone's accelerator build when there is one (on Wi-Fi, when the lease allows it), and the reference data with
-the model (SDK 4.0, about 1 MB). Downloads resume
+this phone's accelerator build when there is one (in the background, when the lease allows it), and the reference
+data with the model (SDK 4.0, about 1 MB). Every download and upload goes on whatever network the phone has (4.0.2):
+the SDK never waits for Wi-Fi and never reads the data saver to hold a request; the system may still pause a
+download by its own settings. Downloads resume
 (HTTP Range, If-Range with the server's ETag); every file's size and SHA-256 are checked as stored and as decoded,
 then moved into place atomically; any mismatch deletes it. Models are kept by build under
 `<storage>/models/<model id>/<build>/`, so a new version never overwrites the one in use, and an app that goes
@@ -372,11 +388,14 @@ offline keeps working with the last verified build.
 that ends, a server error, or no byte for 30 seconds), the call waits and goes on from the bytes already on the
 device: up to five times per file, after 1, 2, 4, 8 and 16 seconds, and only then fails (`download_failed`, or
 `needs_connection` when nothing came at all); the partial file stays for the next call. The 30 seconds are a limit
-on silence, not on the time of a download. A refusal is asked once and never again in the call. A file above 8 MiB
-(the weights) comes in 8 MiB ranges, four at a time, with a map of the ranges that are complete beside the partial
-file, so a cut, a crash or a restart costs only the ranges that were under way. That is what the ranges are for;
-they do not make the download faster where one connection already fills the link (measured on an Alcatel 1 over
-Wi-Fi: 15.5 to 21.2 seconds for the weights in one stream, 16.5 to 17.5 seconds in ranges). `client.close()` ends
+on silence, not on the time of a download. A refusal is asked once and never again in the call. From 4.0.2 every
+model file is one request for the whole file, read as a stream into its partial file; a transfer that was cut goes
+on from the last byte written, with a range request that names the version it started with, so a file that changed
+meanwhile starts again whole. A fresh install of the CPU set is one request per file. The SDK does not cut a file into
+pieces: on Android too the answer is read in a small buffer whatever the file's size. A partial file that an earlier
+SDK left in 8 MiB ranges is completed, not thrown away. (3.1.3 to 4.0.1 fetched the weights in 8 MiB ranges, four at a
+time; they made no download faster where one connection fills the link: measured on an Alcatel 1 over Wi-Fi, 15.5 to
+21.2 seconds for the weights in one stream, 16.5 to 17.5 seconds in ranges.) `client.close()` ends
 a download that is under way: the call fails with `download_failed`, and what it had downloaded stays on the device
 for the next Client. A call whose coroutine is cancelled ends as a cancelled coroutine.
 
@@ -577,7 +596,9 @@ of recitation, the ayat recited per surah and per juz, the hour of the day in th
 and sessions are, how many installs were active and came back, and how the model ran on the device. It works out
 which ayat a take recited by itself; `reportRecited` is used only where it could not tell. Nothing is kept per
 learner: no audio, no text, no ayah numbers, no identifier, no location beyond the country the request came from. It
-is always on: no app option turns it off.
+is always on: no app option turns it off. From 4.0.2 the same daily totals also count, per Quran Lab download server,
+how the model downloads went (files, bytes, requests, failures, time to the first answer, speed), to keep model
+downloads fast; they are not in your statistics.
 
 If your app judges a recitation, tell the SDK the result with the same call that reports what was recited: correct,
 or incorrect with how many mistakes and which rules. Your statistics then show how often your learners recite

@@ -165,12 +165,15 @@ internal class StubQlab : AutoCloseable {
 
     override fun close() = server.stop(0)
 
-    fun seen(path: String) = seen.filter { it.path == path }
-    val puts: List<Seen> get() = seen.filter { it.method == "PUT" }
-    fun starts() = seen.filter { it.method == "POST" && it.path == "/v1/uploads" }
-    fun urlCalls(id: String) = seen.filter { it.path == "/v1/uploads/$id/urls" }.mapNotNull { it.q("from")?.toInt() }
+    /** The requests so far, copied under the list's lock (a request recorded meanwhile never breaks a reader). */
+    private fun snap(): List<Seen> = synchronized(seen) { seen.toList() }
+
+    fun seen(path: String) = snap().filter { it.path == path }
+    val puts: List<Seen> get() = snap().filter { it.method == "PUT" }
+    fun starts() = snap().filter { it.method == "POST" && it.path == "/v1/uploads" }
+    fun urlCalls(id: String) = snap().filter { it.path == "/v1/uploads/$id/urls" }.mapNotNull { it.q("from")?.toInt() }
     /** Every take list call for an upload, in order. */
-    fun takeCalls(id: String) = seen.filter { it.method == "POST" && it.path == "/v1/uploads/$id/takes" }
+    fun takeCalls(id: String) = snap().filter { it.method == "POST" && it.path == "/v1/uploads/$id/takes" }
     fun segments(id: String) = objects.filterKeys { it.startsWith("v1/$id/seg-") }.toSortedMap().values.toList()
 
     private fun handle(ex: HttpExchange) {
@@ -207,7 +210,7 @@ internal class StubQlab : AutoCloseable {
         ex.close()
     }
 
-    private fun count(path: String) = seen.count { it.path == path }
+    private fun count(path: String) = snap().count { it.path == path }
 
     private fun route(s: Seen): Reply {
         everything?.invoke(s)?.let { return it }

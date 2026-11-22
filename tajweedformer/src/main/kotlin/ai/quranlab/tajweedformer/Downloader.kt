@@ -169,24 +169,40 @@ private fun readSome(input: InputStream, max: Int): ByteArray {
  * ([RetryPlan]); no other answer ever is.
  */
 internal fun modelRequest(transport: HttpTransport, url: String, path: String, extra: Map<String, String>, headers: HeaderProvider?, ok: Set<Int>,
-                          cancel: Cancellation? = null): HttpResponse {
+                          cancel: Cancellation? = null, tap: ai.quranlab.tajweedformer.cloud.HostTap? = null): HttpResponse {
     val auth = headers as? ModelAuth
     var renewed = false
     while (true) {
         val h = HashMap<String, String>()
         headers?.headers(url)?.let { h.putAll(it) }
         h.putAll(extra)
-        val r = try {
+        // 28.11 item 2: a path this host holds (a 429, or a 503 with Retry-After, not ended yet) is not asked there: a
+        // 503 is unreachable at once (the next host), a 429 is that answer again, without a request
+        val held = tap?.held()
+        if (held != null && held.status != 429) {
+            throw RecognizerException.DownloadFailed(path, "HTTP ${held.status} (held by its Retry-After)", HeldOnHost(held.status))
+                .at(fileStage(path), "http", held.status)
+        }
+        // 34.6: each request sent is one of its host's, timed from sent to status (a request asked again with a new token is one more)
+        val sentAt = System.nanoTime()
+        val r = if (held != null) tap!!.heldAnswer(held) else try {
             permitted { transport.get(url, h, cancel) }
         } catch (x: IOException) {
+            if (x !is NetworkNotPermitted) tap?.noAnswer()
             throw RecognizerException.DownloadFailed(path, "network: ${x.message}", x)
                 .at(fileStage(path), if (ai.quranlab.tajweedformer.cloud.ErrorRules.timedOut(x)) "timeout" else "network")
         }
+        val statusAt = System.nanoTime()
+        if (held == null) tap?.answered(statusAt - sentAt)
         if (r.code in ok) {
             auth?.served()
-            return r
+            // 34.6: the body's bytes and rate, counted for the host when the answer is closed
+            return tap?.metered(r, statusAt) ?: r
         }
         val body = try { readSome(r.body, MAX_ERROR_BODY) } catch (_: IOException) { ByteArray(0) } finally { r.close() }
+        // 28.11 items 2 and 3: a 429, or a 503 with Retry-After, holds this path on this host until it ends, kept across
+        // restarts
+        if (held == null) tap?.hold(r.code, r.headers, body)
         // a success that is not the answer asked for (a 204, say): a failed attempt ([AnswerRule])
         if (r.code in 200..299) throw AnswerRule.failed(path, "HTTP ${r.code}", r.code)
         // a redirect is never followed, and it is a failed request whatever its body says (SPEC 15.4): no renewal and
@@ -318,9 +334,16 @@ internal class WrongAnswer(what: String) : RuntimeException(what) {
  * 4xx without a JSON `error` string, a 503 `network_blocked`. That host was unreachable: asked once of it (SPEC 16.2), and
  * a resume goes to another model host when the build has one ([RetryPlan.resumable]).
  */
-internal class NotTheHost(val status: Int) : RuntimeException("HTTP $status") {
+internal open class NotTheHost(val status: Int) : RuntimeException("HTTP $status") {
     override fun fillInStackTrace(): Throwable = this
 }
+
+/**
+ * Contract 28.11 item 2 (SDK 4.0.2): the path is held on this host by a `503` with `Retry-After` it answered (in this
+ * process or an earlier one), so it was not asked there: unreachable at once (the next host is asked, 28.3), no
+ * request of the host's (34.6 counts nothing for it), and no `failover` report (28.7: only a host that was asked).
+ */
+internal class HeldOnHost(status: Int) : NotTheHost(status)
 
 /** The cause of a `download_failed` whose answer was a server failure (5xx) without a stop reason: asked for again by the
  *  retry rule, and not a missing connection. */
@@ -409,30 +432,26 @@ internal class Resumes(private val plan: RetryPlan) {
     }
 }
 
-/** Whether the device is on an unmetered network now. Android: [ai.quranlab.tajweedformer.android.AndroidNetwork]. */
+/**
+ * The network as the platform reports it, for `diagnose()` only. Android: [ai.quranlab.tajweedformer.android.AndroidNetwork].
+ *
+ * SDK 4.0.2 (section 33): nothing waits for Wi-Fi. No request and no background job is held for the kind of network
+ * (metered or not) or for the system's data saver; every download and upload goes on whatever network the device has.
+ * The one thing read before a request is whether there is a network at all (`none`): an optional fetch the SDK makes
+ * on its own (the reference data, the recited index, an accelerator program) is then left for the next open, as a
+ * background job waits for a connection; a call that needs a request still makes it and fails as 24.4 says.
+ */
 internal fun interface NetworkPolicy {
-    fun isUnmetered(): Boolean
-
     /**
      * The connection as `diagnose()` reports it: `unmetered` (Wi-Fi, Ethernet), `metered` (cellular, or marked
-     * metered or data saver by the system), `none` (no network), or `unknown` where the platform cannot tell.
-     * `prefetch(unmeteredOnly = true)` downloads on `unmetered` and `unknown` and waits on `metered` and `none`.
+     * metered or data saver by the system), `none` (no network), or `unknown` where the platform cannot tell. It
+     * gates nothing but `none` (above).
      */
-    fun connection(): String = if (isUnmetered()) "unmetered" else "metered"
-
-    /** SPEC 17.3: the system says the user wants to save data (Android: Data Saver on for the app, or roaming): the
-     *  SDK's own downloads wait. False where the platform cannot tell. */
-    fun saveData(): Boolean = false
+    fun connection(): String
 
     companion object {
-        /** Treats every network as unmetered (tests). */
-        @JvmField val ALWAYS_UNMETERED = NetworkPolicy { true }
-
-        /** A platform that cannot tell what its network is (the desktop JVM): nothing waits for an unmetered one. */
-        @JvmField val UNKNOWN: NetworkPolicy = object : NetworkPolicy {
-            override fun isUnmetered(): Boolean = true
-            override fun connection(): String = "unknown"
-        }
+        /** A platform that cannot tell what its network is (the desktop JVM). */
+        @JvmField val UNKNOWN: NetworkPolicy = NetworkPolicy { "unknown" }
     }
 }
 
@@ -660,13 +679,24 @@ internal class RangePlan(val threshold: Long, val rangeSize: Long, val parallel:
 
     companion object {
         /**
-         * 8 MiB ranges, four at a time. A CPU install of the V4 model (about 55 MB) has one such file, the 53.6 MB
-         * weights (seven ranges); every other file of it is one request.
+         * SDK 3.1.3 to 4.0.1: 8 MiB ranges, four at a time (a CPU install of the V4 model, about 55 MB, has one such
+         * file, the 53.6 MB weights, in seven ranges). Not used for a new download since 4.0.2 (SPEC 16.7: one request
+         * per file); the tests of the ranged path use it.
          */
-        @JvmField val DEFAULT = RangePlan(threshold = 8L shl 20, rangeSize = 8L shl 20, parallel = 4)
+        @JvmField val RANGED_401 = RangePlan(threshold = 8L shl 20, rangeSize = 8L shl 20, parallel = 4)
 
-        /** Every file in one request, as 3.1.2 fetched them. */
+        /** Every file in one request (SDK 4.0.2, SPEC 16.7; 3.1.2 fetched them so too): the default. */
         @JvmField val SINGLE = RangePlan(threshold = Long.MAX_VALUE, rangeSize = 8L shl 20, parallel = 1)
+
+        /** SDK 4.0.2 (SPEC 16.7): what a model file is fetched with: one GET for the whole file, a Range only to resume. */
+        @JvmField val DEFAULT = SINGLE
+
+        /**
+         * SPEC 16.7 item 3: a part 4.0.1 (or 3.1.3 on) left in 8 MiB ranges, with its map, is completed in its own
+         * ranges, one after another (only the ranges that are not complete are asked for, each with If-Range), never
+         * thrown away. Nothing else is fetched in ranges.
+         */
+        @JvmField val COMPLETE_STORED = RangePlan(threshold = 0, rangeSize = 8L shl 20, parallel = 1)
     }
 }
 
@@ -782,6 +812,9 @@ internal class ModelDownloader @JvmOverloads constructor(
 
     private fun prefix(e: ModelManifest.FileEntry): String = if (e.encoding == ModelManifest.Encoding.QLE1) CDN_DIR else ""
 
+    /** Whether a download of [e] has begun and stopped: a part of it is kept (24.4's `partial`). */
+    fun begun(e: ModelManifest.FileEntry): Boolean = File(root, prefix(e) + e.path + ".part").let { it.isFile && it.length() > 0 }
+
     /** Whether [e]'s kept file is in place with its size and SHA-256 (see [VerifiedStamps]). */
     fun isInPlace(e: ModelManifest.FileEntry): Boolean = stamps.verified(local(e), e.localSize, e.localSha256)
 
@@ -827,7 +860,10 @@ internal class ModelDownloader @JvmOverloads constructor(
             // 28.4: the file's hosts, from the host that answered last
             val plan = hosts.plan()
             val result = try {
-                download(e, cancel, onProgress, t0, stats, plan, auth).copy(revision = revision).also { plan.ended(stats.retries, "download") }
+                download(e, cancel, onProgress, t0, stats, plan, auth).copy(revision = revision).also {
+                    plan.ended(stats.retries, "download")
+                    plan.fileDone()
+                }
             } catch (x: TajweedError) {
                 // ended because another file of the same call failed: that file's error is the call's, and this one is
                 // not a download that failed on its own
@@ -836,7 +872,7 @@ internal class ModelDownloader @JvmOverloads constructor(
                 // contract 24.2: the resumes made inside the call; 24.8: the failure's telemetry name; 28.7: the role, and
                 // whether more than one host was asked
                 x.cause40?.let { c -> if (c.retries == null && stats.retries > 0) x.cause40 = c.copy(retries = stats.retries) }
-                x.cause40?.let { c -> if (c.hostRole == null && ai.quranlab.tajweedformer.cloud.ErrorRules.roleOfStage(c.stage, c.reason) == "models") x.cause40 = c.copy(hostRole = "models", fallback = plan.fallback(stats.retries)) }
+                x.cause40?.let { c -> if (c.hostRole == null && ai.quranlab.tajweedformer.cloud.ErrorRules.roleOfStage(c.stage, c.reason) == "models") x.cause40 = c.copy(hostRole = "models", fallback = plan.fallback()) }
                 // 28.3: a refusal or a slow down ended the file on its host; a failure of the network on every attempt did not
                 when {
                     RetryPlan.resumable(x, plan.many) -> plan.unanswered("download")
@@ -870,9 +906,12 @@ internal class ModelDownloader @JvmOverloads constructor(
         val hash = PartHash(part)
         val io = Io(e, part, validator, cancel, progress, stats, resumes, hash, auth, plan)
         try {
-        if (e.size > ranges.threshold) {
-            val parallel = if (transport.separateConnections) ranges.parallel else 1
-            RangedFetch(e, part, validator, map, transport, auth, plan, ranges, parallel, cancel, progress, stats, resumes, hash) { given, whole ->
+        // SPEC 16.7 item 3: ranges an earlier SDK stored (their map) are completed in their own ranges, not thrown away
+        val stored = e.size <= ranges.threshold && map.exists() && RangedFetch.mapRangeSize(map) == RangePlan.COMPLETE_STORED.rangeSize
+        if (e.size > ranges.threshold || stored) {
+            val rp = if (stored) RangePlan.COMPLETE_STORED else ranges
+            val parallel = if (transport.separateConnections) rp.parallel else 1
+            RangedFetch(e, part, validator, map, transport, auth, plan, rp, parallel, cancel, progress, stats, resumes, hash) { given, whole ->
                 // one stream instead of ranges. [whole]: the whole file, and what the device holds stays until it is
                 // there; else the device holds one stream's prefix without a validator, and the stream goes on from it
                 single(io, given, whole = whole)
@@ -974,7 +1013,11 @@ internal class ModelDownloader @JvmOverloads constructor(
             } catch (x: RecognizerException.DownloadFailed) {
                 // a request that the cancel ended failed like a connection that dropped: it is the cancel, not the network
                 if (cancel?.isCancelled == true) fail(e, "cancelled")
-                if (!RetryPlan.resumable(x, plan.many)) throw x
+                if (!RetryPlan.resumable(x, plan.many)) {
+                    // 34.6: a redirect or a page that is not the host's own, with no other host to ask, is unreachable too
+                    plan.unreachable(g, x)
+                    throw x
+                }
                 x
             } finally {
                 answer?.close()
@@ -1042,7 +1085,7 @@ internal class ModelDownloader @JvmOverloads constructor(
                 h["Range"] = "bytes=$start-"
                 stored?.let { h["If-Range"] = it }
             }
-            modelRequest(transport, plan.url(g, e.path), e.path, h, io.auth, if (start > 0) setOf(200, 206, 416) else setOf(200), cancel)
+            modelRequest(transport, plan.url(g, e.path), e.path, h, io.auth, if (start > 0) setOf(200, 206, 416) else setOf(200), cancel, plan.tap(g, e.path))
         }
         stats.answer(r)
         // while the body is read, a cancel ends the answer: the read fails at once

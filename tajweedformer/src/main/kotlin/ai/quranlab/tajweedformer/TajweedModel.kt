@@ -275,6 +275,11 @@ public class TajweedModel internal constructor(
 
     internal fun sessionEnded(s: TajweedSession) = synchronized(lock) { if (open === s) open = null }
 
+    /** 21.6 item 2: a lease that allows accelerator programs now; the loaded engine's promotion goes on ([Recognizer.promoteAgain]). */
+    internal fun promoteAgain() {
+        try { recognizer?.promoteAgain() } catch (_: Exception) {}
+    }
+
     /** The context of the engine that is loaded (the last Session's, or the one the Model was opened with). */
     internal fun contextInForce(): String? = recognizer?.context
 
@@ -287,7 +292,7 @@ public class TajweedModel internal constructor(
         synchronized(lock) { open }?.background()
     }
 
-    /** Whether a take is open (the signed config is refreshed more often while one is). */
+    /** Whether a take is open (the minute tick of send points and the lease refresh keeps going while one is). */
     internal val sessionOpen: Boolean get() = synchronized(lock) { open != null }
 
     /** Ends the open Session (as `cancel()`), releases the engine and any accelerator. The files stay on disk. */

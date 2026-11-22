@@ -63,7 +63,7 @@ class AnswerRuleTest : OpenChecked() {
 
     /** The retry rule with its five resumes, after pauses of 10 ms instead of 1 to 16 s. */
     private fun store(root: File) = ModelStore(root, server.base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier,
-        retry = RetryPlan(longArrayOf(10, 10, 10, 10, 10)))
+        ranges = RangePlan.RANGED_401, retry = RetryPlan(longArrayOf(10, 10, 10, 10, 10)))
 
     /** The answers that are not the file, by name. */
     private val wrong: List<Pair<String, (Long) -> Do>> = listOf(
@@ -256,7 +256,7 @@ class AnswerRuleTest : OpenChecked() {
         val size = bytesOf(large).size.toLong()
         // call one, without resumes: the first range's answer has no ETag, so the file is asked for whole, and that
         // stream ends after 9 MiB and some bytes
-        val one = ModelStore(root, server.base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, retry = RetryPlan.NONE)
+        val one = ModelStore(root, server.base, UrlConnectionTransport(), { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, ranges = RangePlan.RANGED_401, retry = RetryPlan.NONE)
         server.plan = { p, range, _ -> if (p == BIG && range == null) Do.Cut((9L shl 20) + 123) else Do.Serve }
         assertEquals("download_failed", fails(one, entry(one))?.code)
         val part = File(root, "$BIG.part")

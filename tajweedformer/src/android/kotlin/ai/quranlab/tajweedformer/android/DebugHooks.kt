@@ -7,16 +7,15 @@ package ai.quranlab.tajweedformer.android
  *
  * - [soc]: the SoC id the client and the accelerator use instead of [DeviceSoc.id] (a phone without that NPU
  *   can then run a stand-in LiteRT for that SoC's build);
- * - [scheduleNow]: the first NPU preparation runs at once on a background thread instead of waiting for
- *   WorkManager's idle + charging + unmetered constraints;
- * - [unmetered]: the network counts as unmetered (the test server is reached through adb reverse);
+ * - [scheduleNow]: kept for the bench app, which sets it; SDK 4.0 reads it nowhere (the accelerator is prepared when
+ *   the model opens, with no WorkManager job of its own);
  * - [singleStream], [backgroundDownloads], [downloads]: the model download of SDK 3.1.3 against 3.1.2's, measured on a
- *   phone (the example app's debug screen DownloadProofActivity).
+ *   phone (the example app's debug screen DownloadProofActivity). Since 4.0.2 every model file is one request anyway
+ *   (SPEC 16.7): [singleStream] changes nothing.
  */
 internal object DebugHooks {
     @JvmField @Volatile var soc: String? = null
     @JvmField @Volatile var scheduleNow: Boolean = false
-    @JvmField @Volatile var unmetered: Boolean = false
 
     /** Every model file in one request, as 3.1.2 fetched them (the phone proof of SDK 3.1.3 measures both). Read when
      *  a client is made. */
@@ -58,7 +57,6 @@ internal object DebugHooks {
     fun reset() {
         soc = null
         scheduleNow = false
-        unmetered = false
         singleStream = false
         backgroundDownloads = true
     }

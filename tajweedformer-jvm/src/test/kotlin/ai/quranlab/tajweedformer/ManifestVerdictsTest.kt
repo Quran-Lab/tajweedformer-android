@@ -166,7 +166,7 @@ class ManifestVerdictsTest : OpenChecked() {
         store(root, v, vault, url = base).manifest(refresh = true)
         ManifestVerdicts.forget()
         // another verifier (another SDK version it compares min_sdk_version with): checked in full
-        val other = ManifestVerifier(TestKit.verifier.trustedKeys, TestKit.verifier.requireSignature, "4.0.2", TestKit.verifier.requireVersion)
+        val other = ManifestVerifier(TestKit.verifier.trustedKeys, TestKit.verifier.requireSignature, "4.0.3", TestKit.verifier.requireVersion)
         assertTrue(other.id != v.id)
         store(root, other, vault).manifest()
         assertEquals("another verifier checks in full", 1, other.checks.get())

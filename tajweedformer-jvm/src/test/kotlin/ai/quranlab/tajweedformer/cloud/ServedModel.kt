@@ -63,8 +63,18 @@ internal class ServedModel private constructor(
     /** Called when a request for a path arrives, before it is answered. */
     @Volatile var onRequest: ((String) -> Unit)? = null
 
+    /** For a path: how long the answer's status waits after the request came (ms); null: none (34.6's timings). */
+    @Volatile var headDelayMs: ((String) -> Long?)? = null
+
+    /** For a path: the body's rate in bytes per second; null: as fast as it goes (34.6's timings). */
+    @Volatile var bytesPerSecond: ((String) -> Long?)? = null
+
     /** No connection: every request is dropped before an answer (the client sees an IOException), and not recorded. */
     @Volatile var down = false
+
+    /** More builds served beside this one, by build id to their stored folder (a newer build of the model: an update).
+     *  Their requests are recorded with the path `<build>/<path>`. */
+    @Volatile var others: Map<String, File> = emptyMap()
 
     private val asked = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
@@ -97,7 +107,10 @@ internal class ServedModel private constructor(
                 return@createContext
             }
             val path = ex.requestURI.path
-            val rel = if (path.startsWith(prefix)) path.removePrefix(prefix) else null
+            val extra = others.entries.firstOrNull { path.startsWith("/$REPO/${it.key}/$FOLDER/") }
+            val rel = if (path.startsWith(prefix)) path.removePrefix(prefix)
+                else extra?.let { "${it.key}/" + path.removePrefix("/$REPO/${it.key}/$FOLDER/") }
+            val from = extra?.value ?: root
             val range = ex.requestHeaders.getFirst("Range")
             val ifRange = ex.requestHeaders.getFirst("If-Range")
             var status = 404
@@ -106,11 +119,12 @@ internal class ServedModel private constructor(
             val headers = ex.requestHeaders.entries.associate { it.key.lowercase() to it.value.last() }
             try {
                 rel?.let { r -> try { onRequest?.invoke(r) } catch (_: Exception) {} }
+                rel?.let { r -> headDelayMs?.invoke(r) }?.let { Thread.sleep(it) }
                 val nRange = rel?.let { r -> askedRange.merge("$r $range", 1) { a, b -> a + b }!! } ?: 0
                 val given = rel?.let { r -> rangeAnswer?.invoke(r, range, nRange) }
                     ?: rel?.let { r -> answer?.invoke(r, asked.merge(r, 1) { a, b -> a + b }!!) }
                 val other = rel?.let { replace?.invoke(it) }
-                val file = rel?.let { File(root, it) }
+                val file = rel?.let { File(from, if (extra != null) it.substringAfter('/') else it) }
                 if (given != null) {
                     status = given.status
                     // recorded before the answer goes out: a client that reads a short answer can return, and its test
@@ -156,12 +170,21 @@ internal class ServedModel private constructor(
                             (other?.inputStream() ?: file!!.inputStream()).use { input ->
                                 var skip = from
                                 while (skip > 0) skip -= input.skip(skip).also { if (it <= 0) throw IOException("cannot skip") }
-                                val buf = ByteArray(32 shl 10)
+                                val rate = bytesPerSecond?.invoke(rel)
+                                // throttled: steps of a twentieth of a second, each sent when its time has come
+                                val buf = ByteArray(if (rate != null) maxOf(1L, rate / 20).toInt() else 32 shl 10)
+                                val t0 = System.nanoTime()
                                 while (sent < stop) {
                                     val n = input.read(buf, 0, minOf(buf.size.toLong(), stop - sent).toInt())
                                     if (n < 0) break
                                     out.write(buf, 0, n)
                                     sent += n
+                                    if (rate != null) {
+                                        out.flush()
+                                        val due = t0 + sent * 1_000_000_000L / rate
+                                        val wait = (due - System.nanoTime()) / 1_000_000
+                                        if (wait > 0) Thread.sleep(wait)
+                                    }
                                 }
                             }
                             out.flush()

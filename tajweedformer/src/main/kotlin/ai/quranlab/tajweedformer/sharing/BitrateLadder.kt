@@ -7,7 +7,7 @@ package ai.quranlab.tajweedformer.sharing
  *
  * - [uploadFailed]: an upload request (session start, more URLs, a segment PUT) failed for network
  *   reasons (no connection, a timeout, HTTP 408 or 5xx): one rung down, the success streak back to 0.
- *   Refusals (403 on a PUT, other 4xx, volume limits) and waits (sharing not allowed, unmetered only) are not.
+ *   Refusals (403 on a PUT, other 4xx, volume limits) and waits (sharing not allowed) are not.
  * - [uploadOk]: a segment PUT answered 2xx, with the seconds of closed audio still waiting after it: the
  *   streak grows (capped at 3); at 3 with at most 30 s waiting and not at the top, one rung up, streak 0.
  * - [segmentClosed]: a capture closed a segment, with the seconds of closed audio not yet uploaded (every
