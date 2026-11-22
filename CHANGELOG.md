@@ -1,5 +1,44 @@
 # Changelog
 
+## 4.0.2
+
+Two changes an app may need to make: delete `unmeteredOnly` where you pass it, and read the new `errorCause` if you
+want to say more than the error code does.
+
+- Nothing waits for Wi-Fi. `TajweedClientOptions.unmeteredOnly` and `prefetch(unmeteredOnly)` are gone, with no
+  replacement: delete the argument (`prefetch(onProgress)` stays). Every download and upload of the SDK uses whatever
+  network the phone has, mobile data too. The system may still pause a download by its own settings.
+  `diagnose().connection` stays and only reports. A download an earlier SDK left waiting for Wi-Fi goes on after the
+  update.
+- `TajweedError.errorCause` (a `TajweedErrorCause`: `stage`, `reason`, `httpStatus`, `errorName`, `errorCode`,
+  `needs`) says where a failure's cause is, in the same short tokens as the SDK's error report, never a message, a
+  path or a host. On `needs_connection`, `needs` is `model` when the model's files are not on the phone yet and
+  `lease` when the model is on the phone and needs Quran Lab's answer to open. Kotlin's `cause` stays the underlying
+  exception.
+- A session on another context whose files are not on the phone, with no connection, now fails with
+  `needs_connection`, like a first install (it said `download_failed`).
+- When the phone's lease does not allow accelerator programs, the SDK no longer tries the accelerator or reports each
+  refusal as a failed attempt, and an accelerator that had already passed its checks is used again, with no new
+  check, once a lease allows it.
+- Gentler on Quran Lab's servers under load. When a server asks the SDK to slow down, the SDK waits at least as long
+  as it asks, also after the app is restarted; the statistics, error reports and shared recordings wait longer after
+  each such answer in a row, and nothing is lost. The SDK no longer checks Quran Lab's settings every minute while the
+  app is in use: it checks when the app starts, comes back to the foreground or starts a session, and only when its
+  copy is a few minutes old.
+- Each model file downloads in one request, read as a stream, and a download that was cut goes on from where it
+  stopped: a fresh install makes fewer requests. A partly downloaded model an earlier SDK left on the phone is
+  completed, not downloaded again.
+- The daily statistics count, per Quran Lab download server, how the model downloads went (files, bytes, requests, the
+  ones that failed, how long the first answer took and how fast the larger transfers ran), to keep model downloads
+  fast. Counts only, with no identifier, address or path.
+- `close()` just as Quran Lab's answer arrives no longer loses that answer: `close()` waits a few seconds for it, and
+  it is kept even when a new client starts on the same storage right after. A request that ends because the client
+  closed never counts as a failure.
+- A stopped key stays stopped: if Quran Lab stops an app's key while a request is still on its way, the late answer is
+  ignored, also after a restart with no network.
+- When the phone's storage filled up during a shared recording, the finished part now goes up in the same session once
+  there is room (it waited until the app was started again).
+
 ## 4.0.1
 
 No change is needed in an app.

@@ -30,7 +30,7 @@ internal class ModelHosts private constructor(
         e.refresh()
         val (order0, probe) = e.models.order(e.now())
         val order = if (baseHost !in e.models.hosts) listOf(baseHost) + order0 else order0
-        return FilePlan(order, order.map { e.originOf(it) + path }, baseHost, probe, e)
+        return FilePlan(order, order.map { e.originOf(it) + path }, baseHost, probe, e, path)
     }
 
     companion object {
@@ -48,7 +48,7 @@ internal class ModelHosts private constructor(
  * resumes and pauses are unchanged. [folders] are the folder URLs of [hosts], in the same order.
  */
 internal class FilePlan(val hosts: List<String>, private val folders: List<String>, private val baseHost: String, private val probe: Boolean,
-                        private val endpoints: Endpoints?) {
+                        private val endpoints: Endpoints?, private val folderPath: String = "") {
     /** More than one host: a failure that is not the model host's own answer goes to the next one (28.3). */
     val many: Boolean get() = hosts.size > 1
 
@@ -59,24 +59,65 @@ internal class FilePlan(val hosts: List<String>, private val folders: List<Strin
     @Volatile private var firstReason: String? = null
     @Volatile private var firstStatus: Int? = null
 
+    /** 28.7: the first host's attempt was a request. A path held there (28.11 item 2) is not asked, and its move to the
+     *  next host sends no `failover` report; diagnose's `lastFailover` still notes it. */
+    @Volatile private var firstAsked = false
+
+    /** 34.6: the host the last byte of the file came from (the answer that brought bytes last). */
+    @Volatile private var lastBytesFrom: String? = null
+
+    /** 28.7 `fallback`: the hosts a request of this file went to (a path held on a host, 28.11 item 2, is not asked). */
+    private val requested: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** The request of the attempt of generation [g] for [file] (its path in the folder): measured (34.6) and held per path
+     *  and host (28.11 item 2), or null (a fixed folder, or nothing measures or holds it: then it goes out). */
+    fun tap(g: Int, file: String? = null): ai.quranlab.tajweedformer.cloud.HostTap? {
+        val h = host(g)
+        val t = endpoints?.tap(h, file?.let { folderPath + it }, { b -> lastBytesFrom = b }, { requested += h })
+        if (t == null && file != null) requested += h
+        return t
+    }
+
+    /**
+     * 34.6: the attempt of generation [g] ended with [x]; when that is unreachable (28.3 item 3: no answer, a stall or a
+     * cut, a 5xx, a redirect, a page that is not the host's own, a 2xx that is not the file), its host counts it. A
+     * refusal, a slow down, a cancel or a write on the device is not.
+     */
+    fun unreachable(g: Int, x: Throwable) {
+        // a path held on the host was not asked there: no request of its
+        if (endpoints == null || !RetryPlan.resumable(x, true) || x.cause is HeldOnHost) return
+        tap(g)?.unreachable()
+    }
+
+    /** 34.6: the file is in place: one of `files` for the host its last byte came from. */
+    fun fileDone() {
+        val h = lastBytesFrom ?: return
+        try { endpoints?.meter?.file(h) } catch (_: Exception) {}
+    }
+
     /** The attempt of generation [g] failed with [x]: the first host's failure is what a failover report names. */
     fun failed(g: Int, x: Throwable) {
+        unreachable(g, x)
         if (g != 0 || firstReason != null) return
         val c = try { ErrorCause.of(x) } catch (_: Exception) { null }
+        firstAsked = x.cause !is HeldOnHost
         firstReason = c?.reason?.takeIf { it in FIRST_REASONS } ?: if (x.cause is IOException) "network" else "http"
         firstStatus = c?.httpStatus
     }
 
-    /** 28.7 `fallback`: the file was asked of more than one host by its attempt of generation [g]. */
-    fun fallback(g: Int): Boolean = many && g > 0
+    /** 28.7 `fallback`: a request of the file went to more than one host (a host skipped for a hold is not asked). */
+    fun fallback(): Boolean = many && requested.size > 1
 
     /** The attempt of generation [g] ended the file (taken, refused or a slow down): its host becomes `P`, and when the
-     *  first host had been unreachable, the silent `failover` report of [stage]. */
+     *  first host had been unreachable, the silent `failover` report of [stage]: only when both were asked (28.7: the first
+     *  host was not held, and the host it ended on answered, not a held 429 given without a request). */
     fun ended(g: Int, stage: String) {
         val e = endpoints ?: return
         val h = host(g)
         e.settled(e.models, h, probe)
-        if (g > 0 && many && h != hosts[0]) firstReason?.let { e.failedOver(Failover("models", hosts[0], h, it, firstStatus, e.now() / 1000, stage)) }
+        if (g > 0 && many && h != hosts[0]) firstReason?.let {
+            e.failedOver(Failover("models", hosts[0], h, it, firstStatus, e.now() / 1000, stage), report = firstAsked && h in requested)
+        }
     }
 
     /** Every attempt failed without an answer of a host: the last failover names no host that answered. */

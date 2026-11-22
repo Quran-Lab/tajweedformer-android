@@ -28,6 +28,8 @@ internal class QuranLabApi(
     transport: HttpTransport = UrlConnectionTransport(),
     /** SDK 4.0.1: the `api` hosts every request goes through, in their failover order. */
     val endpoints: Endpoints = Endpoints.of(apiUrl),
+    /** SDK 4.0.2: each route's `Retry-After` hold, kept across restarts; null: none kept. */
+    val holds: RouteHolds? = null,
     /** Sees every answer of every route (the refusals that stop a model, SPEC 15.3, are remembered there). */
     private val observe: (HttpResponse) -> Unit = {},
 ) {
@@ -59,6 +61,16 @@ internal class QuranLabApi(
     private fun send(method: String, path: String, h: Map<String, String>, bytes: ByteArray?, bodyFile: java.io.File? = null,
                      stage: String? = ErrorRules.stageOfPath(path), check: (HttpResponse) -> Unit = JSON): HttpResponse {
         lastFallback.set(false)
+        // 28.11 item 2: a route a 429 (or a 503 with a Retry-After) held answers as it did, without a request, until the
+        // hold ends; no host is asked
+        val route = RouteHolds.routeOf(path)
+        route?.let { holds?.held(it) }?.let { held ->
+            val leftS = maxOf(1L, (held.untilMs - holds!!.now() + 999) / 1000)
+            return HttpResponse(held.status, held.headers + ("retry-after" to leftS.toString()), held.body).also { r ->
+                r.hostRole = ROLE
+                r.fallback = false
+            }
+        }
         val got = endpoints.request(endpoints.api, stage) { _, origin ->
             val r = try {
                 http.send(HttpRequest(method, origin + path, h, bytes, bodyFile))
@@ -76,6 +88,7 @@ internal class QuranLabApi(
             r.hostRole = ROLE
             r.fallback = got.fallback
             if (got.by == null) r.retryAfterMax = got.retryAfterMax
+            route?.let { try { holds?.answered(it, r) } catch (_: Exception) {} }
             return r
         }
         val e = a.failure!!

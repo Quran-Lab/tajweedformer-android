@@ -27,19 +27,20 @@ import java.util.concurrent.TimeUnit
  * job continues from the complete ranges. A user-initiated data transfer job (Android 14) or a `dataSync` foreground
  * service would run longer, but each needs a permission in the app's manifest and a notification.
  *
- * The network rule is the call's: `prefetch(unmeteredOnly = true)` waits for an unmetered network, the rest goes on
- * any network. A download that fails for good (a refusal, the daily limit) is not continued, and nothing is once the
- * model was removed. One job at a time (unique work, replaced by the latest call).
+ * The job runs on any network (`NetworkType.CONNECTED`): SDK 4.0.2 never waits for Wi-Fi (section 33). A download that
+ * fails for good (a refusal, the daily limit) is not continued, and nothing is once the model was removed. One job at a
+ * time (unique work, replaced by the latest call): the Client enqueues it again at its start while a download is owed,
+ * so a job 4.0.1 queued for an unmetered network only is replaced by one that is not (33.3).
  */
 internal class ModelDownloads(context: Context) : BackgroundDownloads {
     private val app = context.applicationContext
     private val wm by lazy { WorkManager.getInstance(app) }
 
-    override fun owe(unmeteredOnly: Boolean) {
+    override fun owe() {
         try {
             wm.enqueueUniqueWork(WORK, ExistingWorkPolicy.REPLACE,
                 OneTimeWorkRequestBuilder<ModelDownloadWorker>()
-                    .setConstraints(Constraints.Builder().setRequiredNetworkType(if (unmeteredOnly) NetworkType.UNMETERED else NetworkType.CONNECTED).build())
+                    .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                     .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                     .build())
         } catch (_: Exception) {

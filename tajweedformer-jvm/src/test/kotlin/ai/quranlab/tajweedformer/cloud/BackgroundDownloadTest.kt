@@ -4,7 +4,6 @@ import ai.quranlab.tajweedformer.BackgroundDownloads
 import ai.quranlab.tajweedformer.ClientPlatform
 import ai.quranlab.tajweedformer.Continued
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.NetworkPolicy
 import ai.quranlab.tajweedformer.OpenChecked
 import ai.quranlab.tajweedformer.TajweedClient
 import ai.quranlab.tajweedformer.TajweedClientOptions
@@ -38,16 +37,10 @@ class BackgroundDownloadTest : OpenChecked() {
 
     /** The platform's job, recorded. */
     private class Job : BackgroundDownloads {
-        val owed = java.util.Collections.synchronizedList(ArrayList<Boolean>())
+        @Volatile var owed = 0
         @Volatile var settled = 0
-        override fun owe(unmeteredOnly: Boolean) { owed += unmeteredOnly }
+        override fun owe() { owed++ }
         override fun settled() { settled++ }
-    }
-
-    @Volatile private var unmetered = true
-    private val network = object : NetworkPolicy {
-        override fun isUnmetered() = unmetered
-        override fun connection() = if (unmetered) "unmetered" else "metered"
     }
 
     @Before
@@ -74,7 +67,7 @@ class BackgroundDownloadTest : OpenChecked() {
         stub.recommended = s.recommended()
         val platform = ClientPlatform(modelRetry = ai.quranlab.tajweedformer.RetryPlan(longArrayOf(300, 300, 300)), cloud = stub.environment(dir, integrity = stubPlay(stub)), apiUrl = stub.base,
             trustedKeys = listOf(stub.publicKey, TestKit.key.first), engine = CountingEngines(),
-            network = network, downloads = job)
+            downloads = job)
         return TajweedClient(stub.key, TajweedClientOptions(), platform, autoLaunch = false).also { client = it }
     }
 
@@ -108,7 +101,7 @@ class BackgroundDownloadTest : OpenChecked() {
             s.onRequest = { path -> if (path == BIG && seen == null) seen = owed(dir) }
             val c = launch(s, dir, job)
             val model = c.model()
-            assertEquals("the job was asked for once, for any network", listOf(false), job.owed.toList())
+            assertEquals("the job was asked for once (any network: SDK 4.0.2 has no other)", 1, job.owed)
             assertNotNull("nothing was owed while the file came", seen)
             assertNull("still owed once the model is on the device", owed(dir))
             assertTrue("the job was not called off", job.settled >= 1)
@@ -116,7 +109,7 @@ class BackgroundDownloadTest : OpenChecked() {
             // the model on the device: nothing is downloaded, nothing owed
             s.requests.clear()
             launch(s, dir, job).model().close()
-            assertEquals(listOf(false), job.owed.toList())
+            assertEquals(1, job.owed)
             assertTrue(big(s).isEmpty())
         }
     }
@@ -129,7 +122,7 @@ class BackgroundDownloadTest : OpenChecked() {
             val job = Job()
             cutSecondRange(s)
             assertEquals("download_failed", error { launch(s, dir, job).model() }?.code)
-            assertEquals("owed after the call failed", false, owed(dir)?.get("unmetered_only"))
+            assertNotNull("owed after the call failed", owed(dir))
             assertEquals(0, job.settled)
             // the app's process ended; the job starts a new one: a new Client over the same storage
             client?.close()
@@ -146,27 +139,6 @@ class BackgroundDownloadTest : OpenChecked() {
             assertTrue("a file was asked for again: ${s.paths()}", s.paths().none { it != "manifest.json" })
             // nothing owed: the job does nothing
             assertEquals(Continued.DONE, c.continueDownload())
-        }
-    }
-
-    @Test
-    fun anUnmeteredOnlyPrefetchIsContinuedOnlyOnAnUnmeteredNetwork() = runBlocking {
-        withTimeout(120_000) {
-            val s = build()
-            val dir = storage()
-            val job = Job()
-            cutSecondRange(s)
-            val c = launch(s, dir, job)
-            assertNotNull(error { c.prefetch(unmeteredOnly = true) })
-            assertEquals("the job waits for an unmetered network", listOf(true), job.owed.toList())
-            s.rangeCut = null
-            s.requests.clear()
-            unmetered = false
-            assertEquals(Continued.RETRY, c.continueDownload())
-            assertTrue("a request on a metered network: ${s.paths()}", s.paths().isEmpty())
-            unmetered = true
-            assertEquals(Continued.DONE, c.continueDownload())
-            assertNull(owed(dir))
         }
     }
 

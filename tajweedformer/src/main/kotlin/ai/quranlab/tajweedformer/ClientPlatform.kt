@@ -62,7 +62,8 @@ internal class ClientPlatform(
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
     /** The transport of model downloads. */
     val modelHttp: HttpTransport = UrlConnectionTransport(),
-    /** How a large model file is fetched (SDK 3.1.3: in 8 MiB ranges, four at a time over HTTP/1.1). */
+    /** How a model file is fetched: SDK 4.0.2 (SPEC 16.7) one request per file, a Range only to resume (3.1.3 to 4.0.1:
+     *  a large file in 8 MiB ranges, four at a time). */
     val modelRanges: RangePlan = RangePlan.DEFAULT,
     /** How a model request that the network cut is made again inside the call (SDK 3.1.3: five resumes per file, after
      *  1, 2, 4, 8 and 16 s). */
@@ -88,7 +89,7 @@ internal class ClientPlatform(
     val osBuildReport: String = "",
     /** The OS build (Android: `Build.FINGERPRINT`): an accelerator verdict that holds until an OS update is keyed by it. */
     val osBuild: String = (System.getProperty("os.name") ?: "") + " " + (System.getProperty("os.version") ?: ""),
-    /** Whether the network is unmetered now (`prefetch(unmeteredOnly = true)` waits for it). */
+    /** The network as `diagnose()` reports it; it holds no request ([NetworkPolicy], section 33). */
     val network: NetworkPolicy = NetworkPolicy.UNKNOWN,
     /** The microphone; null on a platform without one (`listen()` then fails with `microphone_unavailable`). */
     val microphone: AudioInput? = null,

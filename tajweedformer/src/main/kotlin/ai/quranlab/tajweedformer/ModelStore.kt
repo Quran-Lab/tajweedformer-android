@@ -144,24 +144,36 @@ internal class ModelStore @JvmOverloads constructor(
         val hosts = ModelHosts.of(filesBase, endpoints)
         val e = endpoints
         if (hosts.fixed || e == null) return fetchOnce(filesBase + path, path).also(accept)
-        val got = e.request<Any>(e.models, fileStage(path), first = hosts.baseHost) { _, origin ->
+        val got = e.request<Any>(e.models, fileStage(path), first = hosts.baseHost) { host, origin ->
+            // 34.6: the request counts for its host; a manifest taken is one of the host's files
+            var from: String? = null
+            // 28.7: whether a request went to this host (a path held there, 28.11 item 2, is answered without one)
+            var sent = false
+            val tap = e.tap(host, hosts.path + path, { h -> from = h }, { sent = true })
+            val asked = { tap == null || sent }
             try {
-                val bytes = fetchOnce(origin + hosts.path + path, path)
+                val bytes = fetchOnce(origin + hosts.path + path, path, tap)
                 try {
                     accept(bytes)
+                    from?.let { h -> try { e.meter?.file(h) } catch (_: Exception) {} }
                     HostAnswer.ends(AnswerClass.TAKEN, bytes)
                 } catch (x: TajweedError) {
+                    tap?.unreachable()
                     HostAnswer.unreachable(null, x, "invalid_answer", 200)
                 }
             } catch (x: RecognizerException.DownloadFailed) {
                 // the system's refusal of the network is the same on every host
                 if (x.cause is NetworkNotPermitted) throw x
                 val c = x.cause40
-                if (RetryPlan.resumable(x, true)) HostAnswer.unreachable(null, x, c?.reason ?: "network", c?.httpStatus)
-                else HostAnswer.ends(if (c?.reason == "rate_limited") AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x)
+                if (RetryPlan.resumable(x, true)) {
+                    // a path held on the host (28.11 item 2) was not asked there: no request of its
+                    val held = x.cause is HeldOnHost
+                    if (!held) tap?.unreachable()
+                    HostAnswer.unreachable(null, x, c?.reason ?: "network", c?.httpStatus, asked = !held && asked())
+                } else HostAnswer.ends(if (c?.reason == "rate_limited") AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x, asked())
             } catch (x: TajweedError) {
                 // a refusal the Client read from the answer (a stop, the key, the daily limit)
-                HostAnswer.ends(if (x is RecognizerException.ModelLimit) AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x)
+                HostAnswer.ends(if (x is RecognizerException.ModelLimit) AnswerClass.SLOW_DOWN else AnswerClass.REFUSED, x, asked())
             }
         }
         val v = got.answer.value
@@ -170,10 +182,10 @@ internal class ModelStore @JvmOverloads constructor(
         throw x.via("models", got.fallback)
     }
 
-    /** One request for a small file at [url]. */
-    private fun fetchOnce(url: String, path: String): ByteArray {
+    /** One request for a small file at [url]; [tap] counts it for its `models` host (34.6). */
+    private fun fetchOnce(url: String, path: String, tap: ai.quranlab.tajweedformer.cloud.HostTap? = null): ByteArray {
         try {
-            modelRequest(transport, url, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200)).use { r ->
+            modelRequest(transport, url, path, mapOf("Accept-Encoding" to "identity"), headers, setOf(200), tap = tap).use { r ->
                 val bytes = r.body.readBytes()
                 if (bytes.size > MAX_MANIFEST_BYTES) {
                     throw RecognizerException.DownloadFailed(path, "too large", WrongAnswer("too large")).at("manifest", "invalid_answer", r.code)

@@ -129,9 +129,12 @@ class ExampleActivity : Activity() {
         scope.launch { report.text = Recitation.client(this@ExampleActivity).diagnose().toJson() }
     }
 
-    /** Every failure is a TajweedError: a code, what happened, and what to do about it. */
+    /** Every failure is a TajweedError: a code, what happened, what to do about it, and where its cause is. */
     private fun show(e: TajweedError) {
-        if (e.code != "cancelled") status.text = "${e.code}: ${e.message}\n${e.fix}\n${e.docs}"
+        if (e.code == "cancelled") return
+        // on needs_connection, needs "model": the model is not on the phone yet; "lease": it is, and needs Quran Lab
+        val cause = e.errorCause?.let { c -> " [${c.stage} ${c.reason}${c.needs?.let { " needs $it" } ?: ""}]" } ?: ""
+        status.text = "${e.code}$cause: ${e.message}\n${e.fix}\n${e.docs}"
     }
 
     override fun onDestroy() {

@@ -1,0 +1,346 @@
+{
+ "format": 3,
+ "model_id": "v4.0",
+ "family": "tajweedformer",
+ "revision": "v4.1-two-contexts-402",
+ "version": "4.1.0",
+ "min_sdk_version": "4.0.0",
+ "engine_format": 3,
+ "coreml_format": 9,
+ "tokens": "tokens.txt",
+ "tokens_sha256": "4ff0d57d2263f56684353035675cc25071ca70b275696d6204f0efc96a8676f0",
+ "default_context": "c16_l64",
+ "contexts": [
+  "c16_l64",
+  "c24_l256"
+ ],
+ "encryption": {
+  "scheme": "qle1",
+  "key_id": "d14d9aeeeecb3a238cb86c41a5e8b0c2",
+  "root": 1
+ },
+ "golden_raw_tolerance": {
+  "npu:tensor_g4:c16_l64": {
+   "log_probs": {
+    "token_edits": 0,
+    "lp_mean": 0.05,
+    "lp_p99": 1.5
+   }
+  }
+ },
+ "files": [
+  {
+   "path": "tokens.txt.qle",
+   "size": 1079,
+   "sha256": "7e27f4057c9c4a21bfbc4de60b4a29a4cc00cebe0d03a3dda976e07a32b8b4d8",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "tokens",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "tokens.txt",
+    "size": 16,
+    "sha256": "4ff0d57d2263f56684353035675cc25071ca70b275696d6204f0efc96a8676f0"
+   }
+  },
+  {
+   "path": "calibration.json.gz",
+   "size": 273,
+   "sha256": "84134a50642faec76b6b9d55ef62e30f387e5221b26202015856fe78dd2f88f5",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "calibration",
+   "need": "required",
+   "encoding": "gzip",
+   "decoded": {
+    "path": "calibration.json",
+    "size": 250,
+    "sha256": "f1aead245f34073abe51ab8acba035a3532cbbadea948922350545585cd8af60"
+   }
+  },
+  {
+   "path": "layers.zfw.qle",
+   "size": 4063,
+   "sha256": "cebbe2024e99adc93dd96468e24f017035d68f0fca34992c96de702238553063",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "weights",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "layers.zfw",
+    "size": 3000,
+    "sha256": "1dca5f3c5e58498ab782172830b632d9f3b0bd543fdd6bfa8f835e7f96906a09"
+   }
+  },
+  {
+   "path": "frontend.zfw.qle",
+   "size": 1763,
+   "sha256": "2f173f3c739a222c728dc6df533b3beafe4da7aeb6a494f3e904297a5f473bf1",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "frontend",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "frontend.zfw",
+    "size": 700,
+    "sha256": "6f9100767d268447b45141197a3fb7470729dde6bbabe062fc8a1f84aa552d77"
+   }
+  },
+  {
+   "path": "expected_tj3.zfx.qle",
+   "size": 1463,
+   "sha256": "d4563127479fceab107bb71203295ee9371e7af0c1292a425697b83f9a501a74",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "reference",
+   "need": "optional",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "expected_tj3.zfx",
+    "size": 400,
+    "sha256": "74f29cdf4513d36a4d14a94b5c40239e495c69b62b315c257e1dbfca2ce30061"
+   }
+  },
+  {
+   "path": "c16_l64/model_engine2.onnx.zfg.qle",
+   "size": 1363,
+   "sha256": "e3b20edef1d295c44784b6596a04103df6a8c607e7f89697a03587d5c94f3ce8",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c16_l64",
+   "role": "graph",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c16_l64/model_engine2.onnx.zfg",
+    "size": 300,
+    "sha256": "1426f71433c87719abc38846ba76f7bc27d180b522980d2f6059c44e4b74183b"
+   }
+  },
+  {
+   "path": "c16_l64/model_engine2.onnx.zfg.bin.qle",
+   "size": 1563,
+   "sha256": "affd9e7f5164848f47ae9805da7a9d9ed32942c16b7f67d0ec2f903003e24bbe",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c16_l64",
+   "role": "graph-data",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c16_l64/model_engine2.onnx.zfg.bin",
+    "size": 500,
+    "sha256": "eed52b666be870b437eee6efe7e5cd07b0cc58367c4f0606eaed558a819779d8"
+   }
+  },
+  {
+   "path": "c16_l64/frames.zfw.qle",
+   "size": 1263,
+   "sha256": "b763f3a913f701ca969b2300db65b28485151cd9b5675ef3697a534d2932f14f",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c16_l64",
+   "role": "frames",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c16_l64/frames.zfw",
+    "size": 200,
+    "sha256": "fa3512050a1e23fc5a577e5a17c5a6f9be215ddade0d9c32ee65ba6a41c1a4ef"
+   }
+  },
+  {
+   "path": "c24_l256/model_engine2.onnx.zfg.qle",
+   "size": 1363,
+   "sha256": "798f5e7530ab83780d5373d34c8f1ed5f29d9d2604b921a7256c37efa869cd36",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c24_l256",
+   "role": "graph",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c24_l256/model_engine2.onnx.zfg",
+    "size": 300,
+    "sha256": "62c0f26ab190340a432041e3c878223b6e43e57ed93a1e1343d50936a20cb9d7"
+   }
+  },
+  {
+   "path": "c24_l256/model_engine2.onnx.zfg.bin.qle",
+   "size": 1563,
+   "sha256": "f48fc29976476f3b1174b25f2b2e6d6f6311391c611e0a27e5d9b558061306f0",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c24_l256",
+   "role": "graph-data",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c24_l256/model_engine2.onnx.zfg.bin",
+    "size": 500,
+    "sha256": "7dc2c55f9faa3d50104bc69a81212fdd1d636fe424aa3ea2d36eb814fd740c5f"
+   }
+  },
+  {
+   "path": "c24_l256/frames.zfw.qle",
+   "size": 1263,
+   "sha256": "6442dad79cb0b2a2be8228c1950a431cecf71bb617c8e22f0a5500011e8b401c",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c24_l256",
+   "role": "frames",
+   "need": "required",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "c24_l256/frames.zfw",
+    "size": 200,
+    "sha256": "288bc13d262469e9e613f74bf471a79050ce2392214f2ee4f743efb1ec4fb4d2"
+   }
+  },
+  {
+   "path": "selftest/clip01.wav.gz",
+   "size": 623,
+   "sha256": "1ec8964682a26dbaa2f6491b565c521cbf43bdfff4f359a5e7f3d950377d57b0",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "selftest",
+   "need": "optional",
+   "encoding": "gzip",
+   "decoded": {
+    "path": "selftest/clip01.wav",
+    "size": 600,
+    "sha256": "04e7c5340589d0ee37dd6326c86ad37ed38cf55bc5fbd9b85844ebeeafa16cb2"
+   }
+  },
+  {
+   "path": "selftest/selftest.json.gz",
+   "size": 166,
+   "sha256": "2d93deda3336bfe75077e2482433dad293fbec21158e604fd144bfa3cb107e97",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "selftest",
+   "need": "optional",
+   "encoding": "gzip",
+   "decoded": {
+    "path": "selftest/selftest.json",
+    "size": 143,
+    "sha256": "db07f939d0cbe375ba0771490f4ad608665fd687a4a7f02b41148647743e1a04"
+   }
+  },
+  {
+   "path": "selftest/expected_c16_l64.json.gz",
+   "size": 128,
+   "sha256": "27300ba43e20ef7b2d880a5d5821ef6d73353ac9ba48b2efb25372aea2d00481",
+   "platforms": "*",
+   "soc": "*",
+   "context": "c16_l64",
+   "role": "selftest",
+   "need": "optional",
+   "encoding": "gzip",
+   "decoded": {
+    "path": "selftest/expected_c16_l64.json",
+    "size": 105,
+    "sha256": "2562c376adc0e2a6b15494b743c09e07399b62465ea1c7830934903b3dd0475a"
+   }
+  },
+  {
+   "path": "selftest/clip01.s16.gz",
+   "size": 663,
+   "sha256": "76967dcf3cb80dfc2b774abb9e2c780a0da89a8494ce5c98c41bc21d7b9a984e",
+   "platforms": "*",
+   "soc": "*",
+   "context": "*",
+   "role": "selftest",
+   "need": "optional",
+   "encoding": "gzip",
+   "decoded": {
+    "path": "selftest/clip01.s16",
+    "size": 640,
+    "sha256": "88d16fcaec6429d094737cd642f789a7c5df0bf213a34fbc1a83aa57b98948cf"
+   }
+  },
+  {
+   "path": "npu/tensor_g4/c16_l64/model.tflite.qle",
+   "size": 1963,
+   "sha256": "16fafbd2784eaf80b6ef29b1985cb0280f03150aa8df3af5a4392e3a064725c2",
+   "platforms": [
+    "android"
+   ],
+   "soc": "tensor_g4",
+   "context": "c16_l64",
+   "role": "npu-model",
+   "need": "optional",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "npu/tensor_g4/c16_l64/model.tflite",
+    "size": 900,
+    "sha256": "24f26ce0e65cdb87524b7d10889ca1c12ee75602eb15b3d41bbbbd37f4b758f5"
+   }
+  },
+  {
+   "path": "npu/tensor_g4/c16_l64/io.json.qle",
+   "size": 1363,
+   "sha256": "3771cd59f8deb52432c0a07a2ecd4efac834dbe6dc926c2234b995d929dd68f1",
+   "platforms": [
+    "android"
+   ],
+   "soc": "tensor_g4",
+   "context": "c16_l64",
+   "role": "npu-io",
+   "need": "optional",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "npu/tensor_g4/c16_l64/io.json",
+    "size": 300,
+    "sha256": "e1fa740d28ca987529ae0163b16c9297d0212a9b1809280efe4d776ca25b2fb6"
+   }
+  },
+  {
+   "path": "npu/tensor_g4/c16_l64/masks.bin.qle",
+   "size": 1263,
+   "sha256": "44bd4514c5222df50b697857c5fb138cdffbd3951a2db44c951a51709c9130e2",
+   "platforms": [
+    "android"
+   ],
+   "soc": "tensor_g4",
+   "context": "c16_l64",
+   "role": "npu-masks",
+   "need": "optional",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "npu/tensor_g4/c16_l64/masks.bin",
+    "size": 200,
+    "sha256": "16905c4a3320f9962661330bbbcd763aede4c5eb57c216e8296b48fa6c08fa47"
+   }
+  },
+  {
+   "path": "coreml/tajweedformer_v4.mlmodelc/weights/weight.bin.qle",
+   "size": 1863,
+   "sha256": "f5a94ab0029a5e842a796568a87745c17108e1dc0416ace1c66639613a793831",
+   "platforms": [
+    "apple"
+   ],
+   "soc": "*",
+   "context": "*",
+   "role": "coreml",
+   "need": "optional",
+   "encoding": "qle1",
+   "decoded": {
+    "path": "coreml/tajweedformer_v4.mlmodelc/weights/weight.bin",
+    "size": 800,
+    "sha256": "5019993b2f159f3581f1311a59b93505da97a95c0f4550dcd89fcc6ff21e9613"
+   }
+  }
+ ],
+ "signature": "iX8fVGvHg9Kf7sxgzVA1QteiN9WVeop+dAJkzr5tRE1/HNlNnlhaJDjwhAzhXHEtp7QDOrMVBqRZy186VrxCDg=="
+}

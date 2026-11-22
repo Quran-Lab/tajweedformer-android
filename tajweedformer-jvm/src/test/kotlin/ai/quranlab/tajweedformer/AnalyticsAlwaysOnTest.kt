@@ -25,12 +25,13 @@ class AnalyticsAlwaysOnTest : OpenChecked() {
         assertFalse(c.declaredFields.any { it.name.equals("analytics", ignoreCase = true) })
         assertFalse(c.methods.any { it.name.equals("getAnalytics", ignoreCase = true) })
         assertFalse("no Analytics enum", c.declaredClasses.any { it.simpleName == "Analytics" })
-        // and no constructor takes an analytics argument: every parameter is one of the four that remain (the audience
-        // option went too, contract section 26: OneSheetApiTest), and 4.0.1's appBuild (section 27)
+        // and no constructor takes an analytics argument: every parameter is one of the three that remain (the audience
+        // option went too, contract section 26: OneSheetApiTest; unmeteredOnly in 4.0.2, section 33), and 4.0.1's
+        // appBuild (section 27)
         val kept = c.declaredFields.filter { !Modifier.isStatic(it.modifiers) }.map { it.name }.toSet()
-        assertEquals(setOf("appId", "appVersion", "storage", "unmeteredOnly", "appBuild"), kept)
+        assertEquals(setOf("appId", "appVersion", "storage", "appBuild"), kept)
         // the Kotlin constructor with every argument named: what an app can pass
-        val full = TajweedClientOptions(appId = "a", appVersion = "1", storage = null, unmeteredOnly = false)
+        val full = TajweedClientOptions(appId = "a", appVersion = "1", storage = null)
         assertEquals("a", full.appId)
     }
 

@@ -9,6 +9,10 @@ package ai.quranlab.tajweedformer
  * try { client.model() } catch (e: TajweedError) { if (e.code == "needs_connection") showOfflineHint() }
  * ```
  *
+ * [errorCause] (SDK 4.0.2) says where the failure's cause is, in tokens an app can log, show or send in a support
+ * request: `needs_connection` with `needs == "model"` means the model's files are not on the device yet (connect to
+ * download), `needs == "lease"` that the model is on the device and needs Quran Lab's answer to open.
+ *
  * Codes: `invalid_argument`, `invalid_key`, `sdk_too_old`, `server_rejected`, `client_exists`, `model_unavailable`,
  * `needs_connection`, `network_not_permitted`, `download_failed`, `storage_full`, `storage_failed`, `model_missing`,
  * `model_invalid`, `signature_invalid`,
@@ -35,6 +39,21 @@ public open class TajweedError internal constructor(
 
     /** Where the cause of this failure is, set where it is made ([at]); the error report reads it. */
     @Volatile internal var cause40: ai.quranlab.tajweedformer.cloud.ErrorCause? = null
+
+    /** 24.13 item 3, on `needs_connection`: `model` (files the call needs are not on the device) or `lease` (they are,
+     *  and the model needs Quran Lab's answer to open), set where it is made ([needing]). Unset: `lease`, the code of a
+     *  call that needs no file it lacks (a refusal of the Core on the device, a request of no model file). */
+    @Volatile internal var needs40: String? = null
+
+    /**
+     * SDK 4.0.2: where the cause of this failure is, the same tokens as the SDK's error report of it:
+     * the stage and reason, and when known the HTTP status of the answer that failed, the system error's class and its
+     * code; on `needs_connection`, [TajweedErrorCause.needs]. Never a message, a path, a URL, a host name or an
+     * identifier. Null for the codes that are the app's own (`invalid_argument`, `client_exists`, `session_open`,
+     * `session_closed`, `cancelled`). Kotlin's own [cause] stays the underlying failure (a Core status, an I/O error).
+     * It does not depend on the reports: Quran Lab's config turning issue reports off stops the report, not this.
+     */
+    public val errorCause: TajweedErrorCause? by lazy { TajweedErrorCause.of(this) }
 
     /** Counted once as a failure that reached the app (24.1: one occurrence per error, however it is delivered). */
     internal val reachedApp = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -91,6 +110,16 @@ public open class TajweedError internal constructor(
 }
 
 /**
+ * 24.13 item 3: on `needs_connection`, what the call waits for: `model` when files it needs are not on the device
+ * ([onDevice] `none` or `partial`, [ai.quranlab.tajweedformer.cloud.ErrorRules.needs]), `lease` when they all are. The
+ * place nearest the failure names it.
+ */
+internal fun <T : TajweedError> T.needing(onDevice: String): T {
+    if (needs40 == null && code == "needs_connection") needs40 = ai.quranlab.tajweedformer.cloud.ErrorRules.needs(onDevice)
+    return this
+}
+
+/**
  * Names where the cause of this failure is, unless a cause was named
  * already: the place nearest the failure names it. The platform error's class is read from the error's chain.
  */
@@ -123,6 +152,8 @@ internal fun <T : TajweedError> T.at(cause: ai.quranlab.tajweedformer.cloud.Erro
 internal fun reachedApp(e: Throwable?) {
     val t = e as? TajweedError ?: return
     if (!t.reachedApp.compareAndSet(false, true)) return
+    // 24.13: the app's cause is made here, from the occurrence the report is made from
+    try { t.errorCause } catch (_: Throwable) {}
     try { ai.quranlab.tajweedformer.cloud.QuranLabCloud.current?.errorReachedApp(t) } catch (_: Throwable) {}
 }
 
@@ -187,4 +218,57 @@ internal object ErrorCatalogue {
     fun fix(code: String, params: Map<String, String>): String = words(code, params)?.let { fill(it.fix, params) } ?: ""
 
     fun docs(code: String): String = docsBase + code
+}
+
+/**
+ * SDK 4.0.2: where the cause of a [TajweedError] is, as tokens: what the SDK's error report of the
+ * same failure says, so an app can log it, show the right words, or send it in a support request.
+ *
+ * ```
+ * catch (e: TajweedError) {
+ *     if (e.code == "needs_connection" && e.errorCause?.needs == "model") showConnectToDownload() else showConnectToContinue()
+ *     log("tajweed ${e.code} ${e.errorCause}")
+ * }
+ * ```
+ */
+public data class TajweedErrorCause(
+    /** Where the cause is: `config`, `register`, `attest`, `lease`, `manifest`, `download`, `verify`, `storage`,
+     *  `runtime`, `model_open`, `accelerator`, `audio`, `session`, `sharing` or `events`. */
+    public val stage: String,
+    /** The stage's reason, a lower-case token (`network`, `timeout`, `http`, `rate_limited`, `refused`, `hash`,
+     *  `quota`, `memory`, ...); `other` when none fits. */
+    public val reason: String,
+    /** The HTTP status of the answer that failed, when there was one (100 to 599). */
+    public val httpStatus: Int? = null,
+    /** The system error's class (a Java or Kotlin exception class), when known. Never its message. */
+    public val errorName: String? = null,
+    /** Its code: the server's error of a 4xx answer (`model_limit`, `app_blocked`), a Core status, an errno. */
+    public val errorCode: String? = null,
+    /** On `needs_connection` only: `model` (the model's files are not on the device yet: connect to download) or
+     *  `lease` (the model is on the device and needs Quran Lab's answer to open). */
+    public val needs: String? = null,
+) {
+    internal companion object {
+        /** The cause [e] carries: its report's cause ([ai.quranlab.tajweedformer.cloud.ErrorCause.of], the function the
+         *  report uses), or none for the codes no report is made for. */
+        fun of(e: TajweedError): TajweedErrorCause? {
+            if (e.code in ai.quranlab.tajweedformer.cloud.ErrorRules.CODES_NOT_REPORTED) return null
+            val c = try { ai.quranlab.tajweedformer.cloud.ErrorCause.of(e) } catch (_: Exception) { return null }
+            return of(e.code, c, e.needs40)
+        }
+
+        /** [c] filtered by 24.2's patterns (a value that is not a token of its field is left out, never cut into one),
+         *  and [needs] on `needs_connection` (`lease` when the error names none). */
+        fun of(code: String, c: ai.quranlab.tajweedformer.cloud.ErrorCause, needs: String?): TajweedErrorCause {
+            val r = ai.quranlab.tajweedformer.cloud.ErrorRules
+            return TajweedErrorCause(
+                stage = c.stage,
+                reason = r.token(c.reason, r.TOKEN) ?: "other",
+                httpStatus = c.httpStatus?.takeIf { it in 100..599 },
+                errorName = r.token(c.errorName, r.ERROR_NAME),
+                errorCode = r.token(c.errorCode, r.ERROR_CODE),
+                needs = if (code == "needs_connection") needs ?: "lease" else null,
+            )
+        }
+    }
 }

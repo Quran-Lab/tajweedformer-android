@@ -35,8 +35,8 @@ public class TajweedDiagnosis internal constructor(
      *  wait). 0 in an app that reads them. */
     public val droppedChunks: Long,
     /** The connection now: `unmetered` (Wi-Fi, Ethernet), `metered` (mobile data, a metered hotspot, data saver),
-     *  `none`, or `unknown` where the platform cannot tell (the desktop JVM). `prefetch(unmeteredOnly = true)` waits
-     *  on `metered` and `none`. */
+     *  `none`, or `unknown` where the platform cannot tell (the desktop JVM). It reports the network and holds nothing:
+     *  every download and upload goes on any network. */
     public val connection: String,
     /** The protocol the last request for a model file ran on in this process: `h3`, `h2` or `http/1.1`; null while this
      *  Client has made no model request. The SDK's HTTP stack on Android and on the desktop JVM (`HttpURLConnection`)

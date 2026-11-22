@@ -1,0 +1,1 @@
+{"3e33903e58cc1b6433a2f0bd6d5bd1d8f7e17285:npu:tensor_g5:c16_l64":{"state":"waiting","why":"qlc_accel_prepare: lease refused (lease_no_accel)"},"3e33903e58cc1b6433a2f0bd6d5bd1d8f7e17285:npu:tensor_g4:c16_l64":{"state":"waiting","why":"qlc_accel_prepare: lease refused (lease_no_accel)"}}

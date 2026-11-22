@@ -39,6 +39,12 @@ internal class AcceleratorPlan(
     /** The dispatch library's identity ([DispatchLibrary.Resolution.id]): a transient verdict found with another library
      *  (or none) is tried again at once, so an app update that adds or changes the library brings the NPU back. */
     val dispatchId: String = DispatchLibrary.NONE,
+    /** SDK 4.0.2: whether the lease in force allows accelerator programs (`qlc_accel_allowed`), asked
+     *  before an attempt starts. False: no attempt, nothing counted, the CPU engine ([leaseNoAccel]). */
+    val allowed: () -> Boolean = { true },
+    /** 21.6 item 1: the lease in force allows no accelerator program: said as the config's deny list says a denial
+     *  (the `denylist` demotion, once while it holds), never as a failure of the build. */
+    val leaseNoAccel: () -> Unit = {},
 ) {
     val kind: String get() = "npu:$soc"
 
@@ -308,6 +314,31 @@ internal class AcceleratorRecords(private val file: File) {
     /** The whole verdict of [key] as stored (tests and diagnosis). */
     fun entry(key: String): Map<*, *>? = synchronized(lock) { read()[key] as? Map<*, *> }
 
+    /** [key]'s verdict put back as it was before an attempt ([entry]; null: none, the key never tried): 21.6, an attempt
+     *  the lease refused is no attempt, so a promoted key stays promoted and one never tried stays pending. */
+    fun restore(key: String, entry: Map<*, *>?) = synchronized(lock) {
+        val m = read()
+        if (entry == null) m.remove(key) else m[key] = LinkedHashMap(entry.entries.associate { (k, v) -> k as String to v })
+        write(m)
+    }
+
+    /**
+     * 21.6 item 4, at the first start of 4.0.2: a verdict 4.0.1 stored for a prepare the Core refused because the lease
+     * allowed no accelerator program (`waiting`, why `... (lease_no_accel)`: Android never counted it as a failure, but
+     * the record replaced a promoted key's pass) goes: the key is pending. A verdict for any other reason stays.
+     * Returns how many went.
+     */
+    fun migrateLeaseNoAccel(): Int = synchronized(lock) {
+        val m = read()
+        val gone = m.filterValues { v ->
+            (v as? Map<*, *>)?.let { it["state"] == "waiting" && (it["why"] as? String)?.contains(LEASE_NO_ACCEL) == true } == true
+        }.keys.toList()
+        if (gone.isEmpty()) return 0
+        gone.forEach { m.remove(it) }
+        write(m)
+        gone.size
+    }
+
     companion object {
         const val PASSED = "passed"
         const val FAILED = "failed"
@@ -317,6 +348,8 @@ internal class AcceleratorRecords(private val file: File) {
         /** Core 69276aa's QLC_D_ACCEL_FIRMWARE: held for the OS build it was found on, whatever the SDK or the time. */
         const val FIRMWARE = "firmware"
         const val MAX_UNFINISHED = 2
+        /** The Core's detail name of QLC_D_LEASE_NO_ACCEL (21.6). */
+        const val LEASE_NO_ACCEL = "lease_no_accel"
     }
 }
 

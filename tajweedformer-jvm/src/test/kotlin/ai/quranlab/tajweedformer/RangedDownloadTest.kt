@@ -19,6 +19,8 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
+// SDK 4.0.2 (SPEC 16.7): a new download is one request per file; the ranged path only completes a part an earlier SDK
+// stored in ranges. These tests run that path with 4.0.1's plan (RangePlan.RANGED_401).
 /**
  * SDK 3.1.3: a large model file is fetched in ranges, against a local server that answers closed ranges (206 with
  * `Content-Range`), `If-Range` and an ETag, and can drop a connection or give another answer for one range.
@@ -151,7 +153,7 @@ class RangedDownloadTest : OpenChecked() {
     }
 
     private fun store(root: File, transport: HttpTransport = UrlConnectionTransport()) =
-        ModelStore(root, base, transport, { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, retry = QUICK)
+        ModelStore(root, base, transport, { mapOf("x-qlab-key" to "k1") }, TestKit.verifier, ranges = RangePlan.RANGED_401, retry = QUICK)
 
     private fun layersOf(s: ModelStore) = s.manifest(true).files.first { it.path == BIG }
 
@@ -469,7 +471,7 @@ class RangedDownloadTest : OpenChecked() {
                 return real.get(url, headers, cancel)
             }
         }
-        val s = ModelStore(root, base, transport, auth, TestKit.verifier, retry = QUICK)
+        val s = ModelStore(root, base, transport, auth, TestKit.verifier, ranges = RangePlan.RANGED_401, retry = QUICK)
         val layers = layersOf(s)
         two = setOf(rangeOf(1, layers.size), rangeOf(2, layers.size))
         val failure = runCatching { s.downloader.fetch(layers) }.exceptionOrNull()
@@ -509,7 +511,7 @@ class RangedDownloadTest : OpenChecked() {
                 return real.get(url, headers, cancel)
             }
         }
-        val s = ModelStore(root, base, transport, auth, TestKit.verifier, retry = QUICK)
+        val s = ModelStore(root, base, transport, auth, TestKit.verifier, ranges = RangePlan.RANGED_401, retry = QUICK)
         val layers = layersOf(s)
         waits = rangeOf(1, layers.size)
         refused = rangeOf(2, layers.size)
@@ -539,7 +541,7 @@ class RangedDownloadTest : OpenChecked() {
                 return real.get(url, headers, cancel)
             }
         }
-        val s = ModelStore(root, base, transport, auth, TestKit.verifier, retry = QUICK)
+        val s = ModelStore(root, base, transport, auth, TestKit.verifier, ranges = RangePlan.RANGED_401, retry = QUICK)
         val layers = layersOf(s)
         refused = rangeOf(2, layers.size)
         val t = System.nanoTime()

@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Android, JVM" src="https://img.shields.io/badge/platform-Android%20%7C%20JVM-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 4.0.1" src="https://img.shields.io/badge/version-4.0.1-2a3b8f?style=flat-square">
+  <img alt="version: 4.0.2" src="https://img.shields.io/badge/version-4.0.2-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -45,7 +45,7 @@
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the right model for each device (55.5 MB) from our CDN in six regions, verifies it and keeps it up to date.
+**Nothing to host**<br>The SDK downloads the right model for each device (55.5 MB) from Quran Lab's servers, verifies it and keeps it up to date.
 
 </td>
 <td valign="top">
@@ -77,7 +77,7 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 dependencies { implementation("ai.quranlab:tajweedformer:4.0.1") }
 ```
 
-
+Maven Central serves 4.0.1 today. 4.0.2 follows there once it is released; the quick start below is the same for both.
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at

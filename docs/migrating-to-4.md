@@ -47,7 +47,7 @@ emulator and development keys only: with a production key an emulator gets `serv
 - **When the SDK needs Quran Lab.** When the SDK needs to reach Quran Lab to continue, `client.model()` is
   `needs_connection` if Quran Lab gave no answer, and `download_failed` if it answered with a server error. A refusal
   from Quran Lab is final. When Quran Lab answers that its lease service is briefly unavailable (503 with a
-  `Retry-After`), the SDK asks again after that time; such an answer is never a refusal.
+  `Retry-After`), the SDK asks again later, never sooner than that time; such an answer is never a refusal.
 - **A Model already open keeps running** until the app closes it.
 - **The clock is the Core's.** Changing the device clock has no effect on the lease.
 - **Refusals.** When Quran Lab stops a key or an app, its answer on the lease route is signed. Only when the Core
@@ -80,6 +80,12 @@ code, memory tier, free-space bucket and ABI. Never a message, a path, a URL or 
 failure per day, with its count; at most 16 a day and 32 waiting, kept 7 days. Your app's page at sdk.quranlab.ai
 lists them under Problems, with what to do. No option turns them off; Quran Lab can, from its signed config. For
 Google Play's data-safety form they are diagnostics, like the issue reports (the README's "Data safety" table).
+
+**The cause on the error (4.0.2).** The same tokens are on the error your app gets: `e.errorCause`, a
+`TajweedErrorCause` with `stage`, `reason`, `httpStatus`, `errorName`, `errorCode`, and on `needs_connection`
+`needs`: `model` when the model's files are not on the phone yet (connect to download), `lease` when the model is on
+the phone and needs Quran Lab's answer to open. Log it, or show the right words from it. It is null for the five codes
+above that are never reported. `e.cause` is still the underlying exception.
 
 ## 4. Recited ayahs and the app's judgement
 
@@ -126,8 +132,11 @@ its sheet is on screen.
 
 ## 7. Settings
 
-`TajweedClientOptions(unmeteredOnly = true)` makes the SDK's own background downloads (the recited-ayah index, an
-update of a build) wait for Wi-Fi or Ethernet. `client.model()` and `prefetch()` keep their own argument.
+There is no network setting. From 4.0.2 every download and upload goes on whatever network the phone has, mobile data
+too: a first install, an update, another context's files, the accelerator's program, `prefetch()` and shared
+recordings. `TajweedClientOptions.unmeteredOnly` and `prefetch(unmeteredOnly)` of 4.0.0 and 4.0.1 are gone, with no
+replacement: delete the argument. The system may still pause a download by its own settings (Data Saver, background
+limits); the SDK adds no wait of its own. A download an earlier SDK left waiting for Wi-Fi goes on after the update.
 
 ## 8. What stays the same
 

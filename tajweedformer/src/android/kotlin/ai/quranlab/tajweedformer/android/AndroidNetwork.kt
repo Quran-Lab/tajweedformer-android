@@ -5,17 +5,10 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 
-/** Unmetered = the active network has NET_CAPABILITY_NOT_METERED (Wi-Fi, Ethernet; not mobile data
- *  or a metered hotspot). Needs ACCESS_NETWORK_STATE (declared by the SDK's manifest). */
+/** The network as `diagnose().connection` reports it. Needs ACCESS_NETWORK_STATE (declared by the SDK's manifest).
+ *  SDK 4.0.2: it gates nothing but `none` ([NetworkPolicy]); no request waits for Wi-Fi or for the data saver. */
 internal class AndroidNetwork(context: Context) : NetworkPolicy {
     private val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-
-    override fun isUnmetered(): Boolean = try {
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-    } catch (_: SecurityException) {
-        false
-    }
 
     /** `none` without a network that reaches the internet; `metered` on mobile data, a metered hotspot, or while
      *  the system's data saver is on; else `unmetered`. `unknown` when the state cannot be read. */
@@ -29,15 +22,5 @@ internal class AndroidNetwork(context: Context) : NetworkPolicy {
         }
     } catch (_: Exception) {
         "unknown"
-    }
-
-    /** SPEC 17.3: Data Saver on for this app (`RESTRICT_BACKGROUND_STATUS_ENABLED`; `WHITELISTED` means the user
-     *  exempted the app), or roaming (no `NET_CAPABILITY_NOT_ROAMING`). */
-    override fun saveData(): Boolean = try {
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        cm.restrictBackgroundStatus == ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED ||
-            (caps != null && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING))
-    } catch (_: Exception) {
-        false
     }
 }

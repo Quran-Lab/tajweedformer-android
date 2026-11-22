@@ -3,7 +3,6 @@ package ai.quranlab.tajweedformer.android
 import ai.quranlab.tajweedformer.AndroidMicrophone
 import ai.quranlab.tajweedformer.ClientPlatform
 import ai.quranlab.tajweedformer.Json
-import ai.quranlab.tajweedformer.NetworkPolicy
 import ai.quranlab.tajweedformer.SharingDialogs
 import ai.quranlab.tajweedformer.SharingTheme
 import ai.quranlab.tajweedformer.TajweedClient
@@ -29,7 +28,6 @@ import android.content.ContextWrapper
 import android.content.pm.ApplicationInfo
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -112,7 +110,7 @@ internal object AndroidPlatform {
             osBuild = Build.FINGERPRINT ?: "",
             // the signed config's accel_deny matches this (3.1.6's incident reports' form)
             osBuildReport = "${Build.VERSION.RELEASE}/${Build.ID}/${Build.VERSION.INCREMENTAL}",
-            network = if (debug && DebugHooks.unmetered) NetworkPolicy { true } else network,
+            network = network,
             microphone = microphone,
             warmRate = microphone.nativeRate(),
             lifecycle = { c -> register(app, c) },
@@ -123,8 +121,10 @@ internal object AndroidPlatform {
             identity = { dir -> KeystoreIdentity(app, dir) },
             stateVault = { dir -> KeystoreStateVault(dir) },
             bootId = BootId.read(app),
-            // the large file in ranges (SDK 3.1.3); a debuggable app can ask for one stream per file, as 3.1.2 did
-            modelRanges = if (debug && DebugHooks.singleStream) ai.quranlab.tajweedformer.RangePlan.SINGLE else ai.quranlab.tajweedformer.RangePlan.DEFAULT,
+            // SDK 4.0.2 (SPEC 16.7): one request per model file, a Range only to resume; ranges an earlier SDK stored are
+            // completed in their own ranges. Nothing on Android needs pieces: the answer is read as a stream in a 64 KiB
+            // buffer whatever the file's size (the Alcatel 1 too), and the WorkManager job resumes a cut stream the same way
+            modelRanges = ai.quranlab.tajweedformer.RangePlan.DEFAULT,
             // the download goes on when the app leaves or its process ends (SDK 3.1.3); a debuggable app can turn it off
             downloads = if (debug && !DebugHooks.backgroundDownloads) null else ModelDownloads(app),
         ).also { if (debug) DebugHooks.watchDownloads() }
@@ -202,7 +202,6 @@ internal object AndroidPlatform {
             modelCode = DeviceProfile.modelCode(Build.MODEL),
             abi = (if (android.os.Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS).firstOrNull(),
         )
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         return CloudEnvironment(
             storage = storage,
             app = app,
@@ -215,7 +214,6 @@ internal object AndroidPlatform {
             inputRoute = { inputRoute(context) },
             locale = { context.resources.configuration.locales[0].toLanguageTag() },
             debugBuild = debug,
-            unmetered = { !cm.isActiveNetworkMetered },
             log = { android.util.Log.w("QuranLab", it) },
         )
     }
@@ -425,11 +423,11 @@ internal object AndroidPlatform {
         override fun scheduleUploads(cloud: QuranLabCloud, atMs: Long?) {
             if (atMs == null) uploads.execute { try { cloud.sharing.outbox.drain() } catch (_: Exception) {} }
             val delay = atMs?.let { maxOf(0, it - System.currentTimeMillis()) } ?: 30_000L
-            val net = if (cloud.options.uploadsOnUnmeteredOnly) NetworkType.UNMETERED else NetworkType.CONNECTED
+            // any network (SDK 4.0.2, section 33: no upload waits for Wi-Fi)
             try {
                 wm.enqueueUniqueWork("quranlab.outbox", ExistingWorkPolicy.KEEP,
                     OneTimeWorkRequestBuilder<ai.quranlab.tajweedformer.cloud.android.OutboxWorker>()
-                        .setConstraints(Constraints.Builder().setRequiredNetworkType(net).build())
+                        .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                         .setInitialDelay(delay, TimeUnit.MILLISECONDS)
                         .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                         .build())

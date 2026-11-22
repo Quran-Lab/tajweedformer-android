@@ -40,7 +40,9 @@ class PublicContractTest : OpenChecked() {
             "TajweedSharing", "TajweedAnalytics", "TajweedDiagnosis",
             "TajweedError", "Microphone",
             // SDK 4.0 (SPEC 17.9): the app's judgement of a recited range
-            "RecitedOutcome")
+            "RecitedOutcome",
+            // SDK 4.0.2 (ERRORS_40.md 24.13): the cause on the app's error, `TajweedError.errorCause`
+            "TajweedErrorCause")
         // the sharing UI components: the Views' theme and settings rows, the Compose style
         val ui = listOf("SharingTheme", "SharingSettingsView", "SharingStyle")
         assertEquals((naming + ui).sorted(), found)

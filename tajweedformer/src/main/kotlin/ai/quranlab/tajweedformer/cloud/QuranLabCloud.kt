@@ -18,11 +18,6 @@ internal data class CloudOptions @JvmOverloads constructor(
      * who said "Share"); the signed config's `flags.contributions` is Quran Lab's incident switch for every app.
      */
     val contributions: Boolean = false,
-    /**
-     * Sharing uploads only on unmetered networks (default: any network; about 86 MB per hour at the top
-     * bitrate, less where uploads struggle: the bitrate steps down to 32 kbit/s, about 16 MB an hour).
-     */
-    val uploadsOnUnmeteredOnly: Boolean = false,
     val apiUrl: String = QuranLabApi.DEFAULT_API,
     /** The Ed25519 keys the signed config may be signed with (raw 32 bytes). */
     val trustedKeys: List<ByteArray> = listOf(ManifestVerifier.QURAN_LAB_PUBLIC_KEY),
@@ -50,8 +45,6 @@ internal class CloudEnvironment(
     val locale: () -> String = { java.util.Locale.getDefault().toLanguageTag() },
     /** A debuggable build. */
     val debugBuild: Boolean = false,
-    /** The current network is unmetered (Wi-Fi, Ethernet). */
-    val unmetered: () -> Boolean = { true },
     /** The SDK's warnings for the developer (Android: `Log.w`); only debuggable builds write any. */
     val log: (String) -> Unit = { System.err.println("W/QuranLab: $it") },
 )
@@ -101,7 +94,10 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
     /** The hosts of each role and their failover order, for the API and the model requests. */
     val endpoints: Endpoints = options.endpoints ?: Endpoints.of(options.apiUrl, env.clock)
 
-    val api = QuranLabApi(options.apiUrl, env.http, endpoints) { r ->
+    /** 28.11 (SDK 4.0.2): every route's Retry-After hold and the optional traffic's rows, kept across restarts. */
+    internal val holds = RouteHolds(File(File(env.storage, "cloud"), "holds.json"), env.clock)
+
+    val api = QuranLabApi(options.apiUrl, env.http, endpoints, holds) { r ->
         if (r.status == 401 || r.status == 403) r.error.reason?.let { if (ModelGate.stops(r.status, it)) refusals.stop(it, Refusals.API) }
     }
     val config = ConfigStore(cloudDir, options.trustedKeys, env.clock)
@@ -136,6 +132,12 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         private set
     @Volatile private var telemetryRetryAt = 0L
     private var telemetryFailures = 0
+
+    /** 28.11 item 4: telemetry's `POST /v1/events` after a 429 (a return to the foreground does not end it). */
+    internal val eventsSlowDown = SlowDown(env.clock, holds, "events")
+
+    /** 28.11 item 4: the issue and error reports' `POST /v1/issues` after a 429. */
+    internal val issuesSlowDown = SlowDown(env.clock, holds, "issues")
     @Volatile private var lastSealAt = 0L
 
     /** SDK 4.0: the recited count of each finished take (SPEC 17.1, 17.6); the Client gives it the Core. */
@@ -148,6 +150,11 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         endpoints.onFailover = { f ->
             f.stage?.let { stage -> silent(ErrorCause(stage, "failover", f.status, errorCode = f.reason, hostRole = f.role, fallback = true)) }
         }
+        // 34.6: the model requests' counts per `models` host, with the day's telemetry (the background job's too: its
+        // Client is made the same way)
+        endpoints.meter = telemetry
+        // 28.11 items 2 and 3: a model file's 429, or 503 with Retry-After, holds its path on its host, across restarts
+        endpoints.holds = holds
         // SDK 4.0 (owner, 11-16): anonymous analytics are always on; the signed config's flags.analytics is the only switch
         telemetry.enabled = config.current?.flags?.analytics != false
         telemetry.metric = { g -> currentConfig?.flags?.metric(g) != false }
@@ -284,7 +291,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             telemetry.launch()
             register(modelRevision)
         }
-        refreshConfig()
+        refreshConfigIfOlder()
         sendPoint()
         if (sharing.outbox.hasWork()) env.scheduler.scheduleUploads(this)
     }
@@ -394,6 +401,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             lastConfigError = null
             lastConfigCause = null
             lastConfigAt = env.clock()
+            try { cloudDir.mkdirs(); configAtFile.writeText(lastConfigAt.toString()) } catch (_: Exception) {}
             applyFlags(c)
             noteSdkLatest(c)
             c?.pinUnavailable?.let { v -> if (env.debugBuild) try { env.log("model version $v is not available for this SDK: using ${c.recommendedVersion}") } catch (_: Exception) {} }
@@ -410,6 +418,24 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             if (silentReport) silentCall(e, "config")
             config.current.also { noteSdkLatest(it) }
         }
+    }
+
+    /** When the config in force was last answered (ms), kept across restarts for [refreshConfigIfOlder]. */
+    private val configAtFile get() = File(cloudDir, "config.at")
+
+    /**
+     * Contract 28.11 item 5 (SDK 4.0.2): the config is asked at launch, when the app comes to the foreground and at a
+     * session's start, and only when the one in force is older than [CONFIG_MAX_AGE_MS] or there is none ([configFresh]).
+     * 4.0.1's Android asked it at every minute tick while the app was in use.
+     */
+    fun refreshConfigIfOlder(): RemoteConfig? = if (configFresh()) config.current else refreshConfig()
+
+    /** A verified config is in force and was answered less than [CONFIG_MAX_AGE_MS] ago (in this process or an earlier
+     *  one; a time ahead of the clock, a clock that moved back, is no age). */
+    fun configFresh(): Boolean {
+        val at = maxOf(lastConfigAt, try { configAtFile.readText().trim().toLong() } catch (_: Exception) { 0L })
+        val now = env.clock()
+        return config.current != null && at <= now && now - at < CONFIG_MAX_AGE_MS
     }
 
     private val pinFile get() = File(cloudDir, "config.pin")
@@ -486,10 +512,11 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
         var reports = 0
         var sent = 0
         val flags = currentConfig?.flags
-        if (telemetry.enabled && flags?.analytics != false && env.clock() >= telemetryRetryAt) reports = sendTelemetry()
-        if (options.issueReports && flags?.issues != false) sent = sendIssues()
+        if (telemetry.enabled && flags?.analytics != false && env.clock() >= telemetryRetryAt && eventsSlowDown.allowed()) reports = sendTelemetry()
+        // 28.10: nothing to /v1/issues before its Retry-After (or the wait of 429s in a row) has passed
+        if (options.issueReports && flags?.issues != false && issuesSlowDown.allowed()) sent = sendIssues()
         // 24.6: after the telemetry reports, each queued error report
-        if (options.issueReports && flags?.issues != false) errorsSent += sendErrors()
+        if (options.issueReports && flags?.issues != false && issuesSlowDown.allowed()) errorsSent += sendErrors()
         return reports to sent
     }
 
@@ -508,6 +535,8 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             val body = try { f.readBytes() } catch (_: Exception) { telemetry.dropReport(f); continue }
             try {
                 val r = authed("events") { api.events(it, body).also { r -> if (r.status == 401) throw CloudException(r.error, "events") } }
+                // 28.10: a 429 waits its Retry-After (300 s when none), doubling in a row; a 503's Retry-After is honoured
+                eventsSlowDown.answered(r.status, r.retryAfter)
                 when {
                     r.status == 202 || r.ok -> { telemetry.dropReport(f); n++; telemetryFailures = 0 }
                     r.status == 400 -> {
@@ -520,6 +549,8 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
                         silent(ErrorCause("events", "http", 413, errorCode = ErrorRules.serverCode(r.error)))
                     }
                     r.status == 403 -> { refused(CloudException(r.error, "events"), "events"); return n }
+                    // the 429's wait is the route's own (28.10), not the minute and ten of a failure
+                    r.status == 429 -> return n
                     else -> { backoffTelemetry(); return n }
                 }
             } catch (e: CloudException) {
@@ -546,6 +577,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             val b = issues.firstToSend() ?: break
             try {
                 val r = authed("issues") { api.issue(it, b).also { r -> if (r.status == 401) throw CloudException(r.error, "issues") } }
+                issuesSlowDown.answered(r.status, r.retryAfter)
                 if (r.ok || r.status == 400 || r.status == 413) { issues.removeFirst(); if (r.ok) n++ } else break
             } catch (e: CloudException) {
                 break
@@ -629,6 +661,7 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
             val body = errors.body(r, env.app, env.device, ai.quranlab.tajweedformer.SdkInfo.VERSION)
             try {
                 val a = authed("issues") { api.issue(it, body).also { x -> if (x.status == 401) throw CloudException(x.error, "issues") } }
+                issuesSlowDown.answered(a.status, a.retryAfter)
                 if (a.ok) { n++; 202 } else a.status
             } catch (_: Exception) {
                 null
@@ -684,6 +717,9 @@ internal class QuranLabCloud(val options: CloudOptions, val env: CloudEnvironmen
 
         /** [lastConfigError] when the system did not let the request out (no INTERNET permission). */
         const val NOT_PERMITTED = "network_not_permitted"
+
+        /** 28.11 item 5: the config in force is asked again only when older than this. */
+        const val CONFIG_MAX_AGE_MS = 300_000L
 
         /** 24.6: an occurrence that made a new report is sent this long after it, while the app is in the foreground. */
         const val ERROR_SEND_DELAY_MS = 30_000L

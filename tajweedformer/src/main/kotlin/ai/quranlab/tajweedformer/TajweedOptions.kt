@@ -10,6 +10,8 @@ import java.io.File
  * always on; no option turns them off. Quran Lab's signed config is the only switch.
  *
  * SDK 4.0: every app shows the same sharing sheet under the same ask rules; no option changes the sheet.
+ *
+ * SDK 4.0.2: no option holds a download or an upload for Wi-Fi: the SDK uses whatever network the device has.
  */
 public class TajweedClientOptions @JvmOverloads constructor(
     /** The app's id as registered at sdk.quranlab.ai. Null: the app's own (Android: the package name). */
@@ -19,12 +21,6 @@ public class TajweedClientOptions @JvmOverloads constructor(
     /** Where the SDK keeps its files (the model, the signed config, the sharing queue). Null: the platform's
      *  private folder (Android: `noBackupFilesDir/quranlab`). */
     public val storage: File? = null,
-    /**
-     * SDK 4.0 (SPEC 17.3): the SDK's own downloads (the recited-ayah index, an update of a build) wait for Wi-Fi or
-     * Ethernet. Off (the default): they go on any network unless the system says to save data (Data Saver on for the
-     * app, or roaming). `client.model()` and `prefetch()` are not affected: they keep their own argument.
-     */
-    public val unmeteredOnly: Boolean = false,
     /**
      * SDK 4.0.1: the app's build number, sent with the app's version on every config request so that the developer's
      * model version rules at sdk.quranlab.ai can match it. Null: the app's own (Android: `longVersionCode`, `versionCode`

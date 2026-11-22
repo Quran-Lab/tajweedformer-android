@@ -123,7 +123,12 @@ The SDK sends a delta: what happened since the previous delta of the same UTC da
 with a fresh random `report_id` (32 lower-case hex, drawn per delta). It sends one every 15 minutes while
 the app is in use and one when the app goes to the background; unsent deltas are kept up to 7 days. A retry
 sends the same body with the same `report_id`, which the server counts once. 202 deletes the delta; 400 drops
-it; 401 renews the token and retries; 429, 5xx, 503 and network errors keep it for a retry with backoff.
+it; 401 renews the token and retries; 429, 5xx, 503 and network errors keep it for a retry with backoff. From 4.0.2
+a 429 holds the route for its `Retry-After` (300 seconds when it has none), doubling at each 429 in a row up to an
+hour, and a 503's `Retry-After` is honoured; the issue and error reports and the shared recordings' uploads do the
+same, every other route honours a `Retry-After` too, and the holds are kept across restarts. A
+server that asks the SDK to wait for one model file (a 429, or a 503 with a `Retry-After`) is not asked for that file
+again before then, and the other files go on.
 
 The body is telemetry v2 (`"v": 2`, `day`, `product`, `platform`, `sdk_version`, `app_version`, `device`,
 `cohorts` (may be `[]`), `coverage`, `downloads`) with these fields added, each left out when zero:
@@ -138,6 +143,7 @@ The body is telemetry v2 (`"v": 2`, `day`, `product`, `platform`, `sdk_version`,
 | `rule_checks`, `rule_flags` | per tajweed rule or class id (`vowel_sub` ... `insertion`, `madd`, `qalqalah`, `gemination`, `word`), how many were checked and how many of those were flagged |
 | `share_asked`, `share_yes`, `share_no` | the sharing sheet was shown, the learner chose to share, the learner declined |
 | `promotions` | iOS, macOS and Android only: per accelerator, model revision and context, the promotions that ended and the failovers (below) |
+| `hosts` | SDK 4.0.2: per Quran Lab download server the install asked for model files that day, the download counts (below) |
 
 Each `promotions` entry (at most 8; zero counts left out):
 
@@ -165,6 +171,23 @@ medians in milliseconds (at most 8 a day), as the Apple SDK sends them. `failove
 result. `demoted` counts promoted builds taken back to the CPU after a failure in a session.
 `blank_confirmed_ok` counts silent stretches the CPU confirmed (no switch).
 
+Each `hosts` entry (at most 8 a day, each host once; every field always sent):
+
+```json
+{"role": "models", "host": "cdn.quranlab.ai", "files": 9, "bytes": 56544952, "requests": 11,
+ "unreachable": 0, "hedged": 0, "slow_switches": 0,
+ "ttfb_ms": [0, 3, 5, 2, 1, 0, 0, 0, 0], "kbps": [0, 0, 0, 1, 2, 3, 2, 1, 0, 0]}
+```
+
+`host` is one of Quran Lab's own host names, never a path or an address. `files` counts the files whose last byte
+came from the host (the build's `manifest.json` is one), `bytes` the model bytes it sent, `requests` every request
+to it (resumes included) and `unreachable` those of them that got no usable answer: no connection, a stall or a cut,
+a 5xx, a redirect or a page that is not the host's own. `ttfb_ms` buckets each answered request's time from sent to
+status: under 100, 250, 500, 1000, 1500, 3000, 6000 and 10000 ms, and over. `kbps` buckets each transfer of at least
+256 KiB by its average rate over its body, in kB/s of 1000 bytes: under 32, 64, 128, 256, 512, 1024, 2048, 4096 and
+8192, and over. `hedged` and `slow_switches` are 0 in 4.0.2. The counts are kept on the device with the day's other
+totals (the background download's included) and sent with them.
+
 Never included: audio, text, phonemes, verdict lists, timestamps, ids, locale, account, network type,
 location, app user data.
 
@@ -180,7 +203,7 @@ whatever the model's id; none when the device holds no model).
 1. **First run.** The first install downloads only the CPU files of the default context, and the first session
    runs on the exact CPU engine. Nothing else is downloaded or compiled before it.
 2. **In the background,** one step at a time, remembered across launches for each model revision, context,
-   accelerator build, OS build and device: download the accelerator's program (Wi-Fi or an unmetered network,
+   accelerator build, OS build and device: download the accelerator's program (on any network, from 4.0.2;
    resumable, verified against the signed manifest; usually as a small delta that the SDK applies to the CPU
    weights already on the device, checking the rebuilt program's SHA-256 before the runtime sees it); compile
    it for this device at low priority (the Neural Engine compiler on Apple, the NPU program on Android, kept and

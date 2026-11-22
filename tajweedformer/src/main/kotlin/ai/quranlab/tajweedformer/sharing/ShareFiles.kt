@@ -79,7 +79,21 @@ internal object ShareFiles {
         null
     }
 
+    /**
+     * Test seam: from when it is set, every write of a shared recording
+     * fails as on a full disk (an IOException, "No space left on device"): its segments' pages, the markers,
+     * `capture.json`, `session.json`, the take list, `end.json`, and the recovery's own writes. Set only by the tests
+     * that replay the vector; nothing in the SDK sets it.
+     */
+    @Volatile @JvmField var failWrites: Boolean = false
+
+    /** Each write of a recording asks first: it fails here while [failWrites] is set. */
+    fun writing(what: String) {
+        if (failWrites) throw java.io.IOException("No space left on device ($what)")
+    }
+
     fun writeJson(f: File, v: Any?) {
+        writing(f.name)
         val tmp = File(f.parentFile, f.name + ".tmp")
         tmp.writeText(Json.write(v))
         if (!tmp.renameTo(f)) { f.delete(); if (!tmp.renameTo(f)) throw java.io.IOException("cannot write ${f.name}") }
@@ -203,7 +217,10 @@ internal object ShareFiles {
             val d = try { audio.readBytes() } catch (_: Exception) { ByteArray(0) }
             val (keep, granule) = wholePages(d)
             if (keep == 0) { audio.delete(); continue }
-            if (keep < d.size) RandomAccessFile(audio, "rw").use { it.setLength(keep.toLong()) }
+            if (keep < d.size) {
+                writing(audio.name)
+                RandomAccessFile(audio, "rw").use { it.setLength(keep.toLong()) }
+            }
             try { mark(folder, n, granule, bitrates.getOrNull(n - 1)) } catch (_: Exception) {}
         }
         val last = markers(folder).lastOrNull()

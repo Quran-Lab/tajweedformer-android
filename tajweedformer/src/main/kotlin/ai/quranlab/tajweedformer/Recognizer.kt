@@ -237,6 +237,14 @@ internal class Recognizer private constructor(
         val key = "${model.manifest.build}:${plan.kind}:$context"
         // off for good, or held by a transient verdict (slower than the CPU engine, the runtime refused it on this OS)
         if (plan.records.blocked(key) || plan.held(key)) return
+        // 21.6: a lease that allows no accelerator program: no attempt, nothing counted (asked again at the next lease)
+        if (!(try { plan.allowed() } catch (_: Exception) { true })) {
+            try { plan.leaseNoAccel() } catch (_: Exception) {}
+            return
+        }
+        // one attempt per engine at a time (a lease accepted while one runs asks for none: [promoteAgain]); an engine
+        // opened again for another rate starts its own, and the old one's attempt ends on `engine !== e`
+        if (!promoting.add(e)) return
         ce.onFailover = { why ->
             val c = BackendChoice(Backend.CPU, "failover", why, options.soc, context, model.manifest.build)
             backendChoice = c
@@ -244,10 +252,23 @@ internal class Recognizer private constructor(
             plan.report(ai.quranlab.tajweedformer.core.PromotionInfo(plan.soc, model.manifest.build, context, promoted = false,
                 reason = "failover", detail = why, failover = true, version = model.manifest.version ?: ""))
         }
-        Thread({ promote(ce, plan, key) }, "tajweedformer-accel").apply {
+        Thread({ try { promote(ce, plan, key) } finally { promoting.remove(e) } }, "tajweedformer-accel").apply {
             isDaemon = true
             priority = Thread.MIN_PRIORITY
         }.start()
+    }
+
+    /** The engines a promotion attempt runs for ([promoteLater]). */
+    private val promoting: MutableSet<TajweedEngine> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * SDK 4.0.2: a lease the Core accepted allows accelerator programs now. The engine's key goes
+     * on from where it stood: a promoted key loads its build again with no golden test, one never tried starts its
+     * attempt. Nothing while an attempt runs, once the engine is promoted, or after [close].
+     */
+    internal fun promoteAgain() {
+        if (closed || backend == Backend.NPU) return
+        promoteLater(engine)
     }
 
     private fun promote(e: ai.quranlab.tajweedformer.core.AcceleratorHost, plan: ai.quranlab.tajweedformer.core.AcceleratorPlan, key: String) {
@@ -264,6 +285,8 @@ internal class Recognizer private constructor(
         val passedBefore = records.passedWith(key, plan.dispatchId) || records.passedBefore(key)
         val clips = if (passedBefore) emptyList() else try { plan.clips() } catch (_: Exception) { emptyList() }
         if (!passedBefore && clips.isEmpty()) return
+        // the verdict before this attempt, for a prepare the lease refuses (21.6: no attempt, the key as it stood)
+        val before = records.entry(key)
         if (!records.begin(key, plan.dispatchId)) {
             // the process ended twice during the preparation (the system, or the vendor's runtime, ended it): the CPU
             // engine, held until an SDK, OS or dispatch library update or 30 days, never off for good
@@ -304,6 +327,14 @@ internal class Recognizer private constructor(
                 return
             }
             val qc = ai.quranlab.tajweedformer.core.Core
+            // 21.6: the lease in force allows no accelerator program (it changed since the attempt was asked for): not a
+            // failure and not an attempt. The key stays as it stood (a promoted key stays promoted; 4.0.1 replaced its
+            // pass with `waiting`), the CPU engine runs, and it is said as the deny list says a denial, not as `other`
+            if (x.status == qc.E_LEASE && x.detail == qc.D_LEASE_NO_ACCEL) {
+                records.restore(key, before)
+                try { plan.leaseNoAccel() } catch (_: Exception) {}
+                return
+            }
             val reason = when (x.detail) {
                 qc.D_ACCEL_PROGRAM -> "compile_error"
                 qc.D_ACCEL_RUNTIME, qc.D_ACCEL_CONTRACT -> "load_error"

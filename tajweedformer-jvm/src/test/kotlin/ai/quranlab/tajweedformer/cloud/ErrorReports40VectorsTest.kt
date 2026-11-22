@@ -1,6 +1,8 @@
 package ai.quranlab.tajweedformer.cloud
 
 import ai.quranlab.tajweedformer.Json
+import ai.quranlab.tajweedformer.at
+import ai.quranlab.tajweedformer.needing
 import ai.quranlab.tajweedformer.core.Core
 import ai.quranlab.tajweedformer.core.CoreException
 import org.junit.Assert.assertEquals
@@ -52,6 +54,36 @@ class ErrorReports40VectorsTest : ai.quranlab.tajweedformer.OpenChecked() {
             assertEquals("$c", c["code"], got)
             assertEquals("$c", c["reported"], ErrorRules.reported(stage, reason, got))
         }
+    }
+
+    /**
+     * SDK 4.0.2 (24.13): every `causes` row, an occurrence to the code the app gets and the cause its error carries: the
+     * error made as the SDK makes it ([ai.quranlab.tajweedformer.at] with the occurrence's cause, unfiltered, and
+     * [ai.quranlab.tajweedformer.needing] with its `on_device`), read back through the public `errorCause`. A value
+     * that fails 24.2's pattern is left out; a silent failure makes no error; the codes no report is made for carry none.
+     */
+    @Test
+    fun everyCause() {
+        val cases = list("causes")
+        assertEquals(15, cases.size)
+        for (c in cases) {
+            val code = ErrorRules.codeFor(c["stage"] as String, c["reason"] as String, int(c["http_status"]), c["on_device"] as String,
+                c["error_code"] as String?)
+            assertEquals("$c", c["code"], code)
+            if (code == "none") {
+                assertNull("$c", c["cause"])
+                continue
+            }
+            val e = ai.quranlab.tajweedformer.TajweedError(code)
+                .at(ErrorCause(c["stage"] as String, c["reason"] as String, int(c["http_status"]), c["error_name"] as String?, c["error_code"] as String?))
+                .needing(c["on_device"] as String)
+            val got = e.errorCause!!
+            val map = linkedMapOf<String, Any?>("stage" to got.stage, "reason" to got.reason, "http_status" to got.httpStatus,
+                "error_name" to got.errorName, "error_code" to got.errorCode, "needs" to got.needs).filterValues { it != null }
+            val want = (c["cause"] as Map<String, Any?>).mapValues { (_, x) -> if (x is Double) x.toInt() else x }
+            assertEquals("${c["label"]}", want, map)
+        }
+        for (code in ErrorRules.CODES_NOT_REPORTED) assertNull(code, ai.quranlab.tajweedformer.TajweedError(code).errorCause)
     }
 
     @Test

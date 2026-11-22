@@ -24,7 +24,7 @@ import java.io.File
 internal class Telemetry(
     private val dir: File,
     private val clock: () -> Long = System::currentTimeMillis,
-) {
+) : ModelHostMeter {
     /** The learner's own days (17.8), kept beside the counts (`<storage>/core/learner.json`); never sent. */
     private val learnerFile: File = File(dir.parentFile ?: dir, "core/learner.json")
 
@@ -194,6 +194,39 @@ internal class Telemetry(
             }
         }
         persist(force = true)
+    }
+
+    // ---- 34.6: per `models` host (the model requests, through Endpoints.meter) ----
+
+    override fun request(host: String, ttfbMs: Long?) = onHost(host, false) { c ->
+        c.requests++
+        ttfbMs?.let { c.ttfb[PerHostCounts.bucket(it.toDouble(), PerHostCounts.TTFB_MS)]++ }
+    }
+
+    override fun unreachable(host: String) = onHost(host, true) { it.unreachable++ }
+
+    override fun transfer(host: String, bytes: Long, nanos: Long) = onHost(host, false) { c ->
+        if (bytes <= 0) return@onHost
+        c.bytes += bytes
+        if (bytes >= PerHostCounts.MIN_TRANSFER) c.kbps[PerHostCounts.rateBucket(bytes, nanos)]++
+    }
+
+    override fun file(host: String) = onHost(host, true) { it.files++ }
+
+    /** [body] on today's counts of [host]: a name of the allow-list only, and at most [PerHostCounts.MAX_HOSTS] a day. */
+    private fun onHost(host: String, force: Boolean, body: (HostCounts) -> Unit) {
+        val h = host.lowercase(java.util.Locale.ROOT)
+        if (!HostNames.allowed(h)) return
+        rec { a ->
+            val c = a.hosts[h] ?: if (h in a.dayHosts || a.dayHosts.size < PerHostCounts.MAX_HOSTS) {
+                HostCounts().also { a.hosts[h] = it; a.dayHosts.add(h) }
+            } else null
+            if (c != null) {
+                body(c)
+                dirty = true
+                persist(force)
+            }
+        }
     }
 
     /** A lease refresh ended (17.8 `lease`): null ok, else its failure's kind. */
@@ -522,8 +555,9 @@ internal class Telemetry(
                         n++
                     }
                     // what must not be counted again on this day (the takes it counted, its learner facts) stays with it
-                    val carried = a?.let { old -> DayAggregate().also { n -> old.m40.carryInto(n.m40); n.dayRules.addAll(old.dayRules) } }
-                    if (carried != null && (carried.m40.recitedIds.isNotEmpty() || carried.m40.learnerDone || carried.dayRules.isNotEmpty())) {
+                    val carried = a?.let { old -> DayAggregate().also { n -> old.m40.carryInto(n.m40); n.dayRules.addAll(old.dayRules); old.carryHosts(n) } }
+                    if (carried != null && (carried.m40.recitedIds.isNotEmpty() || carried.m40.learnerDone || carried.dayRules.isNotEmpty() ||
+                            carried.dayHosts.isNotEmpty())) {
                         write(d, carried)
                     } else {
                         f.delete()
@@ -766,6 +800,10 @@ internal class DayAggregate {
     val promotions = LinkedHashMap<PromoKey, PromoCounts>()
     /** The distinct rules the app reported today (at most [Telemetry.MAX_RULES]), kept across the day's deltas. */
     val dayRules = LinkedHashSet<String>()
+    /** 34.6: the counts per `models` host since the last send point, in the order the hosts were first asked. */
+    val hosts = LinkedHashMap<String, HostCounts>()
+    /** 34.6: the hosts counted today (at most [PerHostCounts.MAX_HOSTS]), kept across the day's deltas. */
+    val dayHosts = LinkedHashSet<String>()
     /** SDK 4.0: [ayahs] and [coverage] are the MEASURED ayahs (17.1); the app's fallback and 17.8, 17.9 are here. */
     val m40 = Measured40()
 
@@ -773,9 +811,17 @@ internal class DayAggregate {
 
     fun promotion(k: PromoKey): PromoCounts = promotions.getOrPut(k) { PromoCounts() }
 
-    /** Nothing to send (the day's rule names alone are not something to send). */
+    /** Nothing to send (the day's rule names alone are not something to send, nor host counts that are not sent). */
     fun isEmpty(): Boolean = cohorts.isEmpty() && downloads.isEmpty() && coverage.all { it == 0 } && launches == 0 && ayahs == 0 &&
-        words == 0 && ruleChecks.isEmpty() && shareAsked == 0 && shareYes == 0 && shareNo == 0 && promotions.isEmpty() && m40.isEmpty()
+        words == 0 && ruleChecks.isEmpty() && shareAsked == 0 && shareYes == 0 && shareNo == 0 && promotions.isEmpty() && m40.isEmpty() &&
+        (hosts.isEmpty() || !PerHostCounts.send)
+
+    /** At a send point: the day's hosts stay with the day (the cap of 8 is a day's); their counts too while they are not
+     *  sent ([PerHostCounts.send] off), else they start again from zero like every count. */
+    fun carryHosts(to: DayAggregate) {
+        to.dayHosts.addAll(dayHosts)
+        if (!PerHostCounts.send) to.hosts.putAll(hosts)
+    }
 
     /** The on-disk form (the payload's fields plus the cohort keys). */
     fun toStore(): Map<String, Any?> = linkedMapOf(
@@ -788,6 +834,8 @@ internal class DayAggregate {
         "promotions" to promotions.map { (k, c) -> Promo.json(k, c, store = true) },
         "day_rules" to dayRules.toList(),
         "m40" to m40.toStore(),
+        "hosts" to hosts.map { (h, c) -> c.toStore(h) },
+        "day_hosts" to dayHosts.toList(),
     )
 
     companion object {
@@ -834,6 +882,10 @@ internal class DayAggregate {
             (m["promotions"] as? List<Any?>)?.forEach { x -> val (k, c) = Promo.fromJson(x as Map<String, Any?>); a.promotions[k] = c }
             (m["day_rules"] as? List<Any?>)?.forEach { r -> (r as? String)?.let { a.dayRules.add(it) } }
             (m["m40"] as? Map<String, Any?>)?.let { a.m40.fromStore(it) }
+            // 34.6 (SDK 4.0.2; a day of 4.0.1 has none)
+            (m["hosts"] as? List<Any?>)?.forEach { x -> (x as? Map<*, *>)?.let { HostCounts.fromStore(it) }?.let { (h, c) -> a.hosts[h] = c } }
+            (m["day_hosts"] as? List<Any?>)?.forEach { h -> (h as? String)?.let { a.dayHosts.add(it) } }
+            a.dayHosts.addAll(a.hosts.keys)
             return a
         }
     }
@@ -998,6 +1050,8 @@ internal object TelemetryPayload {
         val promos = a.promotions.entries.sortedByDescending { it.value.attempts + it.value.failovers + it.value.blankConfirmedOk }.take(Promo.MAX)
             .map { (k, c) -> Promo.json(k, c) }.filter { it.size > 3 }
         if (promos.isNotEmpty()) b["promotions"] = promos
+        // 34.6: the counts per `models` host, at most 8, in the order they were first asked
+        if (PerHostCounts.send && a.hosts.isNotEmpty()) b["hosts"] = a.hosts.entries.take(PerHostCounts.MAX_HOSTS).map { (h, c) -> c.json(h) }
         var bytes = Json.write(b).toByteArray(Charsets.UTF_8)
         // over the cap (never seen in practice): the histograms of quality go first, then cohorts
         if (bytes.size > MAX_BYTES) {
