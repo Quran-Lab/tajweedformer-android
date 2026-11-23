@@ -74,10 +74,10 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajwe
 dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 
 // app/build.gradle.kts
-dependencies { implementation("ai.quranlab:tajweedformer:4.0.2") }
+dependencies { implementation("ai.quranlab:tajweedformer:4.0.3") }
 ```
 
-Maven Central serves 4.0.2 today. 4.0.3 follows there once it is released; the quick start below is the same for both.
+
 
 The AAR carries the Quran Lab Core (`libqlcore.so`) and depends on LiteRT 2.2.0, kept for NPU builds; at 4.0's launch
 every phone runs the Core's CPU engine. Then add your app's signing certificates on your Android key's page at
