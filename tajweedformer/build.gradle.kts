@@ -141,7 +141,7 @@ publishing {
                 url.set("https://github.com/Quran-Lab/tajweedformer-android")
                 licenses {
                     license {
-                        name.set("Quran-Lab No-Profit License 1.2 (NPL-1.2)")
+                        name.set("Quran-Lab No-Profit License 1.3 (NPL-1.3)")
                         url.set("https://github.com/Quran-Lab/tajweedformer-android/blob/main/LICENSE")
                         distribution.set("repo")
                     }
